@@ -5,9 +5,18 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+import base64
+import json
+import time
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
+
+
+def _jwt_with_claims(claims):
+    header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"{header}.{payload}.sig"
 
 
 def _make_agent(fallback_model=None):
@@ -210,6 +219,66 @@ class TestFallbackChainAdvancement:
         ):
             assert agent._try_activate_fallback() is True
             assert agent.api_mode == "anthropic_messages"
+
+    def test_budget_cap_fallback_recovers_missing_codex_session(self, tmp_path, monkeypatch):
+        """A LiteLLM budget cap must reach a usable Codex fallback.
+
+        This is intentionally an offline integration test. It mirrors the
+        production HTTP 400 payload, starts with no Hermes Codex session, and
+        verifies that fallback adopts the valid local Codex CLI session before
+        swapping the main agent's provider.
+        """
+        from agent.error_classifier import FailoverReason, classify_api_error
+
+        class BudgetExceededError(Exception):
+            status_code = 400
+            body = {
+                "error": {
+                    "message": "Budget has been exceeded! Current cost: 5005.14, Max budget: 5000.0",
+                    "type": "budget_exceeded",
+                    "code": "400",
+                },
+            }
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+        codex_home = tmp_path / ".codex"
+        codex_home.mkdir()
+        access_token = _jwt_with_claims({"exp": int(time.time()) + 3600})
+        (codex_home / "auth.json").write_text(json.dumps({
+            "tokens": {"access_token": access_token, "refresh_token": "cli-refresh"},
+        }))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        classified = classify_api_error(
+            BudgetExceededError("Error code: 400"),
+            provider="custom:litellm-dev.sandbox.deepbank.daikuan.qihoo.net",
+            model="360/glm-5.2",
+        )
+        assert classified.reason == FailoverReason.billing
+        assert classified.should_fallback is True
+        assert classified.should_rotate_credential is False
+
+        agent = _make_agent(fallback_model={"provider": "openai-codex", "model": "gpt-5.5"})
+        raw_client = MagicMock()
+        raw_client.base_url = "https://chatgpt.com/backend-api/codex"
+        raw_client.api_key = access_token
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("agent.auxiliary_client.OpenAI", return_value=raw_client),
+        ):
+            assert agent._try_activate_fallback(reason=classified.reason) is True
+
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.5"
+        assert agent.api_mode == "codex_responses"
+        persisted = json.loads((hermes_home / "auth.json").read_text())
+        assert persisted["providers"]["openai-codex"]["tokens"] == {
+            "access_token": access_token,
+            "refresh_token": "cli-refresh",
+        }
 
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
