@@ -269,6 +269,31 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.billing
         assert result.retryable is False
 
+    def test_400_litellm_budget_exceeded_uses_fallback_without_rotating_key(self):
+        """A LiteLLM spend cap is a provider budget, not a bad credential."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "error": {
+                    "message": "Budget has been exceeded! Current cost: 5005.14, Max budget: 5000.0",
+                    "type": "budget_exceeded",
+                    "code": "400",
+                },
+            },
+        )
+
+        result = classify_api_error(
+            e,
+            provider="custom:litellm-dev.sandbox.deepbank.daikuan.qihoo.net",
+            model="360/glm-5.2",
+        )
+
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is False
+
     def test_402_out_of_funds_billing(self):
         e = MockAPIError(
             "Payment Required",
@@ -1650,6 +1675,7 @@ class TestSSLTransientPatterns:
         assert result.retryable is True
         assert result.should_compress is False
 
+
     def test_openssl_3x_format_classifies_as_timeout(self):
         """New format `ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC` still matches
         because we key on both space- and underscore-separated forms of
@@ -2066,4 +2092,3 @@ class Test408RequestTimeout:
         assert result.reason == FailoverReason.timeout
         assert result.retryable is True
         assert result.should_compress is False
-

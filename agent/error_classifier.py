@@ -1112,6 +1112,23 @@ def _classify_400(
 ) -> ClassifiedError:
     """Classify 400 Bad Request — context overflow, format error, or generic."""
 
+    # LiteLLM can enforce a configured spend cap with HTTP 400 while putting
+    # the actionable reason in ``error.type`` rather than ``error.code``.
+    # Treat that as a terminal provider-budget condition: switch providers,
+    # but do not rotate this provider's credential because its key is healthy.
+    budget_error_type = ""
+    if isinstance(body, dict):
+        err_obj = body.get("error", {})
+        if isinstance(err_obj, dict):
+            budget_error_type = str(err_obj.get("type") or "").strip().lower()
+    if budget_error_type == "budget_exceeded" or "budget has been exceeded" in error_msg:
+        return result_fn(
+            FailoverReason.billing,
+            retryable=False,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+
     # Multimodal tool content rejected from 400.  Must be checked BEFORE
     # image_too_large because the recovery is different (strip image parts
     # from tool messages, mark the model as no-list-tool-content for the
