@@ -1780,13 +1780,13 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
+    """Read a valid, non-expired Codex OAuth access token for auxiliary use.
 
     If a credential pool exists but currently has no selectable runtime entry
     (for example all pool slots are marked exhausted), fall back to the
-    profile's auth.json token instead of hard-failing. This keeps explicit
-    fallback-to-Codex working when the pool state is stale but the stored OAuth
-    token is still valid.
+    shared runtime resolver instead of hard-failing. This keeps explicit
+    fallback-to-Codex aligned with the main runtime when the pool is stale or
+    the profile can safely recover its own session from the local Codex CLI.
     """
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
@@ -1795,10 +1795,27 @@ def _read_codex_access_token() -> Optional[str]:
             return token
 
     try:
-        from hermes_cli.auth import _read_codex_tokens
-        data = _read_codex_tokens()
-        tokens = data.get("tokens", {})
-        access_token = tokens.get("access_token")
+        from hermes_cli.auth import (
+            AuthError,
+            _recover_codex_tokens_from_cli,
+            resolve_codex_runtime_credentials,
+        )
+
+        try:
+            credentials = resolve_codex_runtime_credentials(refresh_if_expiring=False)
+        except AuthError as exc:
+            # An explicit fallback may be the first Codex route a profile has
+            # used. Reuse the shared recovery primitive for that missing-store
+            # state rather than teaching the auxiliary client to read or refresh
+            # Codex CLI credentials itself.
+            if getattr(exc, "code", None) != "codex_auth_missing":
+                raise
+            recovered = _recover_codex_tokens_from_cli("auxiliary_fallback")
+            if not recovered:
+                raise
+            credentials = {"api_key": recovered.get("access_token")}
+
+        access_token = credentials.get("api_key")
         if not isinstance(access_token, str) or not access_token.strip():
             return None
 
