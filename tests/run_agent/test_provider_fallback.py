@@ -8,6 +8,7 @@ advancement through multiple providers.
 import base64
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
@@ -43,6 +44,24 @@ def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     mock.base_url = base_url
     mock.api_key = api_key
     return mock
+
+
+def _mock_response(content):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=content,
+                    tool_calls=None,
+                    reasoning_content=None,
+                    reasoning=None,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        model="fallback-test-model",
+        usage=None,
+    )
 
 
 # ── Chain initialisation ──────────────────────────────────────────────────
@@ -279,6 +298,45 @@ class TestFallbackChainAdvancement:
             "access_token": access_token,
             "refresh_token": "cli-refresh",
         }
+
+    def test_budget_cap_in_conversation_loop_switches_to_fallback(self):
+        """The production budget payload reaches the loop's eager fallback path."""
+        class BudgetExceededError(Exception):
+            status_code = 400
+            body = {
+                "error": {
+                    "message": "Budget has been exceeded! Current cost: 5005.14, Max budget: 5000.0",
+                    "type": "budget_exceeded",
+                    "code": "400",
+                },
+            }
+
+        agent = _make_agent(fallback_model={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4",
+        })
+        agent._cached_system_prompt = "You are helpful."
+        agent.client.chat.completions.create.side_effect = BudgetExceededError("Error code: 400")
+
+        fallback_client = _mock_client()
+        fallback_client.chat.completions.create.return_value = _mock_response("Fallback completed")
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(fallback_client, "anthropic/claude-sonnet-4"),
+            ) as resolve_provider_client,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("run the safe fallback case")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Fallback completed"
+        assert agent._fallback_activated is True
+        assert agent.provider == "openrouter"
+        assert agent.model == "anthropic/claude-sonnet-4"
+        resolve_provider_client.assert_called_once()
 
 
 # ── Pool-rotation vs fallback gating (#11314) ────────────────────────────
