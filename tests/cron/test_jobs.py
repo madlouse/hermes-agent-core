@@ -697,6 +697,28 @@ class TestGetDueJobs:
         assert get_due_jobs() == []
         assert get_job(job["id"])["active_run_outcome_claim"] is not None
 
+    def test_expired_run_outcome_claim_is_due_after_restart(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        job = create_job(prompt="Recover after crash", schedule="every 1h")
+        signed = _signed_job_revision(job["id"])
+        job.update(signed)
+        jobs = [job]
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=10)).isoformat()
+        monkeypatch.setattr("cron.jobs.time.time", lambda: 1_000_000)
+        claim = _cron_run_outcome_claim(jobs[0])
+        assert claim is not None
+        jobs[0]["active_run_outcome_claim"] = claim
+        save_jobs(jobs)
+
+        assert get_due_jobs() == []
+        monkeypatch.setattr(
+            "cron.jobs.time.time",
+            lambda: claim["claim_expires_at_epoch"],
+        )
+        due = get_due_jobs()
+        assert [item["id"] for item in due] == [job["id"]]
+
     def test_stale_past_due_runs_once_and_fast_forwards(self, tmp_cron_dir):
         """Recurring jobs past their grace window run once now and fast-forward next_run_at.
 

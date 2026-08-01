@@ -4159,8 +4159,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         try:
             if not job.get("enabled", True):
                 continue
-            if job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None:
-                continue
+            active_outcome_claim = job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD)
+            if active_outcome_claim is not None:
+                try:
+                    if _run_outcome_claim_is_active(active_outcome_claim):
+                        continue
+                except ValueError:
+                    # Invalid durable evidence belongs to the existing HAK
+                    # repair path and must never be dispatched automatically.
+                    continue
 
             # Cross-process running-claim guard (#59229): if another scheduler
             # process already claimed this one-shot and its run is still in flight
