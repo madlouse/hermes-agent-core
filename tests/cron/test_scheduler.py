@@ -5,6 +5,7 @@ import itertools
 import json
 import logging
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
@@ -2679,6 +2680,152 @@ def test_run_job_script_executes_bound_snapshot_not_mutated_path(tmp_path, monke
     assert success is True
     assert output == f"{shell}|0|unset|{shell}"
     assert side_effect.exists() is False
+
+
+def test_materialized_execution_snapshot_rejects_ambiguous_shapes():
+    import cron.scheduler as scheduler
+
+    base = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.py",
+        "script_suffix": ".py",
+        "script_bytes": b"print('ok')\n",
+        "interpreter_path": "/runtime/bin/python",
+        "interpreter_bytes": b"runtime",
+        "support_files": [],
+    }
+    with pytest.raises(ValueError, match="invalid cron script execution snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {**base, "script_name": "../task.py"}
+        ):
+            pass
+    with pytest.raises(ValueError, match="invalid cron support snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {**base, "support_files": ["bad"]}
+        ):
+            pass
+    with pytest.raises(ValueError, match="invalid cron support snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {
+                **base,
+                "support_files": [
+                    {"root": "unknown", "path": "task.py", "content": b"x"}
+                ],
+            }
+        ):
+            pass
+    with pytest.raises(ValueError, match="conflicting cron support snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {
+                **base,
+                "support_files": [
+                    {"root": "script_root", "path": "helper.py", "content": b"one"},
+                    {"root": "script_root", "path": "helper.py", "content": b"two"},
+                ],
+            }
+        ):
+            pass
+    with pytest.raises(ValueError, match="script bytes disagree"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {
+                **base,
+                "support_files": [
+                    {"root": "script_root", "path": "task.py", "content": b"other"}
+                ],
+            }
+        ):
+            pass
+    with scheduler._materialized_cron_execution_snapshot(
+        {
+            **base,
+            "support_files": [
+                {"root": "script_root", "path": "task.py", "content": base["script_bytes"]},
+                {"root": "script_root", "path": "task.py", "content": base["script_bytes"]},
+            ],
+        }
+    ) as (script_path, interpreter_path, roots):
+        assert script_path.read_bytes() == base["script_bytes"]
+        assert interpreter_path.read_bytes() == base["interpreter_bytes"]
+        assert len(roots) == 1
+
+
+def test_materialized_shell_snapshot_uses_captured_extensionless_helper(
+    tmp_path, monkeypatch
+):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "task.sh").write_text("printf wrong\n", encoding="utf-8")
+    (scripts / "helper").write_text("VALUE=wrong\n", encoding="utf-8")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    success, output = scheduler._run_job_script("missing.py")
+    assert success is False
+    assert "not found" in output
+    (scripts / "directory.py").mkdir()
+    success, output = scheduler._run_job_script("directory.py")
+    assert success is False
+    assert "not a file" in output
+
+    bash = scheduler.shutil.which("bash")
+    assert bash is not None
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.sh",
+        "script_suffix": ".sh",
+        "script_bytes": b"source ./helper\nprintf '%s' \"$VALUE\"\n",
+        "interpreter_path": str(Path(bash).resolve()),
+        "interpreter_bytes": Path(bash).resolve().read_bytes(),
+        "support_files": [
+            {"root": "script_root", "path": "task.sh", "content": b"source ./helper\nprintf '%s' \"$VALUE\"\n"},
+            {"root": "script_root", "path": "helper", "content": b"VALUE=claimed\n"},
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.sh", script_snapshot=snapshot)
+    assert success is True, output
+    assert output == "claimed"
+
+    (scripts / "task.sh").write_text("printf live\n", encoding="utf-8")
+    success, output = scheduler._run_job_script("task.sh")
+    assert success is True, output
+    assert output == "live"
+
+    monkeypatch.setattr(scheduler.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(scheduler.os.path, "isfile", lambda _path: False)
+    success, output = scheduler._run_job_script(
+        "task.sh", script_snapshot=b"printf unreachable\n"
+    )
+    assert success is False
+    assert "bash not found" in output
+
+
+def test_snapshot_without_runtime_lib_stays_on_captured_execution_path(
+    tmp_path, monkeypatch
+):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "task.py").write_text("print('live')\n", encoding="utf-8")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    completed = MagicMock(returncode=0, stdout=b"captured\n", stderr=b"")
+    monkeypatch.setattr(scheduler.subprocess, "run", MagicMock(return_value=completed))
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.py",
+        "script_suffix": ".py",
+        "script_bytes": b"print('captured')\n",
+        "interpreter_path": str(tmp_path / "runtime" / "bin" / "python"),
+        "interpreter_bytes": b"captured-runtime",
+        "support_files": [
+            {"root": "script_root", "path": "task.py", "content": b"print('captured')\n"}
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.py", script_snapshot=snapshot)
+    assert success is True
+    assert output == "captured"
 
 
 def test_run_job_routes_no_agent_script_through_optional_snapshot():

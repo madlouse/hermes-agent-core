@@ -11,6 +11,7 @@ runs at a time if multiple processes overlap.
 import asyncio
 import atexit
 import concurrent.futures
+import contextlib
 import contextvars
 import json
 import logging
@@ -20,6 +21,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -2826,9 +2828,9 @@ def _run_job_script(
             f"({scripts_dir_resolved}): {script_path!r}"
         )
 
-    if not path.exists():
+    if not isinstance(script_snapshot, dict) and not path.exists():
         return False, f"Script not found: {path}"
-    if not path.is_file():
+    if not isinstance(script_snapshot, dict) and not path.is_file():
         return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
@@ -3566,7 +3568,7 @@ def _run_job_impl(
     *,
     defer_agent_teardown: Optional[list] = None,
     _run_control: _CronRunControl,
-    script_snapshot: bytes | None = None,
+    script_snapshot: bytes | dict[str, Any] | None = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
