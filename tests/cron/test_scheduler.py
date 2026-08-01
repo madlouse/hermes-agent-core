@@ -2921,16 +2921,13 @@ def test_snapshot_execution_drops_caller_path_and_shell_startup_injection(
         f"() {{ touch {marker}; }}",
     )
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
-    captured_env = {}
-
-    def run_snapshot(_argv, **kwargs):
-        captured_env.update(kwargs["env"])
-        return MagicMock(returncode=0, stdout=b"safe\n", stderr=b"")
-
-    monkeypatch.setattr(scheduler.subprocess, "run", run_snapshot)
-    bash = Path("/bin/bash").resolve()
+    bash = Path("/bin/bash")
+    if not bash.is_file():
+        pytest.skip("trusted system Bash is unavailable")
+    bash = bash.resolve()
     content = (
         f"if command -v {command_name} >/dev/null; then {command_name}; fi\n"
+        "if [ -n \"${BASH_ENV-}\" ]; then exit 41; fi\n"
         "printf safe\n"
     ).encode()
     snapshot = {
@@ -2954,9 +2951,6 @@ def test_snapshot_execution_drops_caller_path_and_shell_startup_injection(
 
     assert success is True, output
     assert output == "safe"
-    assert captured_env["PATH"] == scheduler._CRON_SNAPSHOT_EXECUTION_PATH
-    assert "BASH_ENV" not in captured_env
-    assert f"BASH_FUNC_{command_name}%%" not in captured_env
     assert marker.exists() is False
 
 
