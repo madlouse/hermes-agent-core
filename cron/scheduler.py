@@ -35,7 +35,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -159,6 +159,29 @@ class CronPromptInjectionBlocked(Exception):
     malicious skill could carry an injection payload that reached the
     non-interactive (auto-approve) cron agent.
     """
+
+
+class CronRunOutcomeOwnershipLost(RuntimeError):
+    """The current worker no longer owns its persisted run-outcome claim."""
+
+
+def _renew_run_outcome_claim_or_raise(
+    job_id: str,
+    claim: dict[str, Any],
+) -> None:
+    """Refresh one exact claim in place, failing closed on any ownership doubt."""
+    try:
+        refreshed = heartbeat_job_run_outcome(job_id, claim)
+    except Exception as exc:
+        raise CronRunOutcomeOwnershipLost(
+            f"Cron job '{job_id}' lost run-outcome ownership during renewal"
+        ) from exc
+    if refreshed is None:
+        raise CronRunOutcomeOwnershipLost(
+            f"Cron job '{job_id}' no longer owns its run-outcome claim"
+        )
+    claim.clear()
+    claim.update(refreshed)
 
 
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
@@ -1754,6 +1777,8 @@ def _send_media_via_adapter(
 
     for media_path, _is_voice in media_files:
         try:
+            if heartbeat is not None:
+                heartbeat()
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
@@ -1783,6 +1808,8 @@ def _send_media_via_adapter(
                     "Job '%s': media send failed for %s: %s",
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
+        except CronRunOutcomeOwnershipLost:
+            raise
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
@@ -1988,6 +2015,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     delivery_errors = []
 
     for target in targets:
+        if heartbeat is not None:
+            heartbeat()
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
@@ -2307,6 +2336,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
+                    if heartbeat is not None:
+                        heartbeat()
                     from agent.async_utils import safe_schedule_threadsafe
 
                     router = DeliveryRouter(config, adapters)
@@ -2336,7 +2367,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         send_result = None
                         timeout_handled = False
                         try:
-                            send_result = future.result(timeout=60)
+                            send_result = future.result(
+                                timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
+                            )
                         except TimeoutError:
                             # #38922: a slow confirmation does NOT necessarily
                             # mean the send failed — but we must distinguish two
@@ -2345,9 +2378,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             #   cancel() == False -> the coroutine was already
                             #     running on the gateway loop when the timeout
                             #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
+                            #     cannot be un-sent. Signed runs retain their
+                            #     claim until confirmation; legacy callers keep
+                            #     the historical assume-delivered behavior.
                             #
                             #   cancel() == True -> the scheduled callback never
                             #     started executing (loop wedged/backlogged for
@@ -2368,15 +2401,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
                                 timeout_handled = True
+                            elif heartbeat is not None:
+                                logger.warning(
+                                    "Job '%s': live adapter send to %s:%s timed out "
+                                    "after %.0fs; already dispatched (in flight), "
+                                    "waiting under the active run claim",
+                                    job["id"], platform_name, chat_id,
+                                    _CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS,
+                                )
+                                while True:
+                                    heartbeat()
+                                    try:
+                                        send_result = future.result(
+                                            timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
+                                        )
+                                        break
+                                    except TimeoutError:
+                                        continue
                             else:
                                 timed_out = True
                                 timeout_handled = True
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
-                                    "after 60s; already dispatched (in flight), "
+                                    "after %.0fs; already dispatched (in flight), "
                                     "assuming delivered (skipping standalone fallback "
                                     "to avoid duplicate)",
                                     job["id"], platform_name, chat_id,
+                                    _CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS,
                                 )
                         except Exception as ex:
                             # A real send error (not a slow confirmation) — fall
@@ -2384,6 +2435,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # still delivered.
                             target_errors.append(f"live adapter send failed: {ex}")
                             raise
+
+                        if heartbeat is not None:
+                            heartbeat()
 
                         if timeout_handled:
                             # The timeout branch above already decided the
@@ -2471,6 +2525,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        heartbeat=heartbeat,
                     )
                 elif timed_out and boundary_media_files:
                     msg = (
@@ -2513,6 +2568,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
+            except CronRunOutcomeOwnershipLost:
+                raise
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
@@ -2559,6 +2616,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             )
             try:
                 result = asyncio.run(coro)
+            except CronRunOutcomeOwnershipLost:
+                raise
             except RuntimeError as run_err:
                 # asyncio.run() checks for a running loop before awaiting the coroutine;
                 # when it raises, the original coro was never started — close it to
@@ -2599,6 +2658,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
+                except CronRunOutcomeOwnershipLost:
+                    raise
                 except Exception as e:
                     # A shutdown-race here is expected during teardown; downgrade
                     # to a warning so it doesn't read as a genuine failure.
@@ -2620,6 +2681,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
+            if heartbeat is not None:
+                heartbeat()
             if result and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
@@ -2780,6 +2843,60 @@ def _trusted_snapshot_shell_interpreter(snapshot: dict[str, Any]) -> Path | None
         return selected
     except (OSError, RuntimeError, TypeError, ValueError):
         return None
+
+
+_CRON_SCRIPT_HEARTBEAT_POLL_SECONDS = 5.0
+
+
+def _run_subprocess_with_heartbeat(
+    argv: list[str],
+    run_kwargs: dict[str, Any],
+    heartbeat: Callable[[], None],
+) -> subprocess.CompletedProcess:
+    """Wait for a script while letting the existing claim owner renew."""
+    options = dict(run_kwargs)
+    timeout = float(options.pop("timeout"))
+    input_data = options.pop("input", None)
+    options.pop("capture_output", None)
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **options,
+    )
+    deadline = time.monotonic() + timeout
+    pending_input = input_data
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(
+                    argv,
+                    timeout,
+                    output=stdout,
+                    stderr=stderr,
+                )
+            try:
+                stdout, stderr = process.communicate(
+                    input=pending_input,
+                    timeout=min(_CRON_SCRIPT_HEARTBEAT_POLL_SECONDS, remaining),
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    process.returncode,
+                    stdout,
+                    stderr,
+                )
+            except subprocess.TimeoutExpired:
+                pending_input = None
+                heartbeat()
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+        raise
 
 
 def _run_job_script(
@@ -3006,6 +3123,8 @@ def _run_job_script(
 
         return True, stdout
 
+    except CronRunOutcomeOwnershipLost:
+        raise
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
@@ -3586,6 +3705,7 @@ def _run_job_impl(
     defer_agent_teardown: Optional[list] = None,
     _run_control: _CronRunControl,
     script_snapshot: bytes | dict[str, Any] | None = None,
+    run_outcome_claim: dict[str, Any] | None = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3605,6 +3725,34 @@ def _run_job_impl(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    job_schedule = job.get("schedule")
+    is_oneshot = (
+        isinstance(job_schedule, dict) and job_schedule.get("kind") == "once"
+    )
+    run_claim = job.get("run_claim")
+    run_claim_owner = (
+        str(run_claim.get("by") or "") if isinstance(run_claim, dict) else ""
+    )
+    claim_heartbeat_seconds = 60.0
+    last_claim_heartbeat = time.monotonic()
+
+    def _heartbeat_claims_if_due() -> None:
+        nonlocal last_claim_heartbeat
+        if not ((is_oneshot and run_claim_owner) or run_outcome_claim is not None):
+            return
+        current_tick = time.monotonic()
+        if current_tick - last_claim_heartbeat < claim_heartbeat_seconds:
+            return
+        last_claim_heartbeat = current_tick
+        if is_oneshot and run_claim_owner:
+            try:
+                heartbeat_run_claim(job_id, expected_owner=run_claim_owner)
+            except Exception:
+                logger.debug(
+                    "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
+                )
+        if run_outcome_claim is not None:
+            _renew_run_outcome_claim_or_raise(job_id, run_outcome_claim)
 
     # Runtime admission is deliberately before the no_agent short-circuit and
     # before any Agent/session construction. A script-only job is still a
@@ -4425,7 +4573,7 @@ def _run_job_impl(
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
-        # Keep the one-shot run_claim fresh while the run is alive (#62002):
+        # Keep both persisted claims fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
         # run that legitimately outlives it (stream stall, laptop asleep
         # mid-run) is indistinguishable from a dead tick — another process
@@ -4650,6 +4798,8 @@ def _run_job_impl(
         logger.info("Job '%s' completed successfully", job_name)
         return True, output, final_response, None
         
+    except CronRunOutcomeOwnershipLost:
+        raise
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
@@ -4785,7 +4935,8 @@ def run_job(
     job: dict,
     *,
     defer_agent_teardown: Optional[list] = None,
-    script_snapshot: bytes | None = None,
+    script_snapshot: bytes | dict[str, Any] | None = None,
+    run_outcome_claim: dict[str, Any] | None = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Execute a job under one deadline measured from this entry boundary.
 
@@ -4818,6 +4969,7 @@ def run_job(
         defer_agent_teardown=worker_deferred,
         _run_control=control,
         script_snapshot=script_snapshot,
+        run_outcome_claim=run_outcome_claim,
     )
 
     try:
@@ -5077,16 +5229,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             }
             if script_snapshot is not None:
                 run_kwargs["script_snapshot"] = script_snapshot
+            if run_outcome_claim is not None:
+                run_kwargs["run_outcome_claim"] = run_outcome_claim
             success, output, final_response, error = run_job(job, **run_kwargs)
-        except BaseException:
-            # run_job's finally still hands back the agent when it raises; tear
-            # it down here so a failed run never leaks its async resources
-            # (#10200), then re-raise into the outer handler. BaseException
-            # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
-            # still triggers teardown before propagating.
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
-            raise
         finally:
             reset_secret_scope(_scope_token)
 
@@ -5102,13 +5247,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
-            # If the gateway shutdown killed this job's tool subprocess
-            # mid-flight (#60432), the agent may still have produced a
-            # plausible-looking final_response from the truncated output --
-            # force the failure path so the delivered message is an honest
-            # "this run was interrupted" summary instead of that response.
-            # Peek-only: the flag stays set for the authoritative check
-            # right before mark_job_run below.
+            # If gateway shutdown killed the tool subprocess, never deliver a
+            # plausible response derived from truncated output.
             if success and _is_interrupted(job["id"]):
                 success = False
                 error = (
@@ -5116,39 +5256,43 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     "(tool subprocess was killed mid-flight)."
                 )
 
-            # Deliver the final response to the origin/target chat.
-            # If the agent responded with [SILENT], skip delivery (but
-            # output is already saved above).  Failed jobs always deliver.
             deliver_content = (
                 _extract_cron_final_response(final_response)
                 if success
                 else _summarize_cron_failure_for_delivery(job, error)
             )
-            # Treat whitespace-only final responses the same as empty
-            # responses: do not deliver a blank message, and let the
-            # empty-response guard below mark the run as a soft failure.
             should_deliver = bool(deliver_content.strip())
-            unresolved_origin = False
-            # Cron silence suppression — see _is_cron_silence_response.  Replaces the
-            # old `SILENT_MARKER in ...upper()` substring check, which both leaked
-            # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
-            # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
-            # #46917).  Keeps the intentional bracketed-prefix / trailing-line
-            # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
-                logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
-                should_deliver = False
+            if should_deliver and success:
+                if _is_cron_silence_response(deliver_content):
+                    logger.info(
+                        "Job '%s': agent returned %s — skipping delivery",
+                        job["id"],
+                        SILENT_MARKER,
+                    )
+                    should_deliver = False
+                else:
+                    deliver_content = _strip_cron_silence_markers_from_report(
+                        deliver_content
+                    )
 
             if should_deliver:
-                unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                delivery_kwargs: dict[str, Any] = {
+                    "adapters": adapters,
+                    "loop": loop,
+                    "delivery_receipts": delivery_receipts,
+                }
+                if run_outcome_claim is not None:
+                    delivery_kwargs["heartbeat"] = _renew_run_outcome_owner
+                delivery_error = _deliver_result(
+                    job,
+                    deliver_content,
+                    **delivery_kwargs,
                 )
-                try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                except Exception as de:
-                    delivery_error = str(de)
-                    logger.error("Delivery failed for job %s: %s", job["id"], de)
+        except CronRunOutcomeOwnershipLost:
+            raise
+        except Exception as de:
+            delivery_error = str(de)
+            logger.error("Delivery failed for job %s: %s", job["id"], de)
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
@@ -5168,8 +5312,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
-        elif should_deliver and unresolved_origin:
-            delivery_outcome = "not_configured"
         elif should_deliver and normalized_deliver != "local":
             delivery_outcome = "delivered"
         else:
@@ -5214,6 +5356,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             raise
         return False
     finally:
+        for _deferred_agent in locals().get("_deferred_agents", []):
+            _teardown_cron_agent(_deferred_agent, job["id"])
         with _running_lock:
             _running_job_states.pop(job["id"], None)
             _interrupted_job_ids.discard(job["id"])

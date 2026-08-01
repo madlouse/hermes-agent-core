@@ -331,6 +331,7 @@ class TestDeliverResultWrapping:
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
 
+        heartbeats = []
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
             job = {
@@ -339,7 +340,11 @@ class TestDeliverResultWrapping:
                 "deliver": "origin",
                 "origin": {"platform": "telegram", "chat_id": "123"},
             }
-            _deliver_result(job, "Here is today's summary.")
+            _deliver_result(
+                job,
+                "Here is today's summary.",
+                heartbeat=lambda: heartbeats.append("renewed"),
+            )
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
@@ -348,6 +353,163 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+        assert len(heartbeats) >= 3
+
+    def test_live_delivery_propagates_outcome_ownership_loss(self):
+        import cron.scheduler as scheduler
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        adapter = MagicMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="business result",
+            raw={"decision": "allow"},
+        )
+        heartbeat_count = 0
+
+        def lose_before_send():
+            nonlocal heartbeat_count
+            heartbeat_count += 1
+            if heartbeat_count == 2:
+                raise scheduler.CronRunOutcomeOwnershipLost("ownership lost")
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision):
+            with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+                _deliver_result(
+                    {
+                        "id": "live-owner-lost",
+                        "deliver": "origin",
+                        "origin": {"platform": "telegram", "chat_id": "123"},
+                    },
+                    "business result",
+                    adapters={Platform.TELEGRAM: adapter},
+                    loop=loop,
+                    heartbeat=lose_before_send,
+                )
+
+        assert heartbeat_count == 2
+
+    def test_standalone_delivery_cancels_when_periodic_renewal_loses_owner(self):
+        import cron.scheduler as scheduler
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="business result",
+            raw={"decision": "allow"},
+        )
+        heartbeat_count = 0
+
+        def lose_during_wait():
+            nonlocal heartbeat_count
+            heartbeat_count += 1
+            if heartbeat_count == 3:
+                raise scheduler.CronRunOutcomeOwnershipLost("ownership lost")
+
+        async def slow_send(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("tools.send_message_tool._send_to_platform", side_effect=slow_send), \
+             patch("cron.scheduler.asyncio.wait", new=AsyncMock(return_value=(set(), set()))):
+            with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+                _deliver_result(
+                    {
+                        "id": "standalone-owner-lost",
+                        "deliver": "origin",
+                        "origin": {"platform": "telegram", "chat_id": "123"},
+                    },
+                    "business result",
+                    heartbeat=lose_during_wait,
+                )
+
+        assert heartbeat_count == 3
+
+    def test_standalone_delivery_renews_until_async_send_completes(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="business result",
+            raw={"decision": "allow"},
+        )
+        wait_count = 0
+        heartbeats = []
+
+        async def wait_once_then_finish(tasks, **_kwargs):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 1:
+                return set(), set(tasks)
+            task = next(iter(tasks))
+            await task
+            return set(tasks), set()
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("cron.scheduler.asyncio.wait", side_effect=wait_once_then_finish):
+            assert _deliver_result(
+                {
+                    "id": "standalone-renewed",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "business result",
+                heartbeat=lambda: heartbeats.append("renewed"),
+            ) is None
+
+        assert wait_count == 2
+        assert len(heartbeats) >= 4
+
+    def test_standalone_fresh_loop_propagates_outcome_ownership_loss(self):
+        import cron.scheduler as scheduler
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="business result",
+            raw={"decision": "allow"},
+        )
+
+        def lose_in_fresh_loop(coro):
+            coro.close()
+            raise scheduler.CronRunOutcomeOwnershipLost("ownership lost")
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("cron.scheduler.asyncio.run", side_effect=RuntimeError("running loop")), \
+             patch("gateway.outbound_boundary._run_coro_in_new_loop", side_effect=lose_in_fresh_loop):
+            with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+                _deliver_result(
+                    {
+                        "id": "fresh-loop-owner-lost",
+                        "deliver": "origin",
+                        "origin": {"platform": "telegram", "chat_id": "123"},
+                    },
+                    "business result",
+                    heartbeat=lambda: None,
+                )
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
@@ -2067,7 +2229,15 @@ class TestSendMediaViaAdapter:
             return completed
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-            _send_media_via_adapter(adapter, chat_id, media_files, metadata, MagicMock(), job)
+            _send_media_via_adapter(
+                adapter,
+                chat_id,
+                media_files,
+                metadata,
+                MagicMock(),
+                job,
+                heartbeat=lambda: None,
+            )
 
 
     def test_multiple_media_files_all_delivered(self, tmp_path, monkeypatch):
@@ -2175,17 +2345,14 @@ class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter
     delivery path, the outcome depends on whether the coroutine was already
     running.  future.cancel() returning False means it is in flight on the wire
-    (cannot be un-sent) → treat as DELIVERED and skip the standalone fallback to
-    avoid a duplicate (#38922).  future.cancel() returning True means it never
-    started (wedged loop) → nothing was sent, so fall through to standalone or
-    the message is silently dropped.  Regression for #38922.
+    (cannot be un-sent): signed runs wait under their active claim, while legacy
+    callers preserve the assume-delivered behavior that avoids a duplicate.
+    future.cancel() returning True means it never started (wedged loop), so the
+    standalone fallback remains safe. Regression for #38922 and #1453.
     """
 
     def test_live_adapter_timeout_assumes_delivered_no_duplicate(self):
-        """End-to-end: live adapter confirmation times out past the 60s budget.
-        The fix (#38922) treats the send as already-dispatched/delivered and
-        does NOT run the standalone fallback — otherwise the message is sent
-        twice."""
+        """An unsigned legacy send keeps the no-duplicate timeout behavior."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -2283,8 +2450,10 @@ def test_run_one_job_persists_core_terminal_run_outcome_receipt():
         "receipts_truncated": False,
     }
 
+    renewed_claim = {**claim, "lease": "renewed"}
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", return_value=renewed_claim) as heartbeat_mock, \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
          patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
          patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
@@ -2296,16 +2465,116 @@ def test_run_one_job_persists_core_terminal_run_outcome_receipt():
     receipt_mock.assert_called_once_with(
         job,
         success=True,
-        run_outcome_claim=claim,
+        run_outcome_claim=renewed_claim,
         delivery_receipt=delivery,
     )
+    assert heartbeat_mock.call_count == 3
     assert mark_mock.call_args.args == ("run-proof-job", True, None)
     assert mark_mock.call_args.kwargs == {
         "delivery_error": None,
         "delivery_receipt": delivery,
         "run_outcome_receipt": receipt,
-        "run_outcome_claim": claim,
+        "run_outcome_claim": renewed_claim,
     }
+
+
+def test_run_one_job_stops_before_save_when_outcome_ownership_is_lost():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "lost-owner", "name": "Lost owner", "deliver": "origin"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    closed = []
+
+    class FakeAgent:
+        def close(self):
+            closed.append("closed")
+
+    def fake_run(_job, *, defer_agent_teardown, **_kwargs):
+        defer_agent_teardown.append(FakeAgent())
+        return True, "# output", "report", None
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", side_effect=fake_run), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", return_value=None), \
+         patch("cron.scheduler.save_job_output") as save_mock, \
+         patch("cron.scheduler._deliver_result") as deliver_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock, \
+         patch("agent.auxiliary_client.cleanup_stale_async_clients"):
+        assert run_one_job(job) is False
+
+    save_mock.assert_not_called()
+    deliver_mock.assert_not_called()
+    mark_mock.assert_not_called()
+    assert closed == ["closed"]
+
+
+def test_run_one_job_propagates_delivery_ownership_loss_without_terminal_write():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "lost-during-delivery", "name": "Lost delivery", "deliver": "origin"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    heartbeat_results = iter((dict(claim), dict(claim), None))
+
+    def lose_in_delivery(_job, _content, *, heartbeat, **_kwargs):
+        heartbeat()
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda *_args: next(heartbeat_results)), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._deliver_result", side_effect=lose_in_delivery), \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    mark_mock.assert_not_called()
+
+
+def test_run_one_job_exception_stops_when_terminal_renewal_loses_owner():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "lost-before-failure-terminal", "name": "Lost failure", "deliver": "local"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    heartbeat_results = iter((dict(claim), None))
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda *_args: next(heartbeat_results)), \
+         patch("cron.scheduler.save_job_output", side_effect=RuntimeError("disk unavailable")), \
+         patch("cron.scheduler._cron_run_outcome_receipt") as receipt_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    receipt_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_run_one_job_pre_admission_exception_stops_when_terminal_owner_is_lost():
+    from cron.scheduler import run_one_job
+
+    job = {
+        "id": "lost-before-admission-token",
+        "name": "Lost before admission",
+        "deliver": "local",
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("agent.secret_scope.build_profile_secret_scope", side_effect=RuntimeError("scope unavailable")), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", return_value=None), \
+         patch("cron.scheduler._cron_run_outcome_receipt") as receipt_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    receipt_mock.assert_not_called()
+    mark_mock.assert_not_called()
 
 
 def test_run_one_job_real_claim_producer_and_writer_round_trip(tmp_path, monkeypatch):
@@ -2355,6 +2624,70 @@ def test_run_one_job_real_claim_producer_and_writer_round_trip(tmp_path, monkeyp
     assert receipt["delivery_receipt_hash"].startswith("sha256:")
     assert persisted["active_run_outcome_claim"] is None
     assert list(tmp_path.rglob("*.db")) == []
+
+
+def test_delivery_heartbeat_keeps_second_owner_out_past_original_expiry(
+    tmp_path, monkeypatch
+):
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    now_epoch = [1_000_000]
+    monkeypatch.setattr(jobs.time, "time", lambda: now_epoch[0])
+    cron_dir.mkdir()
+    (cron_dir / ".jobs.lock").touch(mode=0o600)
+    job = {
+        "id": "delivery-lease",
+        "name": "Delivery lease",
+        "prompt": "report",
+        "skills": [],
+        "schedule": {"kind": "interval", "minutes": 60},
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "deliver": "origin",
+        "last_status": None,
+        "last_error": None,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": "profile-custom",
+            "cron_job_id": "delivery-lease",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    jobs.save_jobs([job])
+    original_expiry = []
+
+    def fake_run(_job, *, run_outcome_claim, **_kwargs):
+        original_expiry.append(run_outcome_claim["claim_expires_at_epoch"])
+        return True, "# output", "report", None
+
+    def fake_delivery(_job, _content, *, heartbeat, **_kwargs):
+        initial_expiry = original_expiry[0]
+        now_epoch[0] = initial_expiry - 60
+        heartbeat()
+        refreshed = jobs.get_job(job["id"])["active_run_outcome_claim"]
+        assert refreshed["claim_expires_at_epoch"] > initial_expiry
+
+        now_epoch[0] = initial_expiry + 10
+        assert jobs.begin_job_run_outcome(jobs.get_job(job["id"])) is None
+        heartbeat()
+        return None
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.run_job", side_effect=fake_run), \
+         patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "output.md")), \
+         patch("cron.scheduler._deliver_result", side_effect=fake_delivery):
+        assert scheduler.run_one_job(job) is True
+
+    persisted = jobs.get_job(job["id"])
+    assert persisted["active_run_outcome_claim"] is None
+    assert persisted["last_run_outcome_receipt"]["terminal_state"] == "success"
 
 
 def test_signed_job_claim_failure_aborts_before_any_run_side_effect():
@@ -3097,6 +3430,7 @@ def test_run_one_job_passes_claimed_script_snapshot_to_executor():
     claim = {"run_id": "cron-run:" + "2" * 32}
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, b"claimed")), \
          patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)) as run_mock, \
          patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
@@ -3135,6 +3469,7 @@ def test_run_one_job_persists_failed_receipt_when_terminal_pipeline_raises():
 
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
          patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
          patch("cron.scheduler.save_job_output", side_effect=RuntimeError("disk unavailable")), \
@@ -3200,6 +3535,7 @@ def test_run_one_job_keeps_admission_denial_distinct_from_failed_run_receipt():
 
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
          patch("cron.scheduler.run_job", side_effect=denied_run), \
          patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -3250,6 +3586,7 @@ def test_run_one_job_exception_preserves_admission_fact_without_run_receipt():
 
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
          patch("cron.scheduler.run_job", side_effect=raise_after_admission), \
          patch("cron.scheduler._cron_run_outcome_receipt") as outcome_mock, \

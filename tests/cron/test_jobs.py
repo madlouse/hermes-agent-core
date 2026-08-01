@@ -27,6 +27,7 @@ from cron.jobs import (
     load_jobs,
     save_jobs,
     get_job,
+    heartbeat_job_run_outcome,
     list_jobs,
     update_job,
     pause_job,

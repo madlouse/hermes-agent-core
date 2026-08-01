@@ -3503,6 +3503,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         not isinstance(creation, dict)
                         or creation.get("receipt_id") != run_outcome_claim.get("job_revision")
                         or job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) != run_outcome_claim
+                        or not _run_outcome_claim_is_active(run_outcome_claim)
                     ):
                         logger.warning(
                             "mark_job_run: stale run outcome claim for job_id %s; skipping save",
