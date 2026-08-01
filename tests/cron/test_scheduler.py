@@ -2835,15 +2835,16 @@ def test_materialized_shell_snapshot_uses_captured_extensionless_helper(
     assert success is False
     assert "not a file" in output
 
-    bash = scheduler.shutil.which("bash")
-    assert bash is not None
+    bash = Path("/bin/bash")
+    if not bash.is_file():
+        pytest.skip("trusted system Bash is unavailable")
     snapshot = {
         "schema_version": "cron-script-execution-snapshot/v1",
         "script_name": "task.sh",
         "script_suffix": ".sh",
         "script_bytes": b"printf '%s' \"$(./helper)\"\n",
-        "interpreter_path": str(Path(bash).resolve()),
-        "interpreter_bytes": Path(bash).resolve().read_bytes(),
+        "interpreter_path": str(bash.resolve()),
+        "interpreter_bytes": bash.resolve().read_bytes(),
         "support_files": [
             {
                 "root": "script_root",
@@ -2863,6 +2864,22 @@ def test_materialized_shell_snapshot_uses_captured_extensionless_helper(
     success, output = scheduler._run_job_script("task.sh", script_snapshot=snapshot)
     assert success is True, output
     assert output == "claimed"
+    assert scheduler._trusted_snapshot_shell_interpreter(snapshot) == bash.resolve()
+    assert scheduler._trusted_snapshot_shell_interpreter(
+        {**snapshot, "interpreter_bytes": b"changed"}
+    ) is None
+    untrusted_bash = tmp_path / "untrusted-bash"
+    untrusted_bash.write_bytes(snapshot["interpreter_bytes"])
+    untrusted_bash.chmod(0o755)
+    assert scheduler._trusted_snapshot_shell_interpreter(
+        {**snapshot, "interpreter_path": str(untrusted_bash)}
+    ) is None
+    assert scheduler._trusted_snapshot_shell_interpreter(
+        {**snapshot, "interpreter_path": str(tmp_path / "missing-bash")}
+    ) is None
+    assert scheduler._trusted_snapshot_shell_interpreter(
+        {**snapshot, "interpreter_path": None}
+    ) is None
 
     (scripts / "task.sh").write_text("printf live\n", encoding="utf-8")
     success, output = scheduler._run_job_script("task.sh")
@@ -2899,7 +2916,18 @@ def test_snapshot_execution_drops_caller_path_and_shell_startup_injection(
     bash_env.write_text(f"touch {marker}\n", encoding="utf-8")
     monkeypatch.setenv("PATH", str(injected_bin))
     monkeypatch.setenv("BASH_ENV", str(bash_env))
+    monkeypatch.setenv(
+        f"BASH_FUNC_{command_name}%%",
+        f"() {{ touch {marker}; }}",
+    )
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    captured_env = {}
+
+    def run_snapshot(_argv, **kwargs):
+        captured_env.update(kwargs["env"])
+        return MagicMock(returncode=0, stdout=b"safe\n", stderr=b"")
+
+    monkeypatch.setattr(scheduler.subprocess, "run", run_snapshot)
     bash = Path("/bin/bash").resolve()
     content = (
         f"if command -v {command_name} >/dev/null; then {command_name}; fi\n"
@@ -2924,8 +2952,11 @@ def test_snapshot_execution_drops_caller_path_and_shell_startup_injection(
 
     success, output = scheduler._run_job_script("task.sh", script_snapshot=snapshot)
 
-    assert success is False
-    assert output
+    assert success is True, output
+    assert output == "safe"
+    assert captured_env["PATH"] == scheduler._CRON_SNAPSHOT_EXECUTION_PATH
+    assert "BASH_ENV" not in captured_env
+    assert f"BASH_FUNC_{command_name}%%" not in captured_env
     assert marker.exists() is False
 
 
@@ -2965,6 +2996,54 @@ def test_snapshot_execution_drops_caller_pythonpath(tmp_path, monkeypatch):
 
     assert success is False
     assert "external_probe" in output
+
+
+def test_snapshot_execution_disables_python_user_site_startup(tmp_path, monkeypatch):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    scripts.joinpath("task.py").write_text("print('live')\n", encoding="utf-8")
+    marker = tmp_path / "sitecustomize-ran"
+    userbase = tmp_path / "caller-userbase"
+    user_site = (
+        userbase
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    user_site.mkdir(parents=True)
+    user_site.joinpath("sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('injected')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PYTHONUSERBASE", str(userbase))
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    interpreter = Path(sys.executable).resolve()
+    content = b"print('claimed')\n"
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.py",
+        "script_suffix": ".py",
+        "script_bytes": content,
+        "interpreter_path": str(interpreter),
+        "interpreter_bytes": interpreter.read_bytes(),
+        "support_files": [
+            {
+                "root": "script_root",
+                "path": "task.py",
+                "content": content,
+                "mode": 0o644,
+            }
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.py", script_snapshot=snapshot)
+
+    assert success is True, output
+    assert output == "claimed"
+    assert marker.exists() is False
 
 
 def test_snapshot_without_runtime_lib_stays_on_captured_execution_path(

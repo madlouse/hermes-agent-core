@@ -2765,6 +2765,23 @@ def _kill_cron_process_group(process: subprocess.Popen) -> None:
     process.wait()
 
 
+def _trusted_snapshot_shell_interpreter(snapshot: dict[str, Any]) -> Path | None:
+    try:
+        selected = Path(snapshot["interpreter_path"]).resolve(strict=True)
+        trusted = {
+            Path(candidate).resolve(strict=True)
+            for candidate in _CRON_TRUSTED_BASH_PATHS
+            if Path(candidate).is_file()
+        }
+        if selected not in trusted:
+            return None
+        if selected.read_bytes() != snapshot["interpreter_bytes"]:
+            return None
+        return selected
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
