@@ -14,6 +14,7 @@ from cron.jobs import (
     _cron_run_outcome_receipt,
     _cron_run_script_snapshot,
     _cron_script_artifact_hash,
+    _cron_support_artifact_hash,
     _validated_run_outcome_claim,
     _validated_run_outcome_receipt,
     CronJobGovernanceError,
