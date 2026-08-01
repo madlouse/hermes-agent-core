@@ -5,6 +5,7 @@ import itertools
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -2709,7 +2710,49 @@ def test_materialized_execution_snapshot_rejects_ambiguous_shapes():
             {
                 **base,
                 "support_files": [
-                    {"root": "unknown", "path": "task.py", "content": b"x"}
+                    {
+                        "root": "unknown",
+                        "path": "task.py",
+                        "content": b"x",
+                        "mode": 0o644,
+                    }
+                ],
+            }
+        ):
+            pass
+    for invalid_mode in (True, "0644", -1, 0o1000):
+        with pytest.raises(ValueError, match="invalid cron support snapshot"):
+            with scheduler._materialized_cron_execution_snapshot(
+                {
+                    **base,
+                    "support_files": [
+                        {
+                            "root": "script_root",
+                            "path": "task.py",
+                            "content": base["script_bytes"],
+                            "mode": invalid_mode,
+                        }
+                    ],
+                }
+            ):
+                pass
+    with pytest.raises(ValueError, match="conflicting cron support snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {
+                **base,
+                "support_files": [
+                    {
+                        "root": "script_root",
+                        "path": "helper.py",
+                        "content": b"one",
+                        "mode": 0o644,
+                    },
+                    {
+                        "root": "script_root",
+                        "path": "helper.py",
+                        "content": b"two",
+                        "mode": 0o644,
+                    },
                 ],
             }
         ):
@@ -2719,8 +2762,18 @@ def test_materialized_execution_snapshot_rejects_ambiguous_shapes():
             {
                 **base,
                 "support_files": [
-                    {"root": "script_root", "path": "helper.py", "content": b"one"},
-                    {"root": "script_root", "path": "helper.py", "content": b"two"},
+                    {
+                        "root": "script_root",
+                        "path": "helper.py",
+                        "content": b"same",
+                        "mode": 0o644,
+                    },
+                    {
+                        "root": "script_root",
+                        "path": "helper.py",
+                        "content": b"same",
+                        "mode": 0o755,
+                    },
                 ],
             }
         ):
@@ -2730,7 +2783,12 @@ def test_materialized_execution_snapshot_rejects_ambiguous_shapes():
             {
                 **base,
                 "support_files": [
-                    {"root": "script_root", "path": "task.py", "content": b"other"}
+                    {
+                        "root": "script_root",
+                        "path": "task.py",
+                        "content": b"other",
+                        "mode": 0o644,
+                    }
                 ],
             }
         ):
@@ -2739,8 +2797,18 @@ def test_materialized_execution_snapshot_rejects_ambiguous_shapes():
         {
             **base,
             "support_files": [
-                {"root": "script_root", "path": "task.py", "content": base["script_bytes"]},
-                {"root": "script_root", "path": "task.py", "content": base["script_bytes"]},
+                {
+                    "root": "script_root",
+                    "path": "task.py",
+                    "content": base["script_bytes"],
+                    "mode": 0o644,
+                },
+                {
+                    "root": "script_root",
+                    "path": "task.py",
+                    "content": base["script_bytes"],
+                    "mode": 0o644,
+                },
             ],
         }
     ) as (script_path, interpreter_path, roots):
@@ -2773,12 +2841,22 @@ def test_materialized_shell_snapshot_uses_captured_extensionless_helper(
         "schema_version": "cron-script-execution-snapshot/v1",
         "script_name": "task.sh",
         "script_suffix": ".sh",
-        "script_bytes": b"source ./helper\nprintf '%s' \"$VALUE\"\n",
+        "script_bytes": b"printf '%s' \"$(./helper)\"\n",
         "interpreter_path": str(Path(bash).resolve()),
         "interpreter_bytes": Path(bash).resolve().read_bytes(),
         "support_files": [
-            {"root": "script_root", "path": "task.sh", "content": b"source ./helper\nprintf '%s' \"$VALUE\"\n"},
-            {"root": "script_root", "path": "helper", "content": b"VALUE=claimed\n"},
+            {
+                "root": "script_root",
+                "path": "task.sh",
+                "content": b"printf '%s' \"$(./helper)\"\n",
+                "mode": 0o644,
+            },
+            {
+                "root": "script_root",
+                "path": "helper",
+                "content": b"#!/bin/sh\nprintf claimed\n",
+                "mode": 0o755,
+            },
         ],
     }
 
@@ -2800,6 +2878,95 @@ def test_materialized_shell_snapshot_uses_captured_extensionless_helper(
     assert "bash not found" in output
 
 
+def test_snapshot_execution_drops_caller_path_and_shell_startup_injection(
+    tmp_path, monkeypatch
+):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    scripts.joinpath("task.sh").write_text("printf live\n", encoding="utf-8")
+    marker = tmp_path / "injected"
+    injected_bin = tmp_path / "caller-bin"
+    injected_bin.mkdir()
+    command_name = "hak_review_path_probe_1453"
+    injected_bin.joinpath(command_name).write_text(
+        f"#!/bin/sh\nprintf injected\ntouch {marker}\n",
+        encoding="utf-8",
+    )
+    injected_bin.joinpath(command_name).chmod(0o755)
+    bash_env = tmp_path / "caller-bash-env"
+    bash_env.write_text(f"touch {marker}\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(injected_bin))
+    monkeypatch.setenv("BASH_ENV", str(bash_env))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    bash = Path("/bin/bash").resolve()
+    content = (
+        f"if command -v {command_name} >/dev/null; then {command_name}; fi\n"
+        "printf safe\n"
+    ).encode()
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.sh",
+        "script_suffix": ".sh",
+        "script_bytes": content,
+        "interpreter_path": str(bash),
+        "interpreter_bytes": bash.read_bytes(),
+        "support_files": [
+            {
+                "root": "script_root",
+                "path": "task.sh",
+                "content": content,
+                "mode": 0o644,
+            }
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.sh", script_snapshot=snapshot)
+
+    assert success is False
+    assert output
+    assert marker.exists() is False
+
+
+def test_snapshot_execution_drops_caller_pythonpath(tmp_path, monkeypatch):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    scripts.joinpath("task.py").write_text("print('live')\n", encoding="utf-8")
+    injected = tmp_path / "caller-pythonpath"
+    injected.mkdir()
+    injected.joinpath("external_probe.py").write_text(
+        "VALUE = 'injected'\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(injected))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    interpreter = Path(sys.executable).resolve()
+    content = b"import external_probe\nprint(external_probe.VALUE)\n"
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.py",
+        "script_suffix": ".py",
+        "script_bytes": content,
+        "interpreter_path": str(interpreter),
+        "interpreter_bytes": interpreter.read_bytes(),
+        "support_files": [
+            {
+                "root": "script_root",
+                "path": "task.py",
+                "content": content,
+                "mode": 0o644,
+            }
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.py", script_snapshot=snapshot)
+
+    assert success is False
+    assert "external_probe" in output
+
+
 def test_snapshot_without_runtime_lib_stays_on_captured_execution_path(
     tmp_path, monkeypatch
 ):
@@ -2819,7 +2986,12 @@ def test_snapshot_without_runtime_lib_stays_on_captured_execution_path(
         "interpreter_path": str(tmp_path / "runtime" / "bin" / "python"),
         "interpreter_bytes": b"captured-runtime",
         "support_files": [
-            {"root": "script_root", "path": "task.py", "content": b"print('captured')\n"}
+            {
+                "root": "script_root",
+                "path": "task.py",
+                "content": b"print('captured')\n",
+                "mode": 0o644,
+            }
         ],
     }
 
