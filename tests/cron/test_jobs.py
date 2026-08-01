@@ -6,6 +6,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cron.jobs import (
+    _cron_checkpoint_invariant_hash,
+    _cron_delivery_receipt_hash,
+    _cron_interpreter_artifact_hash,
+    _cron_run_artifact_hash,
+    _cron_run_outcome_claim,
+    _cron_run_outcome_receipt,
+    _cron_run_script_snapshot,
+    _cron_script_artifact_hash,
+    _validated_run_outcome_claim,
+    _validated_run_outcome_receipt,
+    CronJobGovernanceError,
+    abandon_job_run_outcome,
+    begin_job_run_outcome,
     parse_duration,
     parse_schedule,
     compute_next_run,
@@ -16,6 +29,7 @@ from cron.jobs import (
     list_jobs,
     update_job,
     pause_job,
+    record_job_run_preflight_denial,
     resume_job,
     remove_job,
     mark_job_run,
@@ -25,6 +39,20 @@ from cron.jobs import (
     get_due_jobs,
     save_job_output,
 )
+
+
+def _signed_job_revision(job_id="job.receipt", profile_id="profile-custom"):
+    return {
+        "id": job_id,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": profile_id,
+            "cron_job_id": job_id,
+            "receipt_id": "sha256:" + "1" * 64,
+            "candidate_hash": "sha256:" + "2" * 64,
+            "job_semantic_hash": "sha256:" + "3" * 64,
+        },
+    }
 
 
 # =========================================================================
@@ -220,9 +248,35 @@ class TestJobCRUD:
 
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
+        output_dir = tmp_cron_dir / "cron" / "output" / job["id"]
+        output_dir.mkdir(parents=True)
+        (output_dir / "result.md").write_text("done", encoding="utf-8")
         assert remove_job(job["id"]) is True
         assert get_job(job["id"]) is None
+        assert not output_dir.exists()
 
+
+    def test_remove_rejects_active_signed_job_between_begin_and_dispatch(
+        self,
+        tmp_cron_dir,
+    ):
+        signed = {
+            "name": "active signed removal",
+            "schedule": {"kind": "once", "run_at": "2099-01-01T00:00:00+00:00"},
+            "repeat": {"times": 1, "completed": 0},
+            **_signed_job_revision("active-remove"),
+        }
+        save_jobs([signed])
+        claim = begin_job_run_outcome(signed)
+        assert claim is not None
+
+        with pytest.raises(CronJobGovernanceError, match="signed run is active"):
+            remove_job(signed["id"])
+
+        persisted = load_jobs()[0]
+        assert persisted["active_run_outcome_claim"] == claim
+        assert claim_dispatch(signed["id"], run_outcome_claim=claim) is True
+        assert load_jobs()[0]["repeat"]["completed"] == 1
 
     def test_auto_repeat_for_once(self, tmp_cron_dir):
         job = create_job(prompt="One-shot", schedule="1h")
@@ -631,6 +685,16 @@ class TestGetDueJobs:
         due = get_due_jobs()
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
+
+    def test_active_run_outcome_claim_is_not_dispatched_again(self, tmp_cron_dir):
+        job = create_job(prompt="Already running", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=10)).isoformat()
+        jobs[0]["active_run_outcome_claim"] = {"run_id": "cron-run:" + "1" * 32}
+        save_jobs(jobs)
+
+        assert get_due_jobs() == []
+        assert get_job(job["id"])["active_run_outcome_claim"] is not None
 
     def test_stale_past_due_runs_once_and_fast_forwards(self, tmp_cron_dir):
         """Recurring jobs past their grace window run once now and fast-forward next_run_at.
@@ -1079,6 +1143,39 @@ class TestClaimDispatch:
         # Persisted BEFORE any side effect — survives a crash.
         assert load_jobs()[0]["repeat"]["completed"] == 1
 
+    def test_signed_dispatch_requires_the_exact_active_revision_claim(
+        self,
+        tmp_cron_dir,
+    ):
+        signed = {
+            **self._oneshot(times=1, completed=0),
+            **_signed_job_revision("os1"),
+        }
+        save_jobs([signed])
+        claim = begin_job_run_outcome(signed)
+        assert claim is not None
+        stale = {**claim, "run_id": "cron-run:" + "9" * 32}
+
+        assert claim_dispatch("os1", run_outcome_claim=stale) is False
+        assert load_jobs()[0]["repeat"]["completed"] == 0
+        assert claim_dispatch("os1", run_outcome_claim=claim) is True
+        assert load_jobs()[0]["repeat"]["completed"] == 1
+
+    def test_signed_dispatch_without_claim_is_refused_without_consuming_count(
+        self,
+        tmp_cron_dir,
+    ):
+        signed = {
+            **self._oneshot(times=1, completed=0),
+            **_signed_job_revision("os1"),
+        }
+        save_jobs([signed])
+
+        assert claim_dispatch("os1") is False
+        persisted = load_jobs()[0]
+        assert persisted["repeat"]["completed"] == 0
+        assert persisted.get("active_run_outcome_claim") is None
+
     def test_already_dispatched_oneshot_is_removed(self, tmp_cron_dir):
         # A prior tick claimed (completed==times) then died before mark_job_run
         # could remove the job.  The next claim must refuse AND clean up.
@@ -1086,6 +1183,18 @@ class TestClaimDispatch:
         assert claim_dispatch("os1") is False
         assert load_jobs() == []  # removed, will not re-fire
 
+
+    def test_missing_job_with_exact_claim_is_refused(self, tmp_cron_dir):
+        signed = {
+            **self._oneshot(times=1, completed=0),
+            **_signed_job_revision("os1"),
+        }
+        save_jobs([signed])
+        claim = begin_job_run_outcome(signed)
+        assert claim is not None
+        save_jobs([])
+
+        assert claim_dispatch("os1", run_outcome_claim=claim) is False
 
     def test_mark_job_run_does_not_double_count_preclaimed_oneshot(self, tmp_cron_dir):
         # Full lifecycle: claim bumps completed to times, then mark_job_run must

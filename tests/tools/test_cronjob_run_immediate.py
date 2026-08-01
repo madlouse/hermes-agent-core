@@ -37,7 +37,7 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
-        m_run.assert_called_once()                       # fired via the shared body
+        m_run.assert_called_once_with(ran)                # fire the claimed snapshot
 
 
     def test_execute_job_now_bails_without_claim(self):

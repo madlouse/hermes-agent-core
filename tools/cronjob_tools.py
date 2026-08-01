@@ -625,6 +625,14 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
 
+        claimed_job = get_job(job_id)
+        if claimed_job is None:
+            return {
+                "claimed": True,
+                "success": False,
+                "error": "Job disappeared after its manual fire claim was committed.",
+            }
+
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
         #

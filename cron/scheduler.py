@@ -653,6 +653,16 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
+# Serializes the narrow durable-dispatch -> phase-publication transition with
+# shutdown without holding ``_running_lock`` across the jobs store lock.
+_dispatch_transition_lock = threading.Lock()
+
+# Per-run state guarded by ``_running_lock``. The shutdown path uses the exact
+# signed claim and dispatch phase to distinguish an unexecuted preflight claim
+# (abandon it) from a committed run (persist an interrupted terminal state).
+_running_job_states: dict[str, dict[str, Any]] = {}
+_RUNNING_STATE_UNSET = object()
+
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
 # below). ``run_one_job``'s own completion path checks this set before
@@ -661,6 +671,54 @@ _running_lock = threading.Lock()
 # plausible-looking final response from truncated output — can never
 # overwrite the interrupted status with a false "ok" (#60432).
 _interrupted_job_ids: set = set()
+
+
+def _set_running_job_state(
+    job_id: str,
+    phase: str,
+    *,
+    run_outcome_claim: Any = _RUNNING_STATE_UNSET,
+    run_claim: Any = _RUNNING_STATE_UNSET,
+    fire_claim: Any = _RUNNING_STATE_UNSET,
+) -> bool:
+    """Record one run phase and return whether shutdown already claimed it."""
+    with _running_lock:
+        state = _running_job_states.setdefault(job_id, {})
+        state["phase"] = phase
+        if run_outcome_claim is not _RUNNING_STATE_UNSET:
+            state["run_outcome_claim"] = run_outcome_claim
+        if run_claim is not _RUNNING_STATE_UNSET:
+            state["run_claim"] = run_claim
+        if fire_claim is not _RUNNING_STATE_UNSET:
+            state["fire_claim"] = fire_claim
+        return job_id in _interrupted_job_ids
+
+
+def _claim_dispatch_with_running_state(
+    job_id: str,
+    run_outcome_claim: Optional[dict[str, Any]],
+) -> tuple[bool, bool]:
+    """Claim a dispatch while its shutdown-visible phase changes atomically."""
+    with _dispatch_transition_lock:
+        if _set_running_job_state(job_id, "attempting"):
+            return False, True
+        try:
+            allowed = (
+                claim_dispatch(job_id)
+                if run_outcome_claim is None
+                else claim_dispatch(
+                    job_id,
+                    run_outcome_claim=run_outcome_claim,
+                )
+            )
+        except BaseException:
+            _set_running_job_state(job_id, "ambiguous")
+            raise
+        interrupted = _set_running_job_state(
+            job_id,
+            "committed" if allowed else "refused",
+        )
+        return allowed, interrupted
 
 
 def get_running_job_ids() -> "frozenset[str]":
@@ -706,14 +764,35 @@ def mark_running_jobs_interrupted(reason: str) -> list:
 
     Returns the list of job IDs marked, for the caller to log.
     """
-    with _running_lock:
-        job_ids = list(_running_job_ids)
-        _interrupted_job_ids.update(job_ids)
+    with _dispatch_transition_lock:
+        with _running_lock:
+            job_ids = list(_running_job_ids)
+            _interrupted_job_ids.update(job_ids)
+            states = {
+                job_id: dict(_running_job_states.get(job_id, {}))
+                for job_id in job_ids
+            }
     marked = []
     for job_id in job_ids:
+        state = states[job_id]
+        phase = state.get("phase", "executing")
+        claim = state.get("run_outcome_claim")
         try:
-            mark_job_run(job_id, False, reason)
-            marked.append(job_id)
+            if phase in {"queued", "ambiguous"}:
+                continue
+            if phase in {"preflight", "attempting", "refused"}:
+                if claim is not None:
+                    abandon_job_run_outcome(
+                        job_id,
+                        claim,
+                        reason_code="run_outcome_interrupted_before_dispatch",
+                        run_claim=state.get("run_claim"),
+                        fire_claim=state.get("fire_claim"),
+                    )
+                continue
+            kwargs = {"run_outcome_claim": claim} if claim is not None else {}
+            if mark_job_run(job_id, False, reason, **kwargs):
+                marked.append(job_id)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
     return marked
@@ -2688,6 +2767,8 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     run_control: Optional[_CronRunControl] = None,
+    *,
+    script_snapshot: bytes | None = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2757,6 +2838,7 @@ def _run_job_script(
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
+    snapshot_bash = False
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
@@ -2772,11 +2854,29 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        argv = [str(path)] if script_snapshot is not None else [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
-        argv = [python_exe, str(path)]
+        argv = (
+            [
+                python_exe,
+                "-s",
+                "-P",
+                "-c",
+                (
+                    "import sys; from importlib.machinery import SourceFileLoader; "
+                    "p=sys.argv[1]; sys.argv=[p]; "
+                    "g={'__name__':'__main__','__file__':p,'__package__':None,"
+                    "'__cached__':None,'__spec__':None,"
+                    "'__loader__':SourceFileLoader('__main__',p)}; "
+                    "exec(compile(sys.stdin.buffer.read(),p,'exec'),g)"
+                ),
+                str(path),
+            ]
+            if script_snapshot is not None
+            else [python_exe, str(path)]
+        )
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -2791,6 +2891,11 @@ def _run_job_script(
             }
         else:
             popen_kwargs = {"start_new_session": True}
+        if suffix in {".sh", ".bash"} and script_snapshot is not None:
+            popen_kwargs["executable"] = _bash
+        if script_snapshot is not None:
+            popen_kwargs.pop("encoding", None)
+            popen_kwargs.pop("errors", None)
         env = build_subprocess_env()
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
@@ -2813,7 +2918,8 @@ def _run_job_script(
                 argv,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                stdin=subprocess.PIPE if script_snapshot is not None else None,
+                text=script_snapshot is None,
                 cwd=_script_cwd,
                 env=env,
                 **popen_kwargs,
@@ -2828,7 +2934,10 @@ def _run_job_script(
             else None
         )
         try:
-            stdout_raw, stderr_raw = process.communicate(timeout=effective_timeout)
+            stdout_raw, stderr_raw = process.communicate(
+                input=script_snapshot,
+                timeout=effective_timeout,
+            )
         except subprocess.TimeoutExpired:
             if run_control is not None and cleanup is not None:
                 run_control.cleanup_script_process(cleanup, kill=True)
@@ -2847,8 +2956,16 @@ def _run_job_script(
                     cleanup, kill=process.poll() is None
                 )
 
-        stdout = (stdout_raw or "").strip()
-        stderr = (stderr_raw or "").strip()
+        stdout = (
+            stdout_raw.decode("utf-8", errors="replace")
+            if isinstance(stdout_raw, bytes)
+            else (stdout_raw or "")
+        ).strip()
+        stderr = (
+            stderr_raw.decode("utf-8", errors="replace")
+            if isinstance(stderr_raw, bytes)
+            else (stderr_raw or "")
+        ).strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -3449,6 +3566,7 @@ def _run_job_impl(
     *,
     defer_agent_teardown: Optional[list] = None,
     _run_control: _CronRunControl,
+    script_snapshot: bytes | None = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3515,12 +3633,20 @@ def _run_job_impl(
             _job_workdir = None
 
         try:
-            ok, output = _run_job_script_with_claim_heartbeat(
-                job,
-                script_path,
-                workdir=_job_workdir,
-                run_control=_run_control,
-            )
+            if script_snapshot is None:
+                ok, output = _run_job_script_with_claim_heartbeat(
+                    job,
+                    script_path,
+                    workdir=_job_workdir,
+                    run_control=_run_control,
+                )
+            else:
+                ok, output = _run_job_script(
+                    script_path,
+                    workdir=_job_workdir,
+                    run_control=_run_control,
+                    script_snapshot=script_snapshot,
+                )
         except Exception as exc:
             logger.exception(
                 "Job '%s': script execution raised unexpectedly", job_id,
@@ -3666,9 +3792,16 @@ def _run_job_impl(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(
-            job, script_path, run_control=_run_control
-        )
+        if script_snapshot is None:
+            prerun_script = _run_job_script_with_claim_heartbeat(
+                job, script_path, run_control=_run_control
+            )
+        else:
+            prerun_script = _run_job_script(
+                script_path,
+                run_control=_run_control,
+                script_snapshot=script_snapshot,
+            )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -4630,7 +4763,10 @@ def _run_job_impl(
 
 
 def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    script_snapshot: bytes | None = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Execute a job under one deadline measured from this entry boundary.
 
@@ -4662,6 +4798,7 @@ def run_job(
         job,
         defer_agent_teardown=worker_deferred,
         _run_control=control,
+        script_snapshot=script_snapshot,
     )
 
     try:
@@ -4745,14 +4882,122 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
     try:
-        # Pre-run dispatch claim (issue #38758): atomically commit a finite
-        # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
-        # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
-        # re-fire the job forever on restart. No-op for recurring jobs (they
-        # use advance_next_run) and infinite/no-repeat jobs. This lives here in
-        # the shared body so BOTH the built-in ticker and the external provider
-        # (Chronos fire_due) get at-most-times semantics.
-        if not claim_dispatch(job["id"]):
+        if _set_running_job_state(
+            job["id"],
+            "preflight",
+            run_outcome_claim=None,
+            run_claim=job.get("run_claim"),
+            fire_claim=job.get("fire_claim"),
+        ):
+            return False
+        # A signed Job clears its previous terminal proof before any script,
+        # model, tool, or delivery side effect. The claim freezes the actual
+        # implementation/checkpoint tuple and is CAS-checked at terminal write.
+        run_outcome_claim = begin_job_run_outcome(job)
+        interrupted = _set_running_job_state(
+            job["id"],
+            "preflight",
+            run_outcome_claim=run_outcome_claim,
+        )
+        if interrupted:
+            if run_outcome_claim is not None:
+                abandon_job_run_outcome(
+                    job["id"],
+                    run_outcome_claim,
+                    reason_code="run_outcome_interrupted_before_dispatch",
+                    run_claim=job.get("run_claim"),
+                    fire_claim=job.get("fire_claim"),
+                )
+            return False
+        if job.get("creation_governance_receipt") is not None and run_outcome_claim is None:
+            verification_declared = any(
+                job.get(field) not in (None, "")
+                for field in ("verification_command", "verification_command_mode")
+            )
+            reason_code = (
+                "unsupported_verification_contract"
+                if verification_declared
+                else "run_outcome_claim_unavailable"
+            )
+            creation = job.get("creation_governance_receipt")
+            job_revision = (
+                str(creation.get("receipt_id") or "")
+                if isinstance(creation, dict)
+                else ""
+            )
+            record_job_run_preflight_denial(
+                job["id"],
+                job_revision=job_revision,
+                reason_code=reason_code,
+                run_claim=job.get("run_claim"),
+                fire_claim=job.get("fire_claim"),
+            )
+            logger.error(
+                "Job '%s': signed run outcome claim could not be established (%s); aborting",
+                job["id"],
+                reason_code,
+            )
+            return False
+        script_snapshot = None
+        if run_outcome_claim is not None:
+            snapshot_matches, script_snapshot = _cron_run_script_snapshot(
+                job,
+                run_outcome_claim,
+            )
+            if not snapshot_matches:
+                abandon_job_run_outcome(
+                    job["id"],
+                    run_outcome_claim,
+                    reason_code="run_outcome_script_changed",
+                    run_claim=job.get("run_claim"),
+                    fire_claim=job.get("fire_claim"),
+                )
+                logger.error(
+                    "Job '%s': script changed after the run claim; aborting",
+                    job["id"],
+                )
+                return False
+
+        # Claim a finite one-shot only after every zero-side-effect signed
+        # preflight succeeds. A crash after this point must retain at-most-times
+        # semantics; a rejected claim or changed snapshot must not consume it.
+        dispatch_phase = "attempting"
+        dispatch_allowed, dispatch_interrupted = _claim_dispatch_with_running_state(
+            job["id"],
+            run_outcome_claim,
+        )
+        if dispatch_interrupted:
+            if dispatch_allowed:
+                kwargs = (
+                    {"run_outcome_claim": run_outcome_claim}
+                    if run_outcome_claim is not None
+                    else {}
+                )
+                mark_job_run(
+                    job["id"],
+                    False,
+                    "Interrupted by gateway shutdown before execution started.",
+                    **kwargs,
+                )
+            elif run_outcome_claim is not None:
+                abandon_job_run_outcome(
+                    job["id"],
+                    run_outcome_claim,
+                    reason_code="run_outcome_interrupted_before_dispatch",
+                    run_claim=job.get("run_claim"),
+                    fire_claim=job.get("fire_claim"),
+                )
+            _consume_interrupted_flag(job["id"])
+            return False
+        if not dispatch_allowed:
+            dispatch_phase = "refused"
+            if run_outcome_claim is not None:
+                abandon_job_run_outcome(
+                    job["id"],
+                    run_outcome_claim,
+                    run_claim=job.get("run_claim"),
+                    fire_claim=job.get("fire_claim"),
+                )
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
@@ -4763,6 +5008,21 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 error="Dispatch claim rejected; execution was not started.",
             )
             return True  # not an error — already handled/removed
+        dispatch_phase = "committed"
+        if _set_running_job_state(job["id"], "executing"):
+            kwargs = (
+                {"run_outcome_claim": run_outcome_claim}
+                if run_outcome_claim is not None
+                else {}
+            )
+            mark_job_run(
+                job["id"],
+                False,
+                "Interrupted by gateway shutdown before execution started.",
+                **kwargs,
+            )
+            _consume_interrupted_flag(job["id"])
+            return False
 
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
@@ -4793,9 +5053,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
-            )
+            run_kwargs: dict[str, Any] = {
+                "defer_agent_teardown": _deferred_agents,
+            }
+            if script_snapshot is not None:
+                run_kwargs["script_snapshot"] = script_snapshot
+            success, output, final_response, error = run_job(job, **run_kwargs)
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -4931,6 +5194,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         if not isinstance(e, Exception):
             raise
         return False
+    finally:
+        with _running_lock:
+            _running_job_states.pop(job["id"], None)
+            _interrupted_job_ids.discard(job["id"])
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -5108,6 +5375,8 @@ def tick(
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
+                        _running_job_states.pop(j["id"], None)
+                        _interrupted_job_ids.discard(j["id"])
 
             try:
                 return pool.submit(_run_and_release)

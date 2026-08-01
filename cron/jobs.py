@@ -18,6 +18,7 @@ import threading
 import time
 import os
 import re
+import sys
 import uuid
 
 # Cross-process advisory file locking for jobs.json critical sections.
@@ -3441,25 +3442,38 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
-    job = resolve_job_ref(job_id)
-    if not job:
-        return False
-    canonical_id = job["id"]
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
-        original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
-        if len(jobs) < original_len:
-            # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
-            # left over from before the create-time guard) fails closed without
-            # half-applying the removal.
-            job_output_dir = _job_output_dir(canonical_id)
-            save_jobs(jobs)
-            # Clean up output directory to prevent orphaned dirs accumulating
-            if job_output_dir.exists():
-                shutil.rmtree(job_output_dir)
-            return True
-    return False
+        job = next((item for item in jobs if item.get("id") == job_id), None)
+        if job is None:
+            name_matches = [
+                item
+                for item in jobs
+                if str(item.get("name") or "").lower() == str(job_id or "").lower()
+            ]
+            if len(name_matches) > 1:
+                raise AmbiguousJobReference(
+                    job_id,
+                    [_normalize_job_record(item) for item in name_matches],
+                )
+            job = name_matches[0] if name_matches else None
+        if job is None:
+            return False
+        if job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None:
+            raise CronJobGovernanceError(
+                "Cron job cannot be removed while a signed run is active."
+            )
+        canonical_id = job["id"]
+        # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
+        # left over from before the create-time guard) fails closed without
+        # half-applying the removal.
+        job_output_dir = _job_output_dir(canonical_id)
+        retained = [item for item in jobs if item["id"] != canonical_id]
+        _save_jobs_unlocked(retained)
+        # Clean up output directory to prevent orphaned dirs accumulating.
+        if job_output_dir.exists():
+            shutil.rmtree(job_output_dir)
+        return True
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
@@ -3477,6 +3491,52 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                creation = job.get("creation_governance_receipt")
+                if isinstance(creation, dict) and run_outcome_claim is None:
+                    logger.warning(
+                        "mark_job_run: signed job_id %s requires its active run outcome claim; skipping save",
+                        job_id,
+                    )
+                    return False
+                if run_outcome_claim is not None:
+                    if (
+                        not isinstance(creation, dict)
+                        or creation.get("receipt_id") != run_outcome_claim.get("job_revision")
+                        or job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) != run_outcome_claim
+                    ):
+                        logger.warning(
+                            "mark_job_run: stale run outcome claim for job_id %s; skipping save",
+                            job_id,
+                        )
+                        return False
+                    if run_outcome_receipt is not None and any(
+                        run_outcome_receipt.get(field) != run_outcome_claim.get(field)
+                        for field in (
+                            "profile_id",
+                            "job_id",
+                            "job_revision",
+                            "run_id",
+                            "implementation_hash",
+                        )
+                    ):
+                        raise ValueError("cron run outcome receipt does not match its claim")
+                    if run_outcome_receipt is not None:
+                        expected_checkpoint = _cron_checkpoint_invariant_hash(
+                            job,
+                            run_outcome_claim,
+                            success=success,
+                        )
+                        expected_delivery = _cron_delivery_receipt_hash(
+                            run_outcome_claim["run_id"],
+                            delivery_receipt,
+                        )
+                        if (
+                            run_outcome_receipt.get("terminal_state")
+                            != ("success" if success else "failed")
+                            or expected_checkpoint != run_outcome_receipt.get("checkpoint_invariant_hash")
+                            or expected_delivery != run_outcome_receipt.get("delivery_receipt_hash")
+                        ):
+                            raise ValueError("cron run outcome receipt does not match its claim")
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
@@ -3528,7 +3588,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["state"] = "completed"
                         job["next_run_at"] = None
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -3563,9 +3623,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
@@ -3612,7 +3673,11 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
         )
 
 
-def claim_dispatch(job_id: str) -> bool:
+def claim_dispatch(
+    job_id: str,
+    *,
+    run_outcome_claim: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Atomically claim a finite one-shot job dispatch BEFORE execution.
 
     Increments ``repeat.completed`` under the cross-process jobs lock and
@@ -3629,11 +3694,33 @@ def claim_dispatch(job_id: str) -> bool:
     Recurring jobs (they use ``advance_next_run``) and infinite-repeat / no-repeat
     jobs are left unchanged and always allowed to proceed.
     """
-    with _jobs_lock():
+    if run_outcome_claim is not None:
+        run_outcome_claim = _validated_run_outcome_claim(run_outcome_claim)
+    with _jobs_lock(require_cross_process=run_outcome_claim is not None):
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+            creation = job.get("creation_governance_receipt")
+            if creation is not None and run_outcome_claim is None:
+                logger.warning(
+                    "claim_dispatch: signed job_id %s requires an exact run outcome claim; refusing dispatch",
+                    job_id,
+                )
+                return False
+            if run_outcome_claim is not None:
+                if (
+                    not isinstance(creation, dict)
+                    or creation.get("receipt_id")
+                    != run_outcome_claim.get("job_revision")
+                    or job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD)
+                    != run_outcome_claim
+                ):
+                    logger.warning(
+                        "claim_dispatch: stale run outcome claim for job_id %s; refusing dispatch",
+                        job_id,
+                    )
+                    return False
             if job.get("schedule", {}).get("kind") != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
             repeat = job.get("repeat")
@@ -3686,8 +3773,14 @@ def claim_dispatch(job_id: str) -> bool:
             )
             return True
 
+        if run_outcome_claim is not None:
+            logger.warning(
+                "claim_dispatch: exact run outcome claim has no stored job_id %s; refusing dispatch",
+                job_id,
+            )
+            return False
         logger.debug(
-            "claim_dispatch: job_id %s not in store — proceeding without claim "
+            "claim_dispatch: unsigned job_id %s not in store — proceeding "
             "(handed-in job dict; nothing to persist a claim against)",
             job_id,
         )
@@ -4065,6 +4158,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # state still reaches save_jobs() below.
         try:
             if not job.get("enabled", True):
+                continue
+            if job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None:
                 continue
 
             # Cross-process running-claim guard (#59229): if another scheduler

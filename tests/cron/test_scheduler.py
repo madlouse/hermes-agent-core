@@ -2246,6 +2246,651 @@ class TestDeliverResultTimeoutCancelsFuture:
         standalone_send.assert_not_awaited()
 
 
+def test_run_one_job_persists_core_terminal_run_outcome_receipt():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "run-proof-job", "name": "Run proof", "deliver": "local"}
+    claim = {
+        "schema_version": "cron-run-claim/v1",
+        "profile_id": "profile-custom",
+        "job_id": "run-proof-job",
+        "job_revision": "sha256:" + "1" * 64,
+        "run_id": "cron-run:" + "2" * 32,
+        "script_artifact_hash": "sha256:" + "6" * 64,
+        "implementation_hash": "sha256:" + "3" * 64,
+        "checkpoint_policy_hash": "sha256:" + "4" * 64,
+    }
+    receipt = {
+        "schema_version": "cron-run-outcome/v1",
+        "profile_id": claim["profile_id"],
+        "job_id": claim["job_id"],
+        "job_revision": claim["job_revision"],
+        "run_id": claim["run_id"],
+        "terminal_state": "success",
+        "implementation_hash": claim["implementation_hash"],
+        "checkpoint_invariant_hash": "sha256:" + "5" * 64,
+        "delivery_receipt_hash": "sha256:" + "7" * 64,
+    }
+    delivery = {
+        "schema_version": "cron-delivery/v1",
+        "status": "success",
+        "required_count": 1,
+        "confirmed_count": 1,
+        "failed_count": 0,
+        "unconfirmed_count": 0,
+        "receipts_truncated": False,
+    }
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._cron_delivery_receipt_summary", return_value=delivery), \
+         patch("cron.scheduler._cron_run_outcome_receipt", return_value=receipt) as receipt_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is True
+
+    receipt_mock.assert_called_once_with(
+        job,
+        success=True,
+        run_outcome_claim=claim,
+        delivery_receipt=delivery,
+    )
+    assert mark_mock.call_args.args == ("run-proof-job", True, None)
+    assert mark_mock.call_args.kwargs == {
+        "delivery_error": None,
+        "delivery_receipt": delivery,
+        "run_outcome_receipt": receipt,
+        "run_outcome_claim": claim,
+    }
+
+
+def test_run_one_job_real_claim_producer_and_writer_round_trip(tmp_path, monkeypatch):
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    cron_dir.mkdir()
+    (cron_dir / ".jobs.lock").touch(mode=0o600)
+    job = {
+        "id": "run-proof-real-writer",
+        "name": "Run proof",
+        "prompt": "report",
+        "skills": [],
+        "schedule": {"kind": "interval", "minutes": 60},
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "deliver": "local",
+        "last_status": None,
+        "last_error": None,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": "profile-custom",
+            "cron_job_id": "run-proof-real-writer",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    jobs.save_jobs([job])
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "output.md")):
+        assert scheduler.run_one_job(job) is True
+
+    persisted = jobs.get_job(job["id"])
+    receipt = persisted["last_run_outcome_receipt"]
+    assert receipt["schema_version"] == "cron-run-outcome/v1"
+    assert receipt["job_revision"] == "sha256:" + "1" * 64
+    assert receipt["terminal_state"] == "success"
+    assert receipt["implementation_hash"].startswith("sha256:")
+    assert receipt["checkpoint_invariant_hash"].startswith("sha256:")
+    assert receipt["delivery_receipt_hash"].startswith("sha256:")
+    assert persisted["active_run_outcome_claim"] is None
+    assert list(tmp_path.rglob("*.db")) == []
+
+
+def test_signed_job_claim_failure_aborts_before_any_run_side_effect():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "signed-claim-failed",
+        "name": "Signed claim failed",
+        "deliver": "local",
+        "creation_governance_receipt": {
+            "schema_version": "invalid",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    with patch("cron.scheduler.claim_dispatch", return_value=True) as dispatch_mock, \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=None), \
+         patch("cron.scheduler.record_job_run_preflight_denial") as denial_mock, \
+         patch("cron.scheduler.run_job") as run_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    dispatch_mock.assert_not_called()
+    denial_mock.assert_called_once_with(
+        job["id"],
+        job_revision="sha256:" + "1" * 64,
+        reason_code="run_outcome_claim_unavailable",
+        run_claim=None,
+        fire_claim=None,
+    )
+    run_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_unsupported_verification_preflight_preserves_finite_oneshot(
+    tmp_path, monkeypatch
+):
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    cron_dir = tmp_path / "cron"
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    marker = tmp_path / "must-not-run"
+    (scripts / "task.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('wrong')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    cron_dir.mkdir()
+    (cron_dir / ".jobs.lock").touch(mode=0o600)
+    run_claim = {"at": "2026-07-22T00:00:00+00:00", "by": "scheduler-a"}
+    job = {
+        "id": "unsupported-verifier",
+        "name": "Unsupported verifier",
+        "schedule": {"kind": "once", "run_at": "2026-07-22T00:00:00+00:00"},
+        "repeat": {"times": 1, "completed": 0},
+        "enabled": True,
+        "deliver": "local",
+        "no_agent": True,
+        "script": "task.py",
+        "verification_command": "python verify.py",
+        "verification_command_mode": "read_only",
+        "run_claim": run_claim,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": "profile-custom",
+            "cron_job_id": "unsupported-verifier",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    jobs.save_jobs([job])
+
+    assert scheduler.run_one_job(job) is False
+
+    persisted = jobs.get_job(job["id"])
+    assert persisted is not None
+    assert persisted["repeat"]["completed"] == 0
+    assert persisted["run_claim"] is None
+    assert persisted["last_runtime_admission_receipt"]["reason_code"] == (
+        "unsupported_verification_contract"
+    )
+    assert marker.exists() is False
+
+
+def test_script_snapshot_mismatch_abandons_claim_before_side_effect():
+    import cron.scheduler as scheduler
+
+    job = {"id": "snapshot-drift", "name": "Snapshot drift", "deliver": "local"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.claim_dispatch", return_value=True) as dispatch_mock, \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(False, b"drift")), \
+         patch("cron.scheduler.abandon_job_run_outcome", return_value=True) as abandon_mock, \
+         patch("cron.scheduler.run_job") as run_mock:
+        assert scheduler.run_one_job(job) is False
+
+    dispatch_mock.assert_not_called()
+    abandon_mock.assert_called_once_with(
+        job["id"],
+        claim,
+        reason_code="run_outcome_script_changed",
+        run_claim=None,
+        fire_claim=None,
+    )
+    run_mock.assert_not_called()
+
+
+def test_pre_dispatch_exception_does_not_consume_finite_legacy_job():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "pre-dispatch-exception",
+        "name": "Pre-dispatch exception",
+        "deliver": "local",
+        "schedule": {"kind": "once", "run_at": "2026-07-22T00:00:00+00:00"},
+        "repeat": {"times": 1, "completed": 0},
+    }
+    with patch(
+        "cron.scheduler.begin_job_run_outcome",
+        side_effect=RuntimeError("preflight unavailable"),
+    ), patch("cron.scheduler.claim_dispatch") as dispatch_mock, patch(
+        "cron.scheduler.mark_job_run"
+    ) as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    dispatch_mock.assert_not_called()
+    mark_mock.assert_not_called()
+    assert job["repeat"]["completed"] == 0
+
+
+def test_signed_begin_exception_records_exact_preflight_denial():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "signed-begin-exception",
+        "name": "Signed begin exception",
+        "deliver": "local",
+        "run_claim": None,
+        "fire_claim": {"at": "2026-07-22T00:00:00+00:00", "by": "manual"},
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    with patch(
+        "cron.scheduler.begin_job_run_outcome",
+        side_effect=RuntimeError("claim store unavailable"),
+    ), patch(
+        "cron.scheduler.record_job_run_preflight_denial", return_value=True
+    ) as denial_mock, patch("cron.scheduler.claim_dispatch") as dispatch_mock, patch(
+        "cron.scheduler.mark_job_run"
+    ) as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    denial_mock.assert_called_once_with(
+        job["id"],
+        job_revision="sha256:" + "1" * 64,
+        reason_code="run_outcome_preflight_exception",
+        run_claim=None,
+        fire_claim=job["fire_claim"],
+    )
+    dispatch_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_signed_pre_dispatch_exception_abandons_only_exact_active_claim():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "signed-pre-dispatch-exception",
+        "name": "Signed pre-dispatch exception",
+        "deliver": "local",
+        "run_claim": {"at": "2026-07-22T00:00:00+00:00", "by": "ticker"},
+        "fire_claim": None,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.begin_job_run_outcome", return_value=claim), patch(
+        "cron.scheduler._cron_run_script_snapshot",
+        side_effect=RuntimeError("snapshot unavailable"),
+    ), patch("cron.scheduler.abandon_job_run_outcome", return_value=True) as abandon_mock, patch(
+        "cron.scheduler.claim_dispatch"
+    ) as dispatch_mock, patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    abandon_mock.assert_called_once_with(
+        job["id"],
+        claim,
+        reason_code="run_outcome_preflight_exception",
+        run_claim=job["run_claim"],
+        fire_claim=None,
+    )
+    dispatch_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_pre_dispatch_cleanup_failure_never_falls_through_to_terminal_write(caplog):
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "pre-dispatch-cleanup-failed",
+        "name": "Pre-dispatch cleanup failed",
+        "deliver": "local",
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.begin_job_run_outcome", return_value=claim), patch(
+        "cron.scheduler._cron_run_script_snapshot",
+        side_effect=RuntimeError("snapshot unavailable"),
+    ), patch(
+        "cron.scheduler.abandon_job_run_outcome",
+        side_effect=RuntimeError("lock unavailable"),
+    ), patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    mark_mock.assert_not_called()
+    assert "failed to persist preflight exception state" in caplog.text
+
+
+def test_dispatch_exception_preserves_ambiguous_claim_state():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "dispatch-ambiguous",
+        "name": "Dispatch ambiguous",
+        "deliver": "local",
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.begin_job_run_outcome", return_value=claim), patch(
+        "cron.scheduler._cron_run_script_snapshot", return_value=(True, None)
+    ), patch(
+        "cron.scheduler.claim_dispatch", side_effect=RuntimeError("commit unknown")
+    ), patch("cron.scheduler.abandon_job_run_outcome") as abandon_mock, patch(
+        "cron.scheduler.record_job_run_preflight_denial"
+    ) as denial_mock, patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    abandon_mock.assert_not_called()
+    denial_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_refused_finite_dispatch_releases_signed_outcome_claim():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "dispatch-refused",
+        "name": "Dispatch refused",
+        "deliver": "local",
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.claim_dispatch", return_value=False), \
+         patch("cron.scheduler.abandon_job_run_outcome", return_value=True) as abandon_mock, \
+         patch("cron.scheduler.run_job") as run_mock:
+        assert scheduler.run_one_job(job) is True
+
+    abandon_mock.assert_called_once_with(
+        job["id"],
+        claim,
+        run_claim=None,
+        fire_claim=None,
+    )
+    run_mock.assert_not_called()
+
+
+def test_run_job_script_executes_bound_snapshot_not_mutated_path(tmp_path, monkeypatch):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    script = scripts / "task.py"
+    side_effect = tmp_path / "must-not-exist"
+    script.write_text(
+        f"from pathlib import Path\nPath({str(side_effect)!r}).write_text('wrong')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+
+    success, output = scheduler._run_job_script(
+        "task.py",
+        script_snapshot=(
+            b"import sys\n"
+            b"assert sys.argv == [__file__]\n"
+            b"assert __spec__ is None\n"
+            b"assert __loader__.name == '__main__'\n"
+            b"assert __loader__.path == __file__\n"
+            b"print('claimed-snapshot')\n"
+        ),
+    )
+
+    assert success is True
+    assert output == "claimed-snapshot"
+    assert side_effect.exists() is False
+
+    script.write_text("print('mutable-path')\n", encoding="utf-8")
+    success, output = scheduler._run_job_script("task.py")
+    assert success is True
+    assert output == "mutable-path"
+
+    shell = scripts / "task.sh"
+    shell.write_text(f"touch {side_effect}\n", encoding="utf-8")
+    success, output = scheduler._run_job_script(
+        "task.sh",
+        script_snapshot=(
+            b"printf '%s|%s|%s|%s' \"$0\" \"$#\" "
+            b"\"${1-unset}\" \"${BASH_SOURCE[0]-}\"\n"
+        ),
+    )
+    assert success is True
+    assert output == f"{shell}|0|unset|{shell}"
+    assert side_effect.exists() is False
+
+
+def test_run_job_routes_no_agent_script_through_optional_snapshot():
+    import cron.scheduler as scheduler
+
+    job = {"id": "no-agent-snapshot", "name": "Snapshot", "no_agent": True, "script": "task.py"}
+    with patch("cron.jobs._apply_cron_runtime_governance"), \
+         patch("cron.scheduler._run_job_script", return_value=(True, "payload")) as script_mock:
+        assert scheduler.run_job(job)[0] is True
+        script_mock.assert_called_once_with("task.py")
+
+        script_mock.reset_mock()
+        assert scheduler.run_job(job, script_snapshot=b"claimed")[0] is True
+        script_mock.assert_called_once_with(
+            "task.py",
+            script_snapshot=b"claimed",
+        )
+
+
+def test_run_one_job_passes_claimed_script_snapshot_to_executor():
+    import cron.scheduler as scheduler
+
+    job = {"id": "snapshot-bound", "name": "Snapshot", "deliver": "local"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, b"claimed")), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)) as run_mock, \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._cron_run_outcome_receipt", return_value=None), \
+         patch("cron.scheduler.mark_job_run"):
+        assert scheduler.run_one_job(job) is True
+
+    assert run_mock.call_args.kwargs["script_snapshot"] == b"claimed"
+
+
+def test_run_one_job_persists_failed_receipt_when_terminal_pipeline_raises():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "run-proof-failed", "name": "Run proof", "deliver": "local"}
+    claim = {
+        "schema_version": "cron-run-claim/v1",
+        "profile_id": "profile-custom",
+        "job_id": "run-proof-failed",
+        "job_revision": "sha256:" + "1" * 64,
+        "run_id": "cron-run:" + "2" * 32,
+        "script_artifact_hash": "sha256:" + "6" * 64,
+        "implementation_hash": "sha256:" + "3" * 64,
+        "checkpoint_policy_hash": "sha256:" + "4" * 64,
+    }
+    receipt = {
+        "schema_version": "cron-run-outcome/v1",
+        "profile_id": claim["profile_id"],
+        "job_id": claim["job_id"],
+        "job_revision": claim["job_revision"],
+        "run_id": claim["run_id"],
+        "terminal_state": "failed",
+        "implementation_hash": claim["implementation_hash"],
+        "checkpoint_invariant_hash": "sha256:" + "5" * 64,
+        "delivery_receipt_hash": "sha256:" + "7" * 64,
+    }
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.save_job_output", side_effect=RuntimeError("disk unavailable")), \
+         patch("cron.scheduler._cron_run_outcome_receipt", return_value=receipt) as receipt_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    receipt_mock.assert_called_once_with(
+        job,
+        success=False,
+        run_outcome_claim=claim,
+        delivery_receipt=None,
+    )
+    mark_mock.assert_called_once_with(
+        "run-proof-failed",
+        False,
+        "disk unavailable",
+        run_outcome_receipt=receipt,
+        run_outcome_claim=claim,
+    )
+
+
+def test_run_one_job_clears_stale_receipt_when_exception_has_no_signed_revision():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "legacy-run-failed", "name": "Legacy run", "deliver": "local"}
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.run_job", side_effect=RuntimeError("model unavailable")), \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    mark_mock.assert_called_once_with("legacy-run-failed", False, "model unavailable")
+
+
+def test_run_one_job_keeps_admission_denial_distinct_from_failed_run_receipt():
+    import cron.scheduler as scheduler
+
+    job = {"id": "run-proof-blocked", "name": "Run proof", "deliver": "local"}
+    admission = {
+        "schema_version": "cron-runtime-admission/v1",
+        "receipt_id": "cron-runtime-admission:" + "a" * 32,
+        "stage": "pre_cron_job_run",
+        "status": "blocked",
+        "reason_code": "job_paused",
+        "state": "paused",
+        "exception_class": "runtime_admission_blocked",
+        "retryable": False,
+        "job_fingerprint": "sha256:" + "b" * 64,
+    }
+    claim = {
+        "schema_version": "cron-run-claim/v1",
+        "profile_id": "profile-custom",
+        "job_id": "run-proof-blocked",
+        "job_revision": "sha256:" + "1" * 64,
+        "run_id": "cron-run:" + "2" * 32,
+        "implementation_hash": "sha256:" + "3" * 64,
+        "checkpoint_policy_hash": "sha256:" + "4" * 64,
+    }
+
+    def denied_run(*_args, **_kwargs):
+        scheduler._runtime_admission_receipt.set(admission)
+        return False, "# denied", "", "Cron job was not run: job_paused."
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", side_effect=denied_run), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+         patch("cron.scheduler._deliver_result", return_value=None), \
+         patch("cron.scheduler._cron_run_outcome_receipt") as outcome_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is True
+
+    outcome_mock.assert_not_called()
+    mark_mock.assert_called_once_with(
+        "run-proof-blocked",
+        False,
+        "Cron job was not run: job_paused.",
+        runtime_admission_receipt=admission,
+        delivery_error=None,
+        run_outcome_claim=claim,
+    )
+
+
+def test_run_one_job_exception_preserves_admission_fact_without_run_receipt():
+    import cron.scheduler as scheduler
+
+    job = {"id": "run-proof-admission-exception", "name": "Run proof", "deliver": "local"}
+    admission = {
+        "schema_version": "cron-runtime-admission/v1",
+        "receipt_id": "cron-runtime-admission:" + "a" * 32,
+        "stage": "pre_cron_job_run",
+        "status": "blocked",
+        "reason_code": "runtime_governance_unavailable",
+        "state": "review_required",
+        "exception_class": "OSError",
+        "retryable": True,
+        "job_fingerprint": "sha256:" + "b" * 64,
+    }
+    claim = {
+        "schema_version": "cron-run-claim/v1",
+        "profile_id": "profile-custom",
+        "job_id": job["id"],
+        "job_revision": "sha256:" + "1" * 64,
+        "run_id": "cron-run:" + "2" * 32,
+        "implementation_hash": "sha256:" + "3" * 64,
+        "checkpoint_policy_hash": "sha256:" + "4" * 64,
+    }
+
+    def raise_after_admission(*_args, **_kwargs):
+        scheduler._runtime_admission_receipt.set(admission)
+        raise RuntimeError("admission pipeline failed")
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", side_effect=raise_after_admission), \
+         patch("cron.scheduler._cron_run_outcome_receipt") as outcome_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    outcome_mock.assert_not_called()
+    mark_mock.assert_called_once_with(
+        job["id"],
+        False,
+        "admission pipeline failed",
+        runtime_admission_receipt=admission,
+        run_outcome_claim=claim,
+    )
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_run_one_job_interrupted_attempt_never_writes_terminal_outcome(raises):
+    import cron.scheduler as scheduler
+
+    job = {"id": f"interrupted-{raises}", "name": "Interrupted", "deliver": "local"}
+    run_result = RuntimeError("interrupted pipeline") if raises else (True, "# output", "report", None)
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=None), \
+         patch("cron.scheduler.run_job", side_effect=run_result if raises else None, return_value=None if raises else run_result), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._consume_interrupted_flag", return_value=True), \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is (not raises)
+
+    mark_mock.assert_not_called()
+
+
 class TestDeliverResultLiveAdapterUnconfirmed:
     """Regression for #47056.
 
