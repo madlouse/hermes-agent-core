@@ -1656,6 +1656,11 @@ def _dispatch_claimed_cron_recovery_effects(
         release_recovery_dispatch,
     )
 
+    # ContextVar-backed profile routing does not propagate into a plain
+    # threading.Thread. Pin the owning store for the whole dispatch lifecycle.
+    dispatch_store = _current_cron_store()
+    dispatch_profile_home = dispatch_store.cron_dir.parent.resolve(strict=False)
+
     for claim in claims:
         acknowledged = False
         heartbeat_stop = threading.Event()
@@ -1669,11 +1674,11 @@ def _dispatch_claimed_cron_recovery_effects(
             while not heartbeat_stop.wait(heartbeat_interval):
                 try:
                     alive = heartbeat_recovery_dispatch(
-                        _current_cron_store().cron_dir,
+                        dispatch_store.cron_dir,
                         str(claim["recovery_id"]),
                         str(claim["claim_id"]),
                         int(claim["fence_token"]),
-                        profile_home=_active_profile_home(),
+                        profile_home=dispatch_profile_home,
                         lease_seconds=float(claim["lease_seconds"]),
                     )
                 except CronPersistRecoveryStoreError:
@@ -1692,11 +1697,11 @@ def _dispatch_claimed_cron_recovery_effects(
 
             discover_plugins()
             if not heartbeat_recovery_dispatch(
-                _current_cron_store().cron_dir,
+                dispatch_store.cron_dir,
                 str(claim["recovery_id"]),
                 str(claim["claim_id"]),
                 int(claim["fence_token"]),
-                profile_home=_active_profile_home(),
+                profile_home=dispatch_profile_home,
                 lease_seconds=float(claim["lease_seconds"]),
             ):
                 heartbeat_lost.set()
@@ -1738,19 +1743,19 @@ def _dispatch_claimed_cron_recovery_effects(
         try:
             if acknowledged:
                 complete_recovery_dispatch(
-                    _current_cron_store().cron_dir,
+                    dispatch_store.cron_dir,
                     str(claim["recovery_id"]),
                     str(claim["claim_id"]),
                     int(claim["fence_token"]),
-                    profile_home=_active_profile_home(),
+                    profile_home=dispatch_profile_home,
                 )
             else:
                 release_recovery_dispatch(
-                    _current_cron_store().cron_dir,
+                    dispatch_store.cron_dir,
                     str(claim["recovery_id"]),
                     str(claim["claim_id"]),
                     int(claim["fence_token"]),
-                    profile_home=_active_profile_home(),
+                    profile_home=dispatch_profile_home,
                 )
         except CronPersistRecoveryStoreError:
             logger.warning(

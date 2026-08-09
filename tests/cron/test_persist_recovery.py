@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Any
 
 import pytest
 
+import cron.persist_recovery as persist_recovery
 from agent.skill_resolution import resolve_skill_refs
 from cron.jobs import (
     CronJobGovernanceError,
@@ -33,6 +35,13 @@ from cron.jobs import (
 
 
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+
+
+def test_dispatch_ack_schema_matches_durable_cas_contract() -> None:
+    assert (
+        persist_recovery.DISPATCH_ACK_SCHEMA_VERSION
+        == "cron-persist-recovery-dispatch-ack/v2"
+    )
 
 
 @pytest.fixture()
@@ -279,6 +288,57 @@ def test_real_create_stale_v2_derives_one_blocked_recovery_and_replays_once(
             conn.execute("SELECT count(*) FROM cron_persist_recoveries").fetchone()[0]
             == 1
         )
+
+
+def test_slow_recovery_dispatch_heartbeat_stays_in_named_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_home = tmp_path / "default"
+    named_home = tmp_path / "profiles" / "atlas"
+    default_home.mkdir()
+    named_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setenv("HERMES_PROFILE_ID", "atlas")
+    monkeypatch.setenv("HERMES_CRON_CREATION_GOVERNANCE_REQUIRED", "1")
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: NOW)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    skill = _write_skill(named_home)
+    with use_cron_store(named_home):
+        package = _resume_package(_candidate(named_home), "create")
+        skill.write_text(
+            skill.read_text(encoding="utf-8") + "Named profile revision.\n",
+            encoding="utf-8",
+        )
+
+    real_claim = persist_recovery.claim_recovery_dispatch
+
+    def short_claim(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        return real_claim(*args, **kwargs, lease_seconds=0.06)
+
+    def invoke_mandatory(_name: str, **kwargs: Any) -> dict[str, Any]:
+        return _report(_fresh_block(copy.deepcopy(kwargs["recovery_context"])))
+
+    def invoke_post(_name: str, **kwargs: Any) -> list[Any]:
+        time.sleep(0.12)
+        return [_dispatch_ack(kwargs)]
+
+    monkeypatch.setattr(
+        "cron.persist_recovery.claim_recovery_dispatch", short_claim
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_mandatory_hook", invoke_mandatory)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_post)
+
+    with use_cron_store(named_home), pytest.raises(CronJobGovernanceError) as exc_info:
+        create_job(prompt=None, schedule="", governance_resume=package)
+
+    payload = exc_info.value.payload()
+    assert "recovery" in payload, payload
+    recovery_id = payload["recovery"]["recovery_id"]
+    stored = get_cron_persist_recovery(recovery_id, profile_home=named_home)
+    assert stored is not None
+    assert stored["dispatch"]["disposition"] == "dispatched"
+    assert not (default_home / "cron" / "persist-recovery.sqlite3").exists()
 
 
 def test_concurrent_stale_create_registers_one_recovery_frame_and_effect(
