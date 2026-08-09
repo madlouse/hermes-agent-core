@@ -251,7 +251,7 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
-    return _handle_send(args)
+    return _handle_send(args, after_send=kw.get("after_send"))
 
 
 def _handle_list():
@@ -355,7 +355,55 @@ def _handle_react(args, remove=False):
     return json.dumps({"success": bool(result)})
 
 
-def _handle_send(args):
+def _trusted_transport_error(
+    message: str,
+    *,
+    request_id: str = "",
+    outcome: str | None = None,
+    receipt: dict | None = None,
+):
+    payload = _error(message)
+    payload["success"] = False
+    if request_id:
+        payload["transport_request_id"] = request_id
+    if outcome:
+        payload["transport_outcome"] = outcome
+    if outcome == "indeterminate":
+        payload["indeterminate"] = True
+    if receipt is not None:
+        payload["transport_receipt_id"] = receipt["receipt_id"]
+        payload["transport_receipt"] = receipt
+    return payload
+
+
+def _confirmed_receipt_result(request: dict, receipt: dict) -> dict:
+    """Reconstruct a safe idempotent result without repeating the send."""
+    result = {
+        "success": True,
+        "idempotent": True,
+        "transport_outcome": "confirmed",
+        "transport_request_id": request["request_id"],
+        "transport_receipt_id": receipt["receipt_id"],
+        "transport_receipt": receipt,
+    }
+    for native_id in receipt.get("native_ids", []):
+        if not isinstance(native_id, dict):
+            continue
+        kind = str(native_id.get("kind") or "").strip()
+        value = str(native_id.get("value") or "").strip()
+        if not kind or not value:
+            continue
+        if kind not in result:
+            result[kind] = value
+        elif isinstance(result[kind], list):
+            if value not in result[kind]:
+                result[kind].append(value)
+        elif result[kind] != value:
+            result[kind] = [result[kind], value]
+    return result
+
+
+def _handle_send(args, *, after_send=None):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
@@ -485,6 +533,52 @@ def _handle_send(args):
                 return json.dumps(_resolve_err)
             chat_id = _resolved
 
+    trusted_request = args.get("transport_request")
+    trusted_commit = None
+    if trusted_request is not None:
+        try:
+            from gateway.transport_outbox import begin_transport_request
+
+            trusted_commit = begin_transport_request(
+                trusted_request,
+                visible_content=cleaned_message,
+                notification_route={
+                    "transport_id": platform_name,
+                    "channel_id": str(chat_id),
+                    "thread_id": str(thread_id or ""),
+                },
+            )
+        except Exception as exc:
+            return json.dumps(
+                _trusted_transport_error(f"Transport request commit failed: {exc}")
+            )
+        trusted_state = trusted_commit.get("state")
+        if trusted_state == "confirmed":
+            return json.dumps(
+                _confirmed_receipt_result(
+                    trusted_commit["request"], trusted_commit["receipt"]
+                )
+            )
+        request_id = str(trusted_commit["request"]["request_id"])
+        if trusted_state == "indeterminate":
+            return json.dumps(
+                _trusted_transport_error(
+                    "Transport request already has an indeterminate outcome",
+                    request_id=request_id,
+                    outcome="indeterminate",
+                    receipt=trusted_commit.get("receipt"),
+                )
+            )
+        if trusted_state == "definitively_rejected":
+            return json.dumps(
+                _trusted_transport_error(
+                    "Transport request already has a definitively rejected receipt",
+                    request_id=request_id,
+                    outcome="definitively_rejected",
+                    receipt=trusted_commit.get("receipt"),
+                )
+            )
+
     try:
         from model_tools import _run_async
         result = _run_async(
@@ -498,6 +592,57 @@ def _handle_send(args):
                 force_document=force_document_attachments,
             )
         )
+        transport_receipt = None
+        if trusted_commit is not None:
+            from gateway.transport_outbox import (
+                OUTCOME_CONFIRMED,
+                classify_transport_outcome,
+                commit_transport_receipt,
+            )
+
+            request_id = str(trusted_commit["request"]["request_id"])
+            result = dict(result) if isinstance(result, dict) else {
+                "success": False,
+                "error": "Transport returned an invalid result",
+            }
+            outcome = classify_transport_outcome(result)
+            try:
+                transport_receipt = commit_transport_receipt(
+                    request_id,
+                    result,
+                    outcome=outcome,
+                )
+            except Exception as exc:
+                return json.dumps(
+                    _trusted_transport_error(
+                        f"Transport receipt commit failed after send outcome {outcome}: {exc}",
+                        request_id=request_id,
+                        outcome="indeterminate",
+                    )
+                )
+            result["transport_request_id"] = request_id
+            result["transport_receipt_id"] = transport_receipt["receipt_id"]
+            result["transport_receipt"] = transport_receipt
+            result["transport_outcome"] = outcome
+            if outcome == "indeterminate":
+                result["success"] = False
+                result["indeterminate"] = True
+            elif outcome == "definitively_rejected":
+                result["success"] = False
+            if outcome == OUTCOME_CONFIRMED:
+                if callable(after_send):
+                    try:
+                        after_send(
+                            {
+                                "request": trusted_commit["request"],
+                                "receipt": transport_receipt,
+                                "send_result": dict(result),
+                            }
+                        )
+                    except Exception as exc:
+                        warnings = list(result.get("warnings", []))
+                        warnings.append(f"after-send callback failed: {exc}")
+                        result["warnings"] = warnings
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
@@ -524,6 +669,40 @@ def _handle_send(args):
             result["error"] = _sanitize_error_text(result["error"])
         return json.dumps(result)
     except Exception as e:
+        if trusted_commit is not None:
+            from gateway.transport_outbox import (
+                OUTCOME_INDETERMINATE,
+                commit_transport_receipt,
+            )
+
+            request_id = str(trusted_commit["request"]["request_id"])
+            error_text = _sanitize_error_text(str(e))
+            try:
+                receipt = commit_transport_receipt(
+                    request_id,
+                    {
+                        "success": False,
+                        "error": error_text,
+                        "exception_type": type(e).__name__,
+                    },
+                    outcome=OUTCOME_INDETERMINATE,
+                )
+            except Exception as commit_exc:
+                return json.dumps(
+                    _trusted_transport_error(
+                        f"Transport send outcome and receipt commit are indeterminate: {commit_exc}",
+                        request_id=request_id,
+                        outcome=OUTCOME_INDETERMINATE,
+                    )
+                )
+            return json.dumps(
+                _trusted_transport_error(
+                    f"Transport send outcome is indeterminate: {error_text}",
+                    request_id=request_id,
+                    outcome=OUTCOME_INDETERMINATE,
+                    receipt=receipt,
+                )
+            )
         return json.dumps(_error(f"Send failed: {e}"))
 
 
@@ -791,6 +970,47 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     media_files = media_files or []
 
+    def chunk_failure(attempts, failed):
+        failed_result = dict(failed) if isinstance(failed, dict) else {
+            "error": "Transport returned an invalid chunk result"
+        }
+        chunk_results = [*attempts, failed_result]
+        from gateway.transport_outbox import extract_native_ids
+
+        delivered = any(
+            attempt.get("success") is True or extract_native_ids(attempt)
+            for attempt in attempts
+            if isinstance(attempt, dict)
+        ) or bool(extract_native_ids(failed_result))
+        failed_result["success"] = False
+        declared = str(failed_result.get("transport_outcome") or "").strip()
+        failed_result["transport_outcome"] = (
+            "definitively_rejected"
+            if not delivered and declared == "definitively_rejected"
+            else "indeterminate"
+        )
+        failed_result["chunk_results"] = chunk_results
+        return failed_result
+
+    def chunk_success(attempts):
+        if not attempts:
+            return {
+                "success": False,
+                "error": "Transport produced no chunk result",
+                "transport_outcome": "indeterminate",
+            }
+        result = dict(attempts[-1])
+        confirmed = all(
+            isinstance(attempt, dict) and attempt.get("success") is True
+            for attempt in attempts
+        )
+        result["transport_outcome"] = "confirmed" if confirmed else "indeterminate"
+        if not confirmed:
+            result["success"] = False
+        if len(attempts) > 1:
+            result["chunk_results"] = attempts
+        return result
+
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
     # so a Weixin send is not blocked by unrelated optional dependencies (for
@@ -894,7 +1114,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             if isinstance(result, dict) and result.get("error"):
                 return result
             return result
-        last_result = None
+        attempts = []
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await entry.standalone_sender_fn(
@@ -905,9 +1125,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else [],
             )
             if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+                return chunk_failure(attempts, result)
+            attempts.append(dict(result) if isinstance(result, dict) else {})
+        return chunk_success(attempts)
 
     # --- Matrix: route ALL sends through the native adapter so text is
     # encrypted in E2EE rooms too (issue: text-only sends arrived with a red
@@ -915,7 +1135,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # reuses the live gateway's E2EE session when available (#46310) and falls
     # back to an encryption-aware ephemeral adapter for standalone/cron. ---
     if platform == Platform.MATRIX:
-        last_result = None
+        attempts = []
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _send_matrix_via_adapter(
@@ -926,13 +1146,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
             )
             if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+                return chunk_failure(attempts, result)
+            attempts.append(dict(result) if isinstance(result, dict) else {})
+        return chunk_success(attempts)
 
     # --- Signal: native attachment support via JSON-RPC attachments param ---
     if platform == Platform.SIGNAL and media_files:
-        last_result = None
+        attempts = []
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _send_signal(
@@ -942,13 +1162,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else [],
             )
             if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+                return chunk_failure(attempts, result)
+            attempts.append(dict(result) if isinstance(result, dict) else {})
+        return chunk_success(attempts)
 
     # --- Yuanbao: native media attachment support via running gateway adapter ---
     if platform == Platform.YUANBAO and media_files:
-        last_result = None
+        attempts = []
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _send_yuanbao(
@@ -957,9 +1177,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else None,
             )
             if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+                return chunk_failure(attempts, result)
+            attempts.append(dict(result) if isinstance(result, dict) else {})
+        return chunk_success(attempts)
 
     # --- Feishu: native media attachment support via the registry's
     # standalone_sender_fn (plugins/platforms/feishu/adapter.py::_standalone_send). #41112
@@ -970,7 +1190,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         _feishu_entry = _pr_feishu.get("feishu")
         if _feishu_entry is None or _feishu_entry.standalone_sender_fn is None:
             return {"error": "Feishu plugin not registered or missing standalone_sender_fn"}
-        last_result = None
+        attempts = []
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _feishu_entry.standalone_sender_fn(
@@ -981,9 +1201,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
             )
             if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+                return chunk_failure(attempts, result)
+            attempts.append(dict(result) if isinstance(result, dict) else {})
+        return chunk_success(attempts)
 
     # --- Slack: native media via files_upload_v2 in the plugin's
     # standalone_sender_fn (plugins/platforms/slack/adapter.py::_standalone_send).
@@ -1012,7 +1232,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             if isinstance(result, dict) and result.get("error"):
                 return result
             return result
-        last_result = None
+        attempts = []
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
             result = await _slack_entry.standalone_sender_fn(
@@ -1023,9 +1243,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else [],
             )
             if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+                return chunk_failure(attempts, result)
+            attempts.append(dict(result) if isinstance(result, dict) else {})
+        return chunk_success(attempts)
 
     # --- WhatsApp: native media attachment support via the registry's
     # standalone_sender_fn (plugins/platforms/whatsapp/adapter.py::_standalone_send).
@@ -1046,7 +1266,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             message, media_files,
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
-        last_result = None
+        attempts = []
         if _wa_caption is not None:
             # Single-file captioned send: no separate text chunk, caption on
             # the media itself.
@@ -1073,9 +1293,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 force_document=force_document,
             )
             if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+                return chunk_failure(attempts, result)
+            attempts.append(dict(result) if isinstance(result, dict) else {})
+        return chunk_success(attempts)
 
     # --- Slack: prefer the live gateway adapter, then the plugin's
     # standalone sender.  The live adapter is multi-workspace aware (it maps
@@ -1086,7 +1306,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # out-of-process cron runs, preserving MEDIA delivery on the fallback
     # (media-bearing sends were already intercepted by the branch above).
     if platform == Platform.SLACK:
-        last_result = None
+        attempts = []
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1
             result = await _send_via_adapter(
@@ -1099,9 +1319,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 force_document=force_document,
             )
             if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
+                return chunk_failure(attempts, result)
+            attempts.append(dict(result) if isinstance(result, dict) else {})
+        return chunk_success(attempts)
 
     # --- Non-media platforms ---
     if media_files and not message.strip():
@@ -1118,7 +1338,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
         )
 
-    last_result = None
+    attempts = []
     for chunk in chunks:
         if platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
@@ -1154,14 +1374,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             )
 
         if isinstance(result, dict) and result.get("error"):
-            return result
-        last_result = result
+            return chunk_failure(attempts, result)
+        attempts.append(dict(result) if isinstance(result, dict) else {})
 
-    if warning and isinstance(last_result, dict) and last_result.get("success"):
-        warnings = list(last_result.get("warnings", []))
+    final_result = chunk_success(attempts)
+    if warning and final_result.get("success"):
+        warnings = list(final_result.get("warnings", []))
         warnings.append(warning)
-        last_result["warnings"] = warnings
-    return last_result
+        final_result["warnings"] = warnings
+    return final_result
 
 
 def _is_telegram_thread_not_found(error: Exception) -> bool:
@@ -1181,6 +1402,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
     """
+    sent_message_ids = []
+
+    def remember_message(sent):
+        message_id = getattr(sent, "message_id", None)
+        if message_id is not None:
+            text = str(message_id)
+            if text not in sent_message_ids:
+                sent_message_ids.append(text)
+
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
@@ -1340,6 +1570,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         )
                     else:
                         raise
+                remember_message(last_msg)
 
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
@@ -1355,6 +1586,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             bot, chat_id=int_chat_id, text=_tg_caption,
                             parse_mode=send_parse_mode, **text_kwargs
                         )
+                        remember_message(last_msg)
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
                         logger.warning(
@@ -1471,26 +1703,46 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                 logger.error(warning)
                 warnings.append(warning)
+            remember_message(last_msg)
 
         if last_msg is None:
             error = "No deliverable text or media remained after processing MEDIA tags"
             if warnings:
-                return {"error": error, "warnings": warnings}
-            return {"error": error}
+                return {
+                    "success": False,
+                    "error": error,
+                    "warnings": warnings,
+                    "transport_outcome": "definitively_rejected",
+                }
+            return {
+                "success": False,
+                "error": error,
+                "transport_outcome": "definitively_rejected",
+            }
 
         result = {
             "success": True,
             "platform": "telegram",
             "chat_id": chat_id,
             "message_id": str(last_msg.message_id),
+            "message_ids": sent_message_ids,
         }
         if warnings:
             result["warnings"] = warnings
         return result
     except ImportError:
-        return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
+        return {
+            "success": False,
+            "error": "python-telegram-bot not installed. Run: pip install python-telegram-bot",
+            "transport_outcome": "definitively_rejected",
+        }
     except Exception as e:
-        return _error(f"Telegram send failed: {e}")
+        result = _error(f"Telegram send failed: {e}")
+        result["success"] = False
+        result["transport_outcome"] = "indeterminate"
+        if sent_message_ids:
+            result["message_ids"] = sent_message_ids
+        return result
 
 
 # _send_slack moved to the slack plugin as _standalone_send
