@@ -7,6 +7,7 @@ conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -22,6 +23,49 @@ LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "NO_REPLY",
     "NO REPLY",
 })
+
+_FINAL_RESPONSE_START = re.compile(r"^#{1,3}[ \t]+response\s*$", re.IGNORECASE)
+_FINAL_RESPONSE_END = re.compile(r"^#{1,3}[ \t]+end\s+response\s*$", re.IGNORECASE)
+
+
+def extract_explicit_final_response(response: Any) -> str:
+    """Return one closed, top-level response frame or the original text.
+
+    Markdown examples inside code fences are ordinary report content and must
+    never become delivery-control markers.
+    """
+    if not isinstance(response, str) or not response.strip():
+        return response
+    starts: list[tuple[int, int]] = []
+    ends: list[tuple[int, int]] = []
+    fence: str | None = None
+    offset = 0
+    for line in response.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if fence is None:
+            start = _FINAL_RESPONSE_START.fullmatch(body)
+            end = _FINAL_RESPONSE_END.fullmatch(body)
+            if start:
+                starts.append((offset + start.start(), offset + start.end()))
+            elif end:
+                ends.append((offset + end.start(), offset + end.end()))
+        stripped = line.lstrip()
+        fence_match = re.match(r"(```+|~~~+)", stripped)
+        if fence_match:
+            token = fence_match.group(1)
+            if fence is None:
+                fence = token
+            elif (
+                token[0] == fence[0]
+                and len(token) >= len(fence)
+                and not stripped[fence_match.end() :].strip()
+            ):
+                fence = None
+        offset += len(line)
+    if not starts or len(ends) != 1 or ends[0][0] <= starts[-1][1]:
+        return response
+    body = response[starts[-1][1] : ends[0][0]].strip()
+    return body or response
 
 
 def _canonical_silence_candidate(text: str) -> str:

@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import shutil
@@ -17,12 +18,14 @@ import threading
 import time
 import os
 import re
+import stat
+import sys
 import uuid
 
 # Cross-process advisory file locking for jobs.json critical sections.
-# fcntl is Unix-only; on Windows fall back to msvcrt. Either may be absent,
-# in which case _jobs_lock() degrades to in-process locking only (the old
-# behaviour) rather than failing.
+# fcntl is Unix-only; on Windows fall back to msvcrt. Non-strict callers may
+# degrade to in-process locking for read-only liveness checks; every durable
+# jobs.json mutation must require the cross-process capability.
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-Unix
@@ -63,7 +66,9 @@ except ImportError:
 # profiles (the security boundary #4707 was filed for). Do NOT change this to
 # the default root: that re-breaks per-profile isolation. See also the dynamic
 # `_get_hermes_home()` / `_get_lock_paths()` resolution in cron/scheduler.py.
-HERMES_DIR = get_hermes_home().resolve()
+HERMES_DIR = Path(
+    os.path.abspath(os.fspath(get_hermes_home().expanduser()))
+)
 # These constants remain the default-profile fallback and a compatibility
 # surface for existing callers/tests. Cross-profile callers must scope paths
 # with use_cron_store() instead of mutating them process-wide.
@@ -90,6 +95,133 @@ TICKER_INTERVAL_SECONDS = 60
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
 
+
+def _build_jobs_lock_capability_owner():
+    """Keep active capability identity and nonce private to Core's lock owner."""
+    owner_nonce = object()
+    active_by_thread: Dict[int, Any] = {}
+
+    class JobsLockCapability:
+        __slots__ = (
+            "_JobsLockCapability__active",
+            "_JobsLockCapability__handle",
+            "_JobsLockCapability__lock_device",
+            "_JobsLockCapability__lock_inode",
+            "_JobsLockCapability__owner_nonce",
+            "_JobsLockCapability__owner_thread",
+            "_JobsLockCapability__cron_device",
+            "_JobsLockCapability__cron_fd",
+            "_JobsLockCapability__cron_inode",
+        )
+
+        def __init__(self, nonce: object, handle: Any, cron_fd: int):
+            if nonce is not owner_nonce:
+                raise TypeError("Core jobs lock capability is internal")
+            opened = os.fstat(handle.fileno())
+            opened_cron = os.fstat(cron_fd)
+            self.__active = True
+            self.__lock_device = opened.st_dev
+            self.__lock_inode = opened.st_ino
+            self.__owner_nonce = nonce
+            self.__owner_thread = threading.get_ident()
+            self.__handle = handle
+            self.__cron_device = opened_cron.st_dev
+            self.__cron_fd = cron_fd
+            self.__cron_inode = opened_cron.st_ino
+
+        def snapshot(self, nonce: object) -> Dict[str, Any] | None:
+            if (
+                nonce is not owner_nonce
+                or self.__owner_nonce is not owner_nonce
+                or not self.__active
+                or threading.get_ident() != self.__owner_thread
+            ):
+                return None
+            try:
+                opened = os.fstat(self.__handle.fileno())
+                opened_cron = os.fstat(self.__cron_fd)
+                lock_entry = os.stat(
+                    ".jobs.lock",
+                    dir_fd=self.__cron_fd,
+                    follow_symlinks=False,
+                )
+            except (OSError, ValueError):
+                return None
+            if (
+                not stat.S_ISDIR(opened_cron.st_mode)
+                or opened_cron.st_dev != self.__cron_device
+                or opened_cron.st_ino != self.__cron_inode
+                or not stat.S_ISREG(lock_entry.st_mode)
+                or opened.st_dev != self.__lock_device
+                or opened.st_ino != self.__lock_inode
+                or lock_entry.st_dev != self.__lock_device
+                or lock_entry.st_ino != self.__lock_inode
+            ):
+                return None
+            return {
+                "owner_thread_id": self.__owner_thread,
+                "cron_device": self.__cron_device,
+                "cron_inode": self.__cron_inode,
+                "lock_device": self.__lock_device,
+                "lock_inode": self.__lock_inode,
+            }
+
+        def invalidate(self, nonce: object) -> None:
+            if nonce is not owner_nonce or self.__owner_nonce is not owner_nonce:
+                raise TypeError("Core jobs lock capability is internal")
+            self.__active = False
+
+    def activate(handle: Any, cron_fd: int) -> object:
+        owner_thread = threading.get_ident()
+        if owner_thread in active_by_thread:
+            raise RuntimeError("Core jobs lock capability owner is already active")
+        capability = JobsLockCapability(owner_nonce, handle, cron_fd)
+        active_by_thread[owner_thread] = capability
+        return capability
+
+    def issue() -> object:
+        capability = active_by_thread.get(threading.get_ident())
+        if capability is None or capability.snapshot(owner_nonce) is None:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(Core jobs lock capability unavailable)."
+            )
+        return capability
+
+    def validate(capability: object) -> Dict[str, Any] | None:
+        current = active_by_thread.get(threading.get_ident())
+        if capability is not current:
+            return None
+        return current.snapshot(owner_nonce)
+
+    def invalidate(capability: object | None) -> None:
+        owner_thread = threading.get_ident()
+        current = active_by_thread.get(owner_thread)
+        if capability is None or capability is not current:
+            return
+        active_by_thread.pop(owner_thread, None)
+        current.invalidate(owner_nonce)
+
+    def duplicate_cron_fd() -> int:
+        current = active_by_thread.get(threading.get_ident())
+        if current is None or current.snapshot(owner_nonce) is None:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(Core jobs lock capability unavailable)."
+            )
+        return os.dup(current._JobsLockCapability__cron_fd)
+
+    return activate, issue, validate, invalidate, duplicate_cron_fd
+
+
+(
+    _activate_jobs_lock_capability,
+    _issue_jobs_lock_capability,
+    _validate_jobs_lock_capability,
+    _invalidate_jobs_lock_capability,
+    _duplicate_active_jobs_lock_cron_fd,
+) = _build_jobs_lock_capability_owner()
+
 # Upper bound on waiting for the cross-process .jobs.lock flock (#60703).
 # Every cron function in the process funnels through _jobs_lock(), and the
 # flock is taken while holding the process-wide RLock — so an unbounded wait
@@ -115,18 +247,48 @@ _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
 )
 
 
+# Import-time snapshot of the compatibility constants, so deliberate
+# re-pointing of the module surface (monkeypatched CRON_DIR/JOBS_FILE/
+# OUTPUT_DIR — the documented escape hatch existing tests/embedders use)
+# is distinguishable from the constants merely being stale.
+_IMPORT_STORE = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
+
+
 def _current_cron_store() -> _CronStorePaths:
-    """Return paths pinned to this execution context's profile."""
+    """Return paths pinned to this execution context's profile.
+
+    Precedence, most explicit first:
+
+    1. an active use_cron_store() override (ContextVar);
+    2. deliberately re-pointed module constants — if CRON_DIR/JOBS_FILE/
+       OUTPUT_DIR no longer match their import-time values, someone chose
+       the documented process-wide compatibility surface; honor it;
+    3. the ACTIVE profile home, resolved fresh via get_hermes_home()
+       (context-local override, then the HERMES_HOME env var) — so a test
+       or embedder that re-points HERMES_HOME after this module was
+       imported reads/writes ITS OWN store, not whatever jobs.json the
+       import happened to freeze (the filed incident: fixtures that patched
+       the env too late silently rewrote the user's real jobs file);
+    4. the import-time constants (home unchanged since import — the common
+       path, returned unchanged).
+    """
     override = _cron_store_override.get()
     if override is not None:
         return override
-    return _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
+    live_constants = _CronStorePaths(CRON_DIR, JOBS_FILE, OUTPUT_DIR)
+    if live_constants != _IMPORT_STORE:
+        return live_constants
+    home = get_hermes_home().resolve()
+    if home == HERMES_DIR:
+        return live_constants
+    cron_dir = home / "cron"
+    return _CronStorePaths(cron_dir, cron_dir / "jobs.json", cron_dir / "output")
 
 
 @contextlib.contextmanager
 def use_cron_store(home: Union[str, Path]):
     """Route cron storage to ``home`` without mutating process globals."""
-    cron_dir = Path(home).expanduser().resolve() / "cron"
+    cron_dir = Path(os.path.abspath(os.fspath(Path(home).expanduser()))) / "cron"
     token = _cron_store_override.set(
         _CronStorePaths(
             cron_dir=cron_dir,
@@ -151,6 +313,7 @@ def get_cron_output_dir() -> Path:
 # floor for the derived value so a very short configured timeout can't make the
 # claim expire mid-run.
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
+OPERATIONAL_NOTICE_RECEIPT_LIMIT = 64
 
 # The derived TTL is the cron inactivity timeout times this headroom multiplier.
 # A healthy run clears its claim via mark_job_run() long before the TTL; the
@@ -217,8 +380,137 @@ def _jobs_lock_file() -> Path:
     return _current_cron_store().cron_dir / ".jobs.lock"
 
 
+def _open_existing_directory_chain(path: Path) -> int:
+    """Open one absolute directory through its lexical non-symlink chain."""
+    absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_flags |= getattr(os, "O_NONBLOCK", 0)
+    # A ProfileAnchor on Darwin exposes a stable ``/.vol/<dev>/<ino>``
+    # directory identity.  It is not a lexical component tree, so traversing
+    # it one component at a time fails even though the kernel can open the
+    # identity atomically.  Accept only the exact numeric identity form.
+    parts = absolute.parts
+    if (
+        len(parts) == 4
+        and parts[0] == os.sep
+        and parts[1] == ".vol"
+        and parts[2].isdigit()
+        and parts[3].isdigit()
+    ):
+        descriptor = os.open(absolute, directory_flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                raise OSError("Cron identity path is not a directory")
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+    descriptor = os.open(absolute.anchor or os.sep, directory_flags)
+    try:
+        for component in absolute.parts[1:]:
+            entry = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(entry.st_mode):
+                raise OSError("Cron path contains a symlink or non-directory")
+            child_fd = os.open(component, directory_flags, dir_fd=descriptor)
+            opened = os.fstat(child_fd)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_dev != entry.st_dev
+                or opened.st_ino != entry.st_ino
+            ):
+                os.close(child_fd)
+                raise OSError("Cron directory changed while opening")
+            os.close(descriptor)
+            descriptor = child_fd
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_existing_cron_directory() -> int:
+    """Open the configured cron directory without creating or following it."""
+    cron_dir = _current_cron_store().cron_dir
+    parent_fd = _open_existing_directory_chain(cron_dir.parent)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        entry = os.stat(cron_dir.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(entry.st_mode):
+            raise OSError("Cron directory is not an existing regular directory")
+        cron_fd = os.open(cron_dir.name, directory_flags, dir_fd=parent_fd)
+        opened = os.fstat(cron_fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != entry.st_dev
+            or opened.st_ino != entry.st_ino
+        ):
+            os.close(cron_fd)
+            raise OSError("Cron directory changed while opening")
+        return cron_fd
+    finally:
+        os.close(parent_fd)
+
+
+def _open_existing_jobs_lock():
+    """Open Core's existing lock without creating or following Profile state."""
+    cron_fd = -1
+    descriptor = -1
+    try:
+        cron_fd = _open_existing_cron_directory()
+        lock_entry = os.stat(
+            ".jobs.lock",
+            dir_fd=cron_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(lock_entry.st_mode):
+            raise OSError("Cron jobs lock is not an existing regular file")
+        descriptor = os.open(
+            ".jobs.lock",
+            os.O_RDWR
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=cron_fd,
+        )
+        opened_lock = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_lock.st_mode)
+            or opened_lock.st_dev != lock_entry.st_dev
+            or opened_lock.st_ino != lock_entry.st_ino
+        ):
+            raise OSError("Cron jobs lock changed while opening")
+        handle = os.fdopen(descriptor, "r+", encoding="utf-8")
+        descriptor = -1
+        retained_cron_fd = cron_fd
+        cron_fd = -1
+        return handle, retained_cron_fd
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if cron_fd >= 0:
+            os.close(cron_fd)
+
+
+def _acquire_bounded_flock(descriptor: int, *, label: str) -> None:
+    """Take one POSIX advisory lock without wedging the cron writer path."""
+    if fcntl is None:
+        raise OSError(f"{label} advisory lock is unavailable")
+    deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except (OSError, IOError):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for {label}")
+            time.sleep(0.1)
+
+
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section.
 
     Combines the in-process threading lock (cheap mutual exclusion between
@@ -228,10 +520,11 @@ def _jobs_lock():
     at all — a `cron pause` could be silently clobbered by a concurrent
     gateway write, leaving a "paused" job still firing).
 
-    The flock is blocking, but every critical section that uses it is short
-    (field updates only — no agent execution), so contention resolves in
-    milliseconds. If neither fcntl nor msvcrt is available the manager still
-    provides in-process locking, matching the historical behaviour.
+    The flock is bounded because every critical section is short (field
+    updates only — no agent execution). Non-strict callers may retain the
+    historical in-process-only fallback for read-only liveness checks;
+    persistence callers must set ``require_cross_process=True`` and fail
+    closed when the capability is unavailable.
 
     Nested calls in the same thread reuse the held lock so legacy callers that
     invoke save_jobs() inside a broader mutation section don't deadlock or try
@@ -239,6 +532,10 @@ def _jobs_lock():
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(_jobs_lock_state, "cross_process_acquired", False):
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review (strict jobs lock unavailable)."
+            )
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -248,12 +545,20 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process_acquired = False
         lock_fd = None
+        lock_dir_fd = -1
+        cron_directory_guard_acquired = False
+        lock_capability = None
         try:
             try:
-                ensure_dirs()
-                lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
-                lock_fd.seek(0)
+                lock_fd, lock_dir_fd = _open_existing_jobs_lock()
+            except (OSError, IOError) as e:
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review "
+                    "(strict jobs lock unavailable)."
+                ) from e
+            try:
                 if fcntl is not None:
                     # Bounded acquisition (#60703): a plain blocking
                     # fcntl.flock(LOCK_EX) here has NO timeout, and it is
@@ -265,42 +570,71 @@ def _jobs_lock():
                     # get_due_jobs() — silently and forever: the heartbeat
                     # file stops updating and all jobs stop firing with no
                     # error logged.  Poll LOCK_NB against a deadline instead;
-                    # on timeout, log loudly and fall through to the same
-                    # in-process-only degraded mode used when locking is
-                    # unavailable.  A briefly-torn cross-process write is
-                    # strictly better than a permanently dead scheduler.
-                    _deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
-                    while True:
-                        try:
-                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            break
-                        except (OSError, IOError):
-                            if time.monotonic() >= _deadline:
-                                logger.error(
-                                    "Timed out after %.0fs waiting for the cron "
-                                    "jobs lock (%s) — another process is holding "
-                                    "it. Proceeding with in-process locking only "
-                                    "so the scheduler stays alive (#60703).",
-                                    _JOBS_LOCK_TIMEOUT_SECONDS,
-                                    _jobs_lock_file(),
-                                )
-                                try:
-                                    lock_fd.close()
-                                except OSError:
-                                    pass
-                                lock_fd = None
-                                break
-                            time.sleep(0.1)
+                    # on timeout, non-strict read-only callers log loudly and
+                    # retain in-process protection. Durable mutations require
+                    # the capability and fail closed below.
+                    _acquire_bounded_flock(lock_fd.fileno(), label="strict cron jobs lock")
+                    # The lock filename can be atomically replaced after the
+                    # file lock is acquired. Retaining an advisory lock on the
+                    # already-open cron directory keeps every replacement
+                    # contender in one writer domain until this transaction
+                    # exits, rather than allowing two lock inodes to diverge.
+                    _acquire_bounded_flock(lock_dir_fd, label="strict cron directory guard")
+                    cron_directory_guard_acquired = True
+                    _jobs_lock_state.cross_process_acquired = True
+                    lock_capability = _activate_jobs_lock_capability(
+                        lock_fd,
+                        lock_dir_fd,
+                    )
                 elif msvcrt is not None:
-                    getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    raise OSError("strict cron directory guard is unavailable on this platform")
+                elif require_cross_process:
+                    raise OSError("cross-process file locking is unavailable")
             except (OSError, IOError) as e:
-                # Never let a locking failure take down cron writes — fall back to
-                # in-process-only protection (still held via _jobs_file_lock).
-                logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
+                if cron_directory_guard_acquired and fcntl is not None:
+                    try:
+                        fcntl.flock(lock_dir_fd, fcntl.LOCK_UN)
+                    except (OSError, IOError):
+                        pass
+                    cron_directory_guard_acquired = False
+                if lock_fd is not None and fcntl is not None:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    except (OSError, IOError):
+                        pass
+                if lock_fd is not None:
+                    try:
+                        lock_fd.close()
+                    except OSError:
+                        pass
+                    lock_fd = None
+                if lock_dir_fd >= 0:
+                    try:
+                        os.close(lock_dir_fd)
+                    except OSError:
+                        pass
+                    finally:
+                        lock_dir_fd = -1
+                if require_cross_process:
+                    raise CronJobGovernanceError(
+                        "Cron job persistence needs administrator review (strict jobs lock unavailable)."
+                    ) from e
+                # Non-strict callers are read-only/liveness probes. Durable
+                # mutations always require the cross-process capability.
+                logger.error(
+                    "Timed out or failed to acquire jobs.json cross-process lock (%s); "
+                    "proceeding with in-process lock only",
+                    e,
+                )
             try:
                 yield
             finally:
+                _invalidate_jobs_lock_capability(lock_capability)
+                if cron_directory_guard_acquired and fcntl is not None:
+                    try:
+                        fcntl.flock(lock_dir_fd, fcntl.LOCK_UN)
+                    except (OSError, IOError):
+                        pass
                 if lock_fd is not None:
                     try:
                         if fcntl is not None:
@@ -311,14 +645,1195 @@ def _jobs_lock():
                         pass
                     finally:
                         lock_fd.close()
+                if lock_dir_fd >= 0:
+                    os.close(lock_dir_fd)
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process_acquired = False
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_IMMUTABLE_JOB_FIELDS = frozenset({
+    "id",
+    "creation_governance_receipt",
+    "last_runtime_admission_receipt",
+    "last_delivery_receipt",
+    "last_run_outcome_receipt",
+    "active_run_outcome_claim",
+})
+_CRON_GOVERNANCE_ENV = "HERMES_CRON_CREATION_GOVERNANCE_REQUIRED"
+_CRON_GOVERNANCE_PLUGIN = "hck-tool-boundary"
+_CRON_RESUME_RECEIPT_FIELD = "cron_persist_resume_receipt"
+_CRON_RUNTIME_ADMISSION_RECEIPT_SCHEMA = "cron-runtime-admission/v1"
+_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD = "last_runtime_admission_receipt"
+_CRON_DELIVERY_RECEIPT_SCHEMA = "cron-delivery/v1"
+_CRON_DELIVERY_RECEIPT_FIELD = "last_delivery_receipt"
+_CRON_RUN_OUTCOME_RECEIPT_SCHEMA = "cron-run-outcome/v1"
+_CRON_RUN_OUTCOME_RECEIPT_FIELD = "last_run_outcome_receipt"
+_CRON_RUN_OUTCOME_CLAIM_SCHEMA = "cron-run-claim/v1"
+_CRON_RUN_OUTCOME_CLAIM_FIELD = "active_run_outcome_claim"
+_CRON_RUN_OUTCOME_CLAIM_MAX_TTL_SECONDS = 24 * 60 * 60
+_CRON_RUN_IMPLEMENTATION_SCHEMA = "cron-run-implementation/v1"
+_CRON_SUPPORT_ARTIFACT_SCHEMA = "cron-support-artifacts/v1"
+_CRON_SCRIPT_EXECUTION_SNAPSHOT_SCHEMA = "cron-script-execution-snapshot/v1"
+_CRON_CHECKPOINT_INVARIANT_SCHEMA = "cron-checkpoint-invariant/v1"
+_CRON_DELIVERY_BINDING_SCHEMA = "cron-run-delivery-binding/v1"
+_CRON_RUN_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
+_CRON_INTERPRETER_ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
+_CRON_ARTIFACT_HASH_CHUNK_BYTES = 1024 * 1024
+_CRON_SUPPORT_ARTIFACT_MAX_FILES = 512
+_CRON_SUPPORT_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
+_CRON_SUPPORT_IGNORED_DIRS = frozenset(
+    {".git", ".venv", "venv", "node_modules", "__pycache__"}
+)
+_CRON_TRUSTED_BASH_PATHS = (
+    "/bin/bash",
+    "/usr/bin/bash",
+    "C:/Program Files/Git/bin/bash.exe",
+    "C:/Program Files/Git/usr/bin/bash.exe",
+)
+_CRON_CLAIM_UNSET = object()
+_CRON_RUN_IMPLEMENTATION_FIELDS = (
+    "prompt",
+    "skills",
+    "skill",
+    "model",
+    "provider",
+    "base_url",
+    "script",
+    "no_agent",
+    "context_from",
+    "enabled_toolsets",
+    "workdir",
+    "max_turns",
+    "run_timeout_seconds",
+)
+_CRON_CHECKPOINT_CONTRACT_FIELDS = (
+    "checkpoint_policy",
+    "checkpoint_invariant",
+)
+_CRON_GOVERNANCE_PATCH_FIELDS = frozenset({
+    "operation",
+    "authorized_behavior_ref",
+    "process_charter_ref",
+    "approval_evidence_ref",
+    "read_scope_ref",
+    "disclosure_policy_ref",
+    "risk_tier",
+    "implementation_categories",
+    "implementation_path_evidence_ref",
+    "actionable_output",
+    "source_route",
+    "join_keys",
+    "creation_governance_receipt",
+    "enabled",
+    "state",
+    "paused_reason",
+})
+_CRON_GOVERNANCE_RUNTIME_FIELDS = frozenset({
+    "created_at",
+    "enabled",
+    "last_delivery_error",
+    "last_delivery_recovered_at",
+    "last_error",
+    "last_output",
+    "last_run_at",
+    "last_run_id",
+    "last_status",
+    "next_run_at",
+    "operational_notice_receipts",
+    "paused_at",
+    "paused_reason",
+    "run_claim",
+    "fire_claim",
+    "state",
+    _CRON_RUNTIME_ADMISSION_RECEIPT_FIELD,
+    _CRON_DELIVERY_RECEIPT_FIELD,
+    _CRON_RUN_OUTCOME_RECEIPT_FIELD,
+    _CRON_RUN_OUTCOME_CLAIM_FIELD,
+})
+_CRON_GOVERNANCE_SELF_REFERENTIAL_FIELDS = frozenset({
+    "candidate_hash",
+    "creation_governance_receipt",
+    _CRON_RESUME_RECEIPT_FIELD,
+    "join_keys",
+})
+
+
+def _cron_governance_material(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Bind every definition field except explicit runtime/self references."""
+    material = {
+        key: copy.deepcopy(value)
+        for key, value in job.items()
+        if key not in _CRON_GOVERNANCE_RUNTIME_FIELDS
+        and key not in _CRON_GOVERNANCE_SELF_REFERENTIAL_FIELDS
+    }
+    repeat = material.get("repeat")
+    if isinstance(repeat, dict):
+        material["repeat"] = {
+            key: copy.deepcopy(value)
+            for key, value in repeat.items()
+            if key != "completed"
+        }
+    return material
+
+
+def _cron_governance_material_changed(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+) -> bool:
+    """Return whether normalized authorization-bound job material changed."""
+    return _cron_governance_material(before) != _cron_governance_material(after)
+
+
+def _cron_update_may_change_governance_material(updates: Dict[str, Any]) -> bool:
+    """Conservatively select the strict lock before the stored Job is loaded."""
+    for key, value in (updates or {}).items():
+        if key in _CRON_GOVERNANCE_RUNTIME_FIELDS:
+            continue
+        if key in _CRON_GOVERNANCE_SELF_REFERENTIAL_FIELDS:
+            continue
+        if key == "repeat" and isinstance(value, dict) and set(value) <= {"completed"}:
+            continue
+        return True
+    return False
+
+
+class CronJobGovernanceError(PermissionError):
+    """Raised when a managed profile refuses a cron persistence candidate."""
+
+    def __init__(self, message: str, *, decision: Dict[str, Any] | None = None):
+        super().__init__(message)
+        self.decision = copy.deepcopy(decision or {})
+
+    def payload(self) -> Dict[str, Any]:
+        pending = self.decision.get("pending_action")
+        return {
+            "schema_version": "cron-admin-pending-action/v1",
+            "action": "blocked",
+            "reason": str(self.decision.get("reason") or "review_required"),
+            "state": str(self.decision.get("state") or "review_required"),
+            "pending_action": copy.deepcopy(pending) if isinstance(pending, dict) else {},
+        }
+
+
+def _safe_runtime_admission_code(value: Any, fallback: str) -> str:
+    """Keep persisted admission metadata machine-readable and non-sensitive."""
+    code = str(value or "").strip().lower()
+    if re.fullmatch(r"[a-z][a-z0-9_.:-]{0,95}", code):
+        return code
+    return fallback
+
+
+def _runtime_admission_job_fingerprint(job: Dict[str, Any]) -> str:
+    """Return a stable job link without persisting prompt, route, or credentials."""
+    creation_receipt = job.get("creation_governance_receipt")
+    join_keys = job.get("join_keys")
+    schedule = job.get("schedule")
+    material = {
+        "job_id": str(job.get("id") or ""),
+        "authorized_behavior_ref": str(job.get("authorized_behavior_ref") or ""),
+        "process_charter_ref": str(job.get("process_charter_ref") or ""),
+        "candidate_hash": (
+            str(creation_receipt.get("candidate_hash") or "")
+            if isinstance(creation_receipt, dict)
+            else str(join_keys.get("candidate_hash") or "")
+            if isinstance(join_keys, dict)
+            else ""
+        ),
+        "risk_tier": str(job.get("risk_tier") or ""),
+        "schedule_kind": str(schedule.get("kind") or "") if isinstance(schedule, dict) else "",
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _runtime_admission_receipt(
+    job: Dict[str, Any],
+    *,
+    reason_code: Any,
+    state: Any,
+    exception_class: str,
+    retryable: bool,
+) -> Dict[str, Any]:
+    """Build the small durable record shared by scheduler status and delivery."""
+    return {
+        "schema_version": _CRON_RUNTIME_ADMISSION_RECEIPT_SCHEMA,
+        "receipt_id": f"cron-runtime-admission:{uuid.uuid4().hex}",
+        "stage": "pre_cron_job_run",
+        "status": "blocked",
+        "reason_code": _safe_runtime_admission_code(reason_code, "runtime_binding_required"),
+        "state": _safe_runtime_admission_code(state, "review_required"),
+        "exception_class": _safe_runtime_admission_code(
+            exception_class, "runtime_admission_error"
+        ),
+        "retryable": bool(retryable),
+        "job_fingerprint": _runtime_admission_job_fingerprint(job),
+    }
+
+
+def _validated_runtime_admission_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
+    """Reject forged or free-form data before it can enter durable job state."""
+    expected_keys = {
+        "schema_version", "receipt_id", "stage", "status", "reason_code", "state",
+        "exception_class", "retryable", "job_fingerprint",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_keys:
+        raise ValueError("invalid runtime admission receipt")
+    if (
+        receipt.get("schema_version") != _CRON_RUNTIME_ADMISSION_RECEIPT_SCHEMA
+        or receipt.get("stage") != "pre_cron_job_run"
+        or receipt.get("status") != "blocked"
+        or not isinstance(receipt.get("retryable"), bool)
+        or not re.fullmatch(r"cron-runtime-admission:[0-9a-f]{32}", str(receipt.get("receipt_id") or ""))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("job_fingerprint") or ""))
+    ):
+        raise ValueError("invalid runtime admission receipt")
+    for field, fallback in {
+        "reason_code": "runtime_binding_required",
+        "state": "review_required",
+        "exception_class": "runtime_admission_error",
+    }.items():
+        value = str(receipt.get(field) or "")
+        if _safe_runtime_admission_code(value, fallback) != value:
+            raise ValueError("invalid runtime admission receipt")
+    return copy.deepcopy(receipt)
+
+
+def _validated_delivery_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept only the aggregate delivery fact safe for ``jobs.json``.
+
+    Transport-level receipts may contain message identifiers or provider
+    metadata. Cron persistence deliberately retains only cardinalities, so the
+    scheduler and Kit health surfaces can prove terminal delivery without
+    turning the job store into an outbound-message archive.
+    """
+    expected_keys = {
+        "schema_version",
+        "status",
+        "required_count",
+        "confirmed_count",
+        "failed_count",
+        "unconfirmed_count",
+        "receipts_truncated",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_keys:
+        raise ValueError("invalid cron delivery receipt")
+    if receipt.get("schema_version") != _CRON_DELIVERY_RECEIPT_SCHEMA:
+        raise ValueError("invalid cron delivery receipt")
+    if receipt.get("status") not in {"not_attempted", "success", "partial", "failed"}:
+        raise ValueError("invalid cron delivery receipt")
+    if not isinstance(receipt.get("receipts_truncated"), bool):
+        raise ValueError("invalid cron delivery receipt")
+    counts = {
+        field: receipt.get(field)
+        for field in ("required_count", "confirmed_count", "failed_count", "unconfirmed_count")
+    }
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in counts.values()):
+        raise ValueError("invalid cron delivery receipt")
+    if counts["confirmed_count"] + counts["failed_count"] + counts["unconfirmed_count"] != counts["required_count"]:
+        raise ValueError("invalid cron delivery receipt")
+    if counts["required_count"] == 0:
+        expected_status = "not_attempted"
+    elif counts["confirmed_count"] == counts["required_count"]:
+        expected_status = "success"
+    elif counts["confirmed_count"]:
+        expected_status = "partial"
+    else:
+        expected_status = "failed"
+    if receipt.get("status") != expected_status:
+        raise ValueError("invalid cron delivery receipt")
+    return copy.deepcopy(receipt)
+
+
+def _safe_run_outcome_identity(value: Any) -> bool:
+    """Accept opaque profile/Job ids without allowing control data."""
+    if not isinstance(value, str) or value != value.strip():
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return bool(encoded) and len(encoded) <= 256 and not any(
+        ord(char) < 32 or 127 <= ord(char) <= 159 for char in value
+    )
+
+
+def _cron_run_hash(material: Any) -> str:
+    encoded = json.dumps(
+        material,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _cron_run_artifact(path: Path) -> tuple[Optional[str], Optional[bytes]]:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        if not resolved.is_file() or resolved.stat().st_size > _CRON_RUN_ARTIFACT_MAX_BYTES:
+            return None, None
+        content = resolved.read_bytes()
+        if len(content) > _CRON_RUN_ARTIFACT_MAX_BYTES:
+            return None, None
+        return "sha256:" + hashlib.sha256(content).hexdigest(), content
+    except (OSError, RuntimeError):
+        return None, None
+
+
+def _cron_run_artifact_hash(path: Path) -> Optional[str]:
+    return _cron_run_artifact(path)[0]
+
+
+def _cron_interpreter_artifact(
+    path: Path,
+) -> tuple[Optional[str], Optional[bytes], Optional[Path]]:
+    """Capture one bounded interpreter binary for exact snapshot execution."""
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        if not resolved.is_file():
+            return None, None, None
+        digest = hashlib.sha256()
+        total = 0
+        chunks: list[bytes] = []
+        with resolved.open("rb") as handle:
+            while chunk := handle.read(_CRON_ARTIFACT_HASH_CHUNK_BYTES):
+                total += len(chunk)
+                if total > _CRON_INTERPRETER_ARTIFACT_MAX_BYTES:
+                    return None, None, None
+                digest.update(chunk)
+                chunks.append(chunk)
+        return "sha256:" + digest.hexdigest(), b"".join(chunks), resolved
+    except (OSError, RuntimeError):
+        return None, None, None
+
+
+def _cron_interpreter_artifact_hash(path: Path) -> Optional[str]:
+    return _cron_interpreter_artifact(path)[0]
+
+
+def _cron_profile_home() -> Path:
+    return _current_cron_store().cron_dir.parent
+
+
+def _cron_script_interpreter(path: Path) -> Optional[Path]:
+    if path.suffix.lower() in {".sh", ".bash"}:
+        for raw_candidate in _CRON_TRUSTED_BASH_PATHS:
+            candidate = Path(raw_candidate)
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+    if sys.platform == "win32":
+        return None
+    return Path(sys.executable)
+
+
+def _cron_script_artifact(
+    job: Dict[str, Any],
+    profile_home: Path,
+) -> tuple[Optional[str], Optional[str], Optional[bytes]]:
+    script = job.get("script")
+    if not isinstance(script, str) or not script.strip():
+        return (
+            _cron_run_hash({"state": "absent"}),
+            _cron_run_hash({"state": "not_applicable"}),
+            None,
+        )
+    scripts_root = (profile_home / "scripts").resolve(strict=False)
+    raw = Path(script).expanduser()
+    path = raw.resolve(strict=False) if raw.is_absolute() else (scripts_root / raw).resolve(strict=False)
+    try:
+        path.relative_to(scripts_root)
+    except ValueError:
+        return None, None, None
+    artifact_hash, snapshot = _cron_run_artifact(path)
+    interpreter = _cron_script_interpreter(path)
+    interpreter_hash = (
+        _cron_interpreter_artifact_hash(interpreter)
+        if interpreter is not None
+        else None
+    )
+    if artifact_hash is None or snapshot is None or interpreter_hash is None:
+        return None, None, None
+    return _cron_run_hash(
+        {
+            "state": "loaded",
+            "execution_mode": "stdin-snapshot/v1",
+            "interpreter": "bash" if path.suffix.lower() in {".sh", ".bash"} else "python",
+            "content_hash": artifact_hash,
+        }
+    ), interpreter_hash, snapshot
+
+
+def _cron_script_artifact_hash(job: Dict[str, Any], profile_home: Path) -> Optional[str]:
+    return _cron_script_artifact(job, profile_home)[0]
+
+
+def _cron_support_artifact(
+    job: Dict[str, Any], profile_home: Path
+) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    """Capture the bounded local tree that a script can import or execute."""
+    script = job.get("script")
+    if not isinstance(script, str) or not script.strip():
+        return _cron_run_hash({"state": "not_applicable"}), []
+    scripts_root = (profile_home / "scripts").resolve(strict=False)
+    raw = Path(script).expanduser()
+    script_path = (
+        raw.resolve(strict=False)
+        if raw.is_absolute()
+        else (scripts_root / raw).resolve(strict=False)
+    )
+    try:
+        script_path.relative_to(scripts_root)
+    except ValueError:
+        return None, None
+
+    roots: list[tuple[str, Path]] = [("script_root", script_path.parent)]
+    workdir = str(job.get("workdir") or "").strip()
+    if workdir:
+        workdir_input = Path(workdir).expanduser()
+        workdir_path = workdir_input.resolve(strict=False)
+        if workdir_input.is_symlink() or workdir_path != script_path.parent:
+            return None, None
+
+    records: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
+    total_bytes = 0
+    try:
+        for root_kind, raw_root in roots:
+            root = raw_root.resolve(strict=True)
+            for candidate in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+                relative = candidate.relative_to(root)
+                if set(relative.parts) & _CRON_SUPPORT_IGNORED_DIRS:
+                    continue
+                if candidate.is_dir():
+                    continue
+                if candidate.is_symlink() or not candidate.is_file():
+                    return None, None
+                content_hash, content = _cron_run_artifact(candidate)
+                if content_hash is None or content is None:
+                    return None, None
+                mode = candidate.stat().st_mode & 0o777
+                total_bytes += len(content)
+                if (
+                    len(records) >= _CRON_SUPPORT_ARTIFACT_MAX_FILES
+                    or total_bytes > _CRON_SUPPORT_ARTIFACT_MAX_BYTES
+                ):
+                    return None, None
+                records.append(
+                    {
+                        "root": root_kind,
+                        "path": relative.as_posix(),
+                        "content_hash": content_hash,
+                        "mode": mode,
+                    }
+                )
+                snapshots.append(
+                    {
+                        "root": root_kind,
+                        "path": relative.as_posix(),
+                        "content": content,
+                        "mode": mode,
+                    }
+                )
+    except (OSError, RuntimeError, ValueError):
+        return None, None
+    return (
+        _cron_run_hash(
+            {"schema_version": _CRON_SUPPORT_ARTIFACT_SCHEMA, "files": records}
+        ),
+        snapshots,
+    )
+
+
+def _cron_support_artifact_hash(
+    job: Dict[str, Any], profile_home: Path
+) -> Optional[str]:
+    return _cron_support_artifact(job, profile_home)[0]
+
+
+def _cron_run_script_snapshot(
+    job: Dict[str, Any],
+    claim: Dict[str, Any],
+    *,
+    profile_home: Optional[Path] = None,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Capture the bounded Profile-controlled files after validating the claim."""
+    home = (profile_home or _cron_profile_home()).expanduser().resolve(strict=False)
+    artifact_hash, interpreter_hash, snapshot = _cron_script_artifact(job, home)
+    support_hash, support_snapshot = _cron_support_artifact(job, home)
+    if snapshot is None:
+        return (
+            artifact_hash == claim.get("script_artifact_hash")
+            and interpreter_hash == claim.get("interpreter_artifact_hash")
+            and support_hash == claim.get("support_artifact_hash")
+        ), None
+    scripts_root = (home / "scripts").resolve(strict=False)
+    raw = Path(str(job.get("script") or "")).expanduser()
+    script_path = (
+        raw.resolve(strict=False)
+        if raw.is_absolute()
+        else (scripts_root / raw).resolve(strict=False)
+    )
+    interpreter = _cron_script_interpreter(script_path)
+    if interpreter is None:
+        return False, None
+    captured_interpreter_hash, interpreter_snapshot, interpreter_path = (
+        _cron_interpreter_artifact(interpreter)
+    )
+    matches = (
+        artifact_hash == claim.get("script_artifact_hash")
+        and interpreter_hash == claim.get("interpreter_artifact_hash")
+        and captured_interpreter_hash == interpreter_hash
+        and support_hash == claim.get("support_artifact_hash")
+        and interpreter_snapshot is not None
+        and interpreter_path is not None
+        and support_snapshot is not None
+    )
+    if not matches:
+        return False, None
+    return True, {
+        "schema_version": _CRON_SCRIPT_EXECUTION_SNAPSHOT_SCHEMA,
+        "script_name": script_path.name,
+        "script_suffix": script_path.suffix.lower(),
+        "script_bytes": snapshot,
+        "interpreter_path": str(interpreter_path),
+        "interpreter_bytes": interpreter_snapshot,
+        "support_files": support_snapshot,
+    }
+
+
+def _cron_run_outcome_claim(
+    job: Dict[str, Any],
+    *,
+    run_id: Optional[str] = None,
+    profile_home: Optional[Path] = None,
+    claim_started_at_epoch: Optional[int] = None,
+    claim_heartbeat_at_epoch: Optional[int] = None,
+    claim_expires_at_epoch: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Freeze the actual executable and checkpoint contract before a run."""
+    creation = job.get("creation_governance_receipt")
+    if not isinstance(creation, dict):
+        return None
+    profile_id = creation.get("profile_id")
+    job_id = job.get("id")
+    revision = creation.get("receipt_id")
+    if (
+        creation.get("schema_version") != "cron-creation-governance/v1"
+        or creation.get("cron_job_id") != job_id
+        or not _safe_run_outcome_identity(profile_id)
+        or not _safe_run_outcome_identity(job_id)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(revision or ""))
+    ):
+        return None
+    home = (profile_home or _cron_profile_home()).expanduser().resolve(strict=False)
+    script_hash, interpreter_hash, _snapshot = _cron_script_artifact(job, home)
+    support_hash = _cron_support_artifact_hash(job, home)
+    if script_hash is None or interpreter_hash is None or support_hash is None or any(
+        job.get(field) not in (None, "")
+        for field in ("verification_command", "verification_command_mode")
+    ):
+        # An arbitrary subprocess cannot be proven read-only without an OS
+        # sandbox. A future fixed verifier must use a new versioned contract.
+        return None
+    implementation_hash = _cron_run_hash(
+        {
+            "schema_version": _CRON_RUN_IMPLEMENTATION_SCHEMA,
+            "mode": "no_agent" if job.get("no_agent") is True else "agent",
+            "execution": {
+                field: copy.deepcopy(job.get(field))
+                for field in _CRON_RUN_IMPLEMENTATION_FIELDS
+            },
+            "script_artifact_hash": script_hash,
+            "interpreter_artifact_hash": interpreter_hash,
+            "support_artifact_hash": support_hash,
+        }
+    )
+    checkpoint_contract = {
+        field: copy.deepcopy(job.get(field))
+        for field in _CRON_CHECKPOINT_CONTRACT_FIELDS
+        if field in job
+    }
+    checkpoint_policy_hash = _cron_run_hash(
+        {
+            "schema_version": "cron-checkpoint-policy/v1",
+            "job_revision": revision,
+            "checkpoint_contract": checkpoint_contract or {"mode": "not_declared"},
+        }
+    )
+    if (
+        claim_started_at_epoch is None
+        and claim_heartbeat_at_epoch is None
+        and claim_expires_at_epoch is None
+    ):
+        claim_started_at_epoch = int(time.time())
+        claim_heartbeat_at_epoch = claim_started_at_epoch
+        claim_expires_at_epoch = claim_heartbeat_at_epoch + min(
+            int(_oneshot_run_claim_ttl_seconds()),
+            _CRON_RUN_OUTCOME_CLAIM_MAX_TTL_SECONDS,
+        )
+    claim: Dict[str, Any] = {
+        "schema_version": _CRON_RUN_OUTCOME_CLAIM_SCHEMA,
+        "profile_id": profile_id,
+        "job_id": job_id,
+        "job_revision": revision,
+        "run_id": run_id or f"cron-run:{uuid.uuid4().hex}",
+        "claim_started_at_epoch": claim_started_at_epoch,
+        "claim_heartbeat_at_epoch": claim_heartbeat_at_epoch,
+        "claim_expires_at_epoch": claim_expires_at_epoch,
+        "script_artifact_hash": script_hash,
+        "interpreter_artifact_hash": interpreter_hash,
+        "support_artifact_hash": support_hash,
+        "implementation_hash": implementation_hash,
+        "checkpoint_policy_hash": checkpoint_policy_hash,
+    }
+    return _validated_run_outcome_claim(claim)
+
+
+def _validated_run_outcome_claim(claim: Dict[str, Any]) -> Dict[str, Any]:
+    required = {
+        "schema_version",
+        "profile_id",
+        "job_id",
+        "job_revision",
+        "run_id",
+        "claim_started_at_epoch",
+        "claim_heartbeat_at_epoch",
+        "claim_expires_at_epoch",
+        "script_artifact_hash",
+        "interpreter_artifact_hash",
+        "support_artifact_hash",
+        "implementation_hash",
+        "checkpoint_policy_hash",
+    }
+    if not isinstance(claim, dict) or set(claim) != required:
+        raise ValueError("invalid cron run outcome claim")
+    started_at = claim.get("claim_started_at_epoch")
+    heartbeat_at = claim.get("claim_heartbeat_at_epoch")
+    expires_at = claim.get("claim_expires_at_epoch")
+    if (
+        claim.get("schema_version") != _CRON_RUN_OUTCOME_CLAIM_SCHEMA
+        or not _safe_run_outcome_identity(claim.get("profile_id"))
+        or not _safe_run_outcome_identity(claim.get("job_id"))
+        or not re.fullmatch(r"cron-run:[0-9a-f]{32}", str(claim.get("run_id") or ""))
+        or not all(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", str(claim.get(field) or ""))
+            for field in (
+                "job_revision",
+                "script_artifact_hash",
+                "interpreter_artifact_hash",
+                "support_artifact_hash",
+                "implementation_hash",
+                "checkpoint_policy_hash",
+            )
+        )
+        or isinstance(started_at, bool)
+        or not isinstance(started_at, int)
+        or isinstance(heartbeat_at, bool)
+        or not isinstance(heartbeat_at, int)
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or started_at <= 0
+        or heartbeat_at < started_at
+        or not (
+            ONESHOT_RUN_CLAIM_TTL_SECONDS
+            <= expires_at - heartbeat_at
+            <= _CRON_RUN_OUTCOME_CLAIM_MAX_TTL_SECONDS
+        )
+    ):
+        raise ValueError("invalid cron run outcome claim")
+    return copy.deepcopy(claim)
+
+
+def _run_outcome_claim_is_active(
+    claim: Dict[str, Any],
+    *,
+    now_epoch: Optional[int] = None,
+) -> bool:
+    """Return whether a validated claim still owns its bounded run window."""
+    validated = _validated_run_outcome_claim(claim)
+    now = int(time.time()) if now_epoch is None else now_epoch
+    return (
+        validated["claim_heartbeat_at_epoch"]
+        <= now
+        < validated["claim_expires_at_epoch"]
+    )
+
+
+def heartbeat_job_run_outcome(
+    job_id: str,
+    claim: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Refresh the exact active claim without changing its run identity."""
+    claim = _validated_run_outcome_claim(claim)
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) != claim:
+                return None
+            if not _run_outcome_claim_is_active(claim):
+                return None
+            heartbeat_at = max(
+                int(time.time()),
+                claim["claim_heartbeat_at_epoch"],
+            )
+            refreshed = {
+                **claim,
+                "claim_heartbeat_at_epoch": heartbeat_at,
+                "claim_expires_at_epoch": heartbeat_at
+                + min(
+                    int(_oneshot_run_claim_ttl_seconds()),
+                    _CRON_RUN_OUTCOME_CLAIM_MAX_TTL_SECONDS,
+                ),
+            }
+            refreshed = _validated_run_outcome_claim(refreshed)
+            job[_CRON_RUN_OUTCOME_CLAIM_FIELD] = copy.deepcopy(refreshed)
+            _save_jobs_unlocked(jobs)
+            return refreshed
+    return None
+
+
+def _validated_run_outcome_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the redacted, revision-bound terminal execution fact."""
+    required_keys = {
+        "schema_version",
+        "profile_id",
+        "job_id",
+        "job_revision",
+        "run_id",
+        "terminal_state",
+        "implementation_hash",
+        "checkpoint_invariant_hash",
+        "delivery_receipt_hash",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != required_keys:
+        raise ValueError("invalid cron run outcome receipt")
+    if (
+        receipt.get("schema_version") != _CRON_RUN_OUTCOME_RECEIPT_SCHEMA
+        or receipt.get("terminal_state") not in {"success", "failed"}
+        or not _safe_run_outcome_identity(receipt.get("profile_id"))
+        or not _safe_run_outcome_identity(receipt.get("job_id"))
+        or not re.fullmatch(r"cron-run:[0-9a-f]{32}", str(receipt.get("run_id") or ""))
+    ):
+        raise ValueError("invalid cron run outcome receipt")
+    for field in (
+        "job_revision",
+        "implementation_hash",
+        "checkpoint_invariant_hash",
+        "delivery_receipt_hash",
+    ):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get(field) or "")):
+            raise ValueError("invalid cron run outcome receipt")
+    return copy.deepcopy(receipt)
+
+
+def _cron_delivery_receipt_hash(
+    run_id: str,
+    delivery_receipt: Optional[Dict[str, Any]],
+) -> str:
+    normalized = (
+        _validated_delivery_receipt(delivery_receipt)
+        if delivery_receipt is not None
+        else {"state": "not_recorded"}
+    )
+    return _cron_run_hash(
+        {
+            "schema_version": _CRON_DELIVERY_BINDING_SCHEMA,
+            "run_id": run_id,
+            "delivery_receipt": normalized,
+        }
+    )
+
+
+def _cron_checkpoint_invariant_hash(
+    job: Dict[str, Any],
+    claim: Dict[str, Any],
+    *,
+    success: bool,
+) -> Optional[str]:
+    checkpoint_contract = {
+        field: copy.deepcopy(job.get(field))
+        for field in _CRON_CHECKPOINT_CONTRACT_FIELDS
+        if field in job
+    }
+    policy_hash = _cron_run_hash(
+        {
+            "schema_version": "cron-checkpoint-policy/v1",
+            "job_revision": claim["job_revision"],
+            "checkpoint_contract": checkpoint_contract or {"mode": "not_declared"},
+        }
+    )
+    if policy_hash != claim.get("checkpoint_policy_hash"):
+        return None
+    if checkpoint_contract and success:
+        # #1424 owns the actual checkpoint observation. A declaration alone
+        # cannot authorize a successful terminal outcome.
+        return None
+    terminal_state = (
+        "unobserved_due_to_failure"
+        if checkpoint_contract
+        else "not_applicable"
+    )
+    return _cron_run_hash(
+        {
+            "schema_version": _CRON_CHECKPOINT_INVARIANT_SCHEMA,
+            "run_id": claim["run_id"],
+            "policy_hash": policy_hash,
+            "implementation_hash": claim["implementation_hash"],
+            "terminal_state": terminal_state,
+            "pending_stage_count": None if checkpoint_contract else 0,
+        }
+    )
+
+
+def _cron_run_outcome_receipt(
+    job: Dict[str, Any],
+    *,
+    success: bool,
+    run_outcome_claim: Optional[Dict[str, Any]] = None,
+    delivery_receipt: Optional[Dict[str, Any]] = None,
+    profile_home: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a terminal fact only when the pre-run implementation stayed exact."""
+    if not isinstance(success, bool):
+        raise ValueError("cron run outcome success must be boolean")
+    if run_outcome_claim is None:
+        return None
+    claim = _validated_run_outcome_claim(run_outcome_claim)
+    current = _cron_run_outcome_claim(
+        job,
+        run_id=claim["run_id"],
+        profile_home=profile_home,
+        claim_started_at_epoch=claim["claim_started_at_epoch"],
+        claim_heartbeat_at_epoch=claim["claim_heartbeat_at_epoch"],
+        claim_expires_at_epoch=claim["claim_expires_at_epoch"],
+    )
+    if current != claim:
+        return None
+    checkpoint_hash = _cron_checkpoint_invariant_hash(
+        job,
+        claim,
+        success=success,
+    )
+    if checkpoint_hash is None:
+        return None
+    receipt: Dict[str, Any] = {
+        "schema_version": _CRON_RUN_OUTCOME_RECEIPT_SCHEMA,
+        "profile_id": claim["profile_id"],
+        "job_id": claim["job_id"],
+        "job_revision": claim["job_revision"],
+        "run_id": claim["run_id"],
+        "terminal_state": "success" if success else "failed",
+        "implementation_hash": claim["implementation_hash"],
+        "checkpoint_invariant_hash": checkpoint_hash,
+        "delivery_receipt_hash": _cron_delivery_receipt_hash(
+            claim["run_id"],
+            delivery_receipt,
+        ),
+    }
+    return _validated_run_outcome_receipt(receipt)
+
+
+def begin_job_run_outcome(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Clear stale success and atomically claim this signed Job revision."""
+    snapshot_creation = job.get("creation_governance_receipt")
+    if not isinstance(snapshot_creation, dict):
+        return None
+    snapshot_revision = snapshot_creation.get("receipt_id")
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for stored in jobs:
+            if stored.get("id") != job.get("id"):
+                continue
+            creation = stored.get("creation_governance_receipt")
+            if not isinstance(creation, dict) or creation.get("receipt_id") != snapshot_revision:
+                return None
+            existing_claim = stored.get(_CRON_RUN_OUTCOME_CLAIM_FIELD)
+            if existing_claim is not None:
+                try:
+                    if _run_outcome_claim_is_active(existing_claim):
+                        return None
+                except ValueError:
+                    return None
+            claim = _cron_run_outcome_claim(stored)
+            if claim is None:
+                stored[_CRON_RUN_OUTCOME_CLAIM_FIELD] = None
+                stored[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = None
+                _save_jobs_unlocked(jobs)
+                return None
+            stored[_CRON_RUN_OUTCOME_CLAIM_FIELD] = copy.deepcopy(claim)
+            stored[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = None
+            _save_jobs_unlocked(jobs)
+            return claim
+    return None
+
+
+def record_job_run_preflight_denial(
+    job_id: str,
+    *,
+    job_revision: str,
+    reason_code: str,
+    run_claim: Any = _CRON_CLAIM_UNSET,
+    fire_claim: Any = _CRON_CLAIM_UNSET,
+) -> bool:
+    """Persist a zero-side-effect denial without consuming a finite dispatch."""
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for stored in jobs:
+            if stored.get("id") != job_id:
+                continue
+            creation = stored.get("creation_governance_receipt")
+            if (
+                not isinstance(creation, dict)
+                or creation.get("receipt_id") != job_revision
+                or stored.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None
+                or (
+                    run_claim is not _CRON_CLAIM_UNSET
+                    and stored.get("run_claim") != run_claim
+                )
+                or (
+                    fire_claim is not _CRON_CLAIM_UNSET
+                    and stored.get("fire_claim") != fire_claim
+                )
+            ):
+                return False
+            if run_claim is not _CRON_CLAIM_UNSET:
+                stored["run_claim"] = None
+            if fire_claim is not _CRON_CLAIM_UNSET:
+                stored["fire_claim"] = None
+            stored[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = None
+            stored[_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD] = _runtime_admission_receipt(
+                stored,
+                reason_code=reason_code,
+                state="review_required",
+                exception_class="run_outcome_preflight_denied",
+                retryable=False,
+            )
+            _save_jobs_unlocked(jobs)
+            return True
+    return False
+
+
+def abandon_job_run_outcome(
+    job_id: str,
+    claim: Dict[str, Any],
+    *,
+    reason_code: Optional[str] = None,
+    run_claim: Any = _CRON_CLAIM_UNSET,
+    fire_claim: Any = _CRON_CLAIM_UNSET,
+) -> bool:
+    """Clear an unexecuted claim without advancing schedule or run status."""
+    claim = _validated_run_outcome_claim(claim)
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if (
+                job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) != claim
+                or (
+                    run_claim is not _CRON_CLAIM_UNSET
+                    and job.get("run_claim") != run_claim
+                )
+                or (
+                    fire_claim is not _CRON_CLAIM_UNSET
+                    and job.get("fire_claim") != fire_claim
+                )
+            ):
+                return False
+            job[_CRON_RUN_OUTCOME_CLAIM_FIELD] = None
+            job[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = None
+            if run_claim is not _CRON_CLAIM_UNSET:
+                job["run_claim"] = None
+            if fire_claim is not _CRON_CLAIM_UNSET:
+                job["fire_claim"] = None
+            if reason_code is not None:
+                job[_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD] = _runtime_admission_receipt(
+                    job,
+                    reason_code=reason_code,
+                    state="review_required",
+                    exception_class="run_outcome_preflight_denied",
+                    retryable=False,
+                )
+            _save_jobs_unlocked(jobs)
+            return True
+    return False
+
+
+class CronRuntimeAdmissionError(PermissionError):
+    """Fail-closed runtime admission result with a safe durable receipt."""
+
+    def __init__(self, receipt: Dict[str, Any]):
+        self.receipt = _validated_runtime_admission_receipt(receipt)
+        super().__init__(f"Cron job was not run: {self.receipt['reason_code']}.")
+
+
+def _cron_creation_governance_expected() -> bool:
+    if str(os.environ.get(_CRON_GOVERNANCE_ENV, "")).strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    plugin_dir = get_hermes_home() / "plugins" / _CRON_GOVERNANCE_PLUGIN
+    managed_profile = (get_hermes_home() / ".hermes-agent-kit").exists()
+    if not (plugin_dir / "plugin.yaml").is_file() or not (plugin_dir / "cron_creation_governance.py").is_file():
+        # A managed Hermes Agent Kit profile must fail closed if its governance
+        # plugin is missing. Unmanaged upstream profiles retain compatibility.
+        return managed_profile
+    try:
+        import yaml
+        config_path = get_hermes_home() / "config.yaml"
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+        plugins = config.get("plugins") if isinstance(config, dict) else {}
+        enabled = plugins.get("enabled") if isinstance(plugins, dict) else []
+        disabled = plugins.get("disabled") if isinstance(plugins, dict) else []
+        return _CRON_GOVERNANCE_PLUGIN in (enabled or []) and _CRON_GOVERNANCE_PLUGIN not in (disabled or [])
+    except Exception:
+        return managed_profile
+
+
+def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
+    """Admit a scheduled job before its script or Agent side effect."""
+    if not _cron_creation_governance_expected():
+        return
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+        discover_plugins()
+        results = invoke_hook("pre_cron_job_run", job=copy.deepcopy(job))
+    except Exception as exc:
+        raise CronRuntimeAdmissionError(
+            _runtime_admission_receipt(
+                job,
+                reason_code="runtime_governance_unavailable",
+                state="review_required",
+                exception_class=exc.__class__.__name__,
+                retryable=True,
+            )
+        ) from exc
+    decisions = [item for item in results if isinstance(item, dict) and item.get("action") in {"allow", "block"}]
+    blocked = next((item for item in decisions if item.get("action") == "block"), None)
+    if blocked is not None:
+        raise CronRuntimeAdmissionError(
+            _runtime_admission_receipt(
+                job,
+                reason_code=blocked.get("reason"),
+                state=blocked.get("state"),
+                exception_class="runtime_admission_blocked",
+                retryable=False,
+            )
+        )
+    allowed = [item for item in decisions if item.get("action") == "allow"]
+    if len(allowed) != 1:
+        raise CronRuntimeAdmissionError(
+            _runtime_admission_receipt(
+                job,
+                reason_code="runtime_admission_ambiguous",
+                state="review_required",
+                exception_class="runtime_admission_ambiguous",
+                retryable=False,
+            )
+        )
+
+
+def _apply_cron_creation_governance(
+    operation: str,
+    candidate: Dict[str, Any],
+    existing_jobs: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], str]:
+    if not _cron_creation_governance_expected():
+        if _CRON_RESUME_RECEIPT_FIELD in candidate:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review (resume governance unavailable)."
+            )
+        return candidate, "allow_write"
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+        discover_plugins()
+        results = invoke_hook(
+            "pre_cron_job_persist",
+            operation=operation,
+            candidate=copy.deepcopy(candidate),
+            existing_jobs=copy.deepcopy(existing_jobs),
+            core_jobs_lock_capability=_issue_jobs_lock_capability(),
+        )
+    except Exception as exc:
+        raise CronJobGovernanceError("Cron job persistence needs administrator review (governance unavailable).") from exc
+
+    decisions = [item for item in results if isinstance(item, dict) and item.get("action") in {"allow", "block"}]
+    blocked = next((item for item in decisions if item.get("action") == "block"), None)
+    if blocked is not None:
+        reason = str(blocked.get("reason") or "review_required")
+        state = str(blocked.get("state") or "review_required")
+        raise CronJobGovernanceError(f"Cron job was not saved: {reason} ({state}).", decision=blocked)
+    allowed = [item for item in decisions if item.get("action") == "allow"]
+    if len(allowed) != 1:
+        raise CronJobGovernanceError("Cron job persistence needs administrator review (missing or ambiguous authorization).")
+    decision = allowed[0]
+    disposition = str(decision.get("persist_disposition") or "allow_write")
+    if disposition == "already_persisted":
+        resume = candidate.get(_CRON_RESUME_RECEIPT_FIELD)
+        resume_id = str(resume.get("receipt_id") or "").strip() if isinstance(resume, dict) else ""
+        matching = [
+            job for job in existing_jobs
+            if str(job.get("id") or "") == str(candidate.get("id") or "")
+            and isinstance(job.get("creation_governance_receipt"), dict)
+            and str(job["creation_governance_receipt"].get("resume_receipt_id") or "") == resume_id
+        ]
+        if not resume_id or len(matching) != 1:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review (invalid already-persisted result)."
+            )
+        return copy.deepcopy(matching[0]), "already_persisted"
+    if disposition != "allow_write":
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review (invalid persistence disposition)."
+        )
+
+    patch = decision.get("job_patch")
+    if not isinstance(patch, dict) or set(patch) - _CRON_GOVERNANCE_PATCH_FIELDS:
+        raise CronJobGovernanceError("Cron job persistence needs administrator review (invalid governance result).")
+    resume = candidate.get(_CRON_RESUME_RECEIPT_FIELD)
+    resume_pause = {
+        "enabled": False,
+        "state": "paused",
+        "paused_reason": "admin_authorized_pending_explicit_enable",
+    }
+    if resume is not None:
+        if {key: patch.get(key) for key in resume_pause} != resume_pause:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review (invalid resume pause result)."
+            )
+    elif set(patch).intersection(resume_pause):
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review (unexpected governance state patch)."
+        )
+    receipt = patch.get("creation_governance_receipt")
+    if not isinstance(receipt, dict) or not str(receipt.get("receipt_id") or "").strip():
+        raise CronJobGovernanceError("Cron job persistence needs administrator review (missing governance receipt).")
+    if resume is not None:
+        resume_id = str(resume.get("receipt_id") or "").strip() if isinstance(resume, dict) else ""
+        if not resume_id or str(receipt.get("resume_receipt_id") or "").strip() != resume_id:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review (resume receipt was not consumed)."
+            )
+    governed = {**candidate, **copy.deepcopy(patch)}
+    governed.pop(_CRON_RESUME_RECEIPT_FIELD, None)
+    return governed, "allow_write"
+
+
+def _resume_candidate(package: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(package, dict):
+        raise CronJobGovernanceError("Cron job persistence needs administrator review (invalid resume package).")
+    job = package.get("job")
+    receipt = package.get("receipt")
+    if not isinstance(job, dict) or not isinstance(receipt, dict):
+        raise CronJobGovernanceError("Cron job persistence needs administrator review (invalid resume package).")
+    if not str(job.get("id") or "").strip() or not str(receipt.get("receipt_id") or "").strip():
+        raise CronJobGovernanceError("Cron job persistence needs administrator review (incomplete resume package).")
+    return {**copy.deepcopy(job), _CRON_RESUME_RECEIPT_FIELD: copy.deepcopy(receipt)}
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -335,6 +1850,48 @@ def _job_output_dir(job_id: str) -> Path:
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     return _current_cron_store().output_dir / text
+
+
+def _remove_pinned_job_output(job_id: str) -> None:
+    """Remove one output tree through the active Core cron identity only."""
+    # Keep the existing safe-component guard, but do not use its lexical result
+    # for any filesystem operation after Core's lock capability is active.
+    output_name = _job_output_dir(job_id).name
+    cron_fd = -1
+    output_fd = -1
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        cron_fd = _duplicate_active_jobs_lock_cron_fd()
+        try:
+            output_entry = os.stat("output", dir_fd=cron_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(output_entry.st_mode):
+            raise OSError("Cron output path is not a directory")
+        output_fd = os.open("output", directory_flags, dir_fd=cron_fd)
+        output_open = os.fstat(output_fd)
+        if (
+            not stat.S_ISDIR(output_open.st_mode)
+            or output_open.st_dev != output_entry.st_dev
+            or output_open.st_ino != output_entry.st_ino
+        ):
+            raise OSError("Cron output directory changed during cleanup")
+        try:
+            job_entry = os.stat(output_name, dir_fd=output_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(job_entry.st_mode):
+            raise OSError("Cron job output path is not a directory")
+        if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+            raise OSError("Secure recursive Cron output cleanup is unavailable")
+        shutil.rmtree(output_name, dir_fd=output_fd)
+        os.fsync(output_fd)
+    finally:
+        if output_fd >= 0:
+            os.close(output_fd)
+        if cron_fd >= 0:
+            os.close(cron_fd)
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -439,13 +1996,268 @@ def _secure_file(path: Path):
         pass
 
 
+def _open_cron_directory_for_provisioning() -> int:
+    """Explicitly provision cron only through a checked parent directory chain."""
+    cron_dir = _current_cron_store().cron_dir
+    parent_fd = _open_existing_directory_chain(cron_dir.parent)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        try:
+            entry = os.stat(cron_dir.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            try:
+                os.mkdir(cron_dir.name, 0o700, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileExistsError:
+                pass
+            entry = os.stat(cron_dir.name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(entry.st_mode):
+            raise OSError("Cron directory is not an existing regular directory")
+        descriptor = os.open(cron_dir.name, flags, dir_fd=parent_fd)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != entry.st_dev
+            or opened.st_ino != entry.st_ino
+        ):
+            os.close(descriptor)
+            raise OSError("Cron directory changed while provisioning")
+        return descriptor
+    finally:
+        os.close(parent_fd)
+
+
+def _provision_jobs_lock(cron_fd: int) -> None:
+    """Create Core's lock during explicit store initialization, never at acquire time."""
+    name = ".jobs.lock"
+    try:
+        entry = os.stat(name, dir_fd=cron_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        descriptor = os.open(
+            name,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+            dir_fd=cron_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise OSError("Cron jobs lock is not a regular file")
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            os.fsync(cron_fd)
+        finally:
+            os.close(descriptor)
+        return
+    if not stat.S_ISREG(entry.st_mode):
+        raise OSError("Cron jobs lock is not an existing regular file")
+    descriptor = os.open(
+        name,
+        os.O_RDWR
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+        dir_fd=cron_fd,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != entry.st_dev
+            or opened.st_ino != entry.st_ino
+        ):
+            raise OSError("Cron jobs lock changed while provisioning")
+    finally:
+        os.close(descriptor)
+
+
+def _provision_cron_output_dir(cron_fd: int) -> None:
+    """Create the output directory through the same checked cron identity."""
+    name = "output"
+    try:
+        entry = os.stat(name, dir_fd=cron_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        os.mkdir(name, 0o700, dir_fd=cron_fd)
+        os.fsync(cron_fd)
+        entry = os.stat(name, dir_fd=cron_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(entry.st_mode):
+        raise OSError("Cron output path is not a directory")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(name, flags, dir_fd=cron_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != entry.st_dev
+            or opened.st_ino != entry.st_ino
+        ):
+            raise OSError("Cron output directory changed while provisioning")
+        os.fchmod(descriptor, 0o700)
+    finally:
+        os.close(descriptor)
+
+
+def _open_pinned_cron_output_dir() -> tuple[int, int]:
+    """Open the cron/output pair through one no-follow cron directory handle."""
+    cron_fd = -1
+    output_fd = -1
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        cron_fd = _open_cron_directory_for_provisioning()
+        _provision_cron_output_dir(cron_fd)
+        entry = os.stat("output", dir_fd=cron_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(entry.st_mode):
+            raise OSError("Cron output path is not a directory")
+        output_fd = os.open("output", directory_flags, dir_fd=cron_fd)
+        opened = os.fstat(output_fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != entry.st_dev
+            or opened.st_ino != entry.st_ino
+        ):
+            raise OSError("Cron output directory changed while opening")
+        return cron_fd, output_fd
+    except Exception:
+        if output_fd >= 0:
+            os.close(output_fd)
+        if cron_fd >= 0:
+            os.close(cron_fd)
+        raise
+
+
+def _open_pinned_job_output_dir(output_fd: int, job_name: str) -> int:
+    """Provision and open one job output directory without following a path."""
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        entry = os.stat(job_name, dir_fd=output_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            os.mkdir(job_name, 0o700, dir_fd=output_fd)
+            os.fsync(output_fd)
+        except FileExistsError:
+            pass
+        entry = os.stat(job_name, dir_fd=output_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(entry.st_mode):
+        raise OSError("Cron job output path is not a directory")
+    descriptor = os.open(job_name, directory_flags, dir_fd=output_fd)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != entry.st_dev
+            or opened.st_ino != entry.st_ino
+        ):
+            raise OSError("Cron job output directory changed while opening")
+        os.fchmod(descriptor, 0o700)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _write_pinned_job_output(job_fd: int, filename: str, output: str) -> None:
+    """Atomically replace one output file through its already-pinned directory."""
+    descriptor = -1
+    temporary = ""
+    try:
+        for _attempt in range(16):
+            candidate = f".output_{os.getpid()}_{os.urandom(8).hex()}.tmp"
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=job_fd,
+                )
+                temporary = candidate
+                break
+            except FileExistsError:
+                continue
+        if descriptor < 0:
+            raise OSError("cannot create cron output temporary file")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(output)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, filename, src_dir_fd=job_fd, dst_dir_fd=job_fd)
+        temporary = ""
+        os.fsync(job_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=job_fd)
+            except OSError:
+                pass
+
+
+def _prune_pinned_job_output(job_fd: int, keep: int) -> int:
+    """Prune retained output files without resolving or globbing their path."""
+    if keep <= 0:
+        return 0
+    try:
+        files = []
+        for name in os.listdir(job_fd):
+            if not name.endswith(".md"):
+                continue
+            entry = os.stat(name, dir_fd=job_fd, follow_symlinks=False)
+            if stat.S_ISREG(entry.st_mode):
+                files.append(name)
+        files.sort(reverse=True)
+    except OSError:
+        return 0
+    deleted = 0
+    for stale in files[keep:]:
+        try:
+            os.unlink(stale, dir_fd=job_fd)
+            deleted += 1
+        except OSError as exc:
+            logger.debug("Failed to prune cron output %s: %s", stale, exc)
+    return deleted
+
+
+def _validate_pinned_cron_path(cron_fd: int) -> None:
+    """Do not report a mutable path as the destination of a pinned write."""
+    try:
+        entry = os.stat(_current_cron_store().cron_dir, follow_symlinks=False)
+    except OSError as exc:
+        raise OSError("Cron directory changed during output persistence") from exc
+    opened = os.fstat(cron_fd)
+    if (
+        not stat.S_ISDIR(entry.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or entry.st_dev != opened.st_dev
+        or entry.st_ino != opened.st_ino
+    ):
+        raise OSError("Cron directory changed during output persistence")
+
+
 def ensure_dirs():
-    """Ensure cron directories exist with secure permissions."""
-    store = _current_cron_store()
-    store.cron_dir.mkdir(parents=True, exist_ok=True)
-    store.output_dir.mkdir(parents=True, exist_ok=True)
-    _secure_dir(store.cron_dir)
-    _secure_dir(store.output_dir)
+    """Provision one cron store before any runtime lock acquisition.
+
+    This is the only Core-owned creation path for ``cron/.jobs.lock``.  The
+    lock manager itself intentionally opens an already-provisioned regular
+    file, so governed writes fail closed if later path state is untrusted.
+    """
+    cron_fd = _open_cron_directory_for_provisioning()
+    try:
+        os.fchmod(cron_fd, 0o700)
+        _provision_jobs_lock(cron_fd)
+        _provision_cron_output_dir(cron_fd)
+    finally:
+        os.close(cron_fd)
 
 
 # =============================================================================
@@ -754,7 +2566,6 @@ def _atomic_write_epoch(path: Path) -> None:
     concurrent reader in another process (``hermes cron status``) never sees a
     torn/truncated file. Best-effort: failures are swallowed by callers.
     """
-    ensure_dirs()
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=".hb_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -819,47 +2630,129 @@ def get_ticker_success_age() -> Optional[float]:
 # Job CRUD Operations
 # =============================================================================
 
-def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
-    jobs_file = _current_cron_store().jobs_file
-    ensure_dirs()
-    if not jobs_file.exists():
-        return []
-
-    _strict_retry = False  # track whether we used the strict=False fallback
-
+def _read_jobs_payload_from_text(raw: str) -> tuple[Any, bool]:
+    """Parse jobs store text, returning ``(payload, used_strict_false)``."""
     try:
-        with open(jobs_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        return json.loads(raw), False
     except json.JSONDecodeError:
-        # Retry with strict=False to handle bare control chars in string values
-        _strict_retry = True
         try:
-            with open(jobs_file, 'r', encoding='utf-8') as f:
-                data = json.loads(f.read(), strict=False)
+            return json.loads(raw, strict=False), True
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
             raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
+
+
+def _read_jobs_payload_bytes(raw: bytes) -> tuple[Any, bool]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as e:
+        logger.error("IOError reading jobs.json: %s", e)
+        raise RuntimeError(f"Failed to read cron database: {e}") from e
+    return _read_jobs_payload_from_text(text)
+
+
+def _read_jobs_payload_from_path(jobs_file: Path) -> tuple[Any, bool]:
+    try:
+        with open(jobs_file, "r", encoding="utf-8") as handle:
+            raw = handle.read()
     except IOError as e:
         logger.error("IOError reading jobs.json: %s", e)
         raise RuntimeError(f"Failed to read cron database: {e}") from e
+    return _read_jobs_payload_from_text(raw)
 
+
+def _read_jobs_payload_from_cron_fd(cron_fd: int) -> tuple[Any, bool] | None:
+    """Read jobs.json through the active Core lock's pinned cron directory."""
+    descriptor = -1
+    try:
+        try:
+            entry = os.stat("jobs.json", dir_fd=cron_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(entry.st_mode):
+            raise RuntimeError(
+                "Cron database corrupted and unrepairable: jobs store is not a regular file"
+            )
+        descriptor = os.open(
+            "jobs.json",
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=cron_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != entry.st_dev
+            or opened.st_ino != entry.st_ino
+        ):
+            raise RuntimeError(
+                "Cron database corrupted and unrepairable: jobs store changed while opening"
+            )
+        chunks: list[bytes] = []
+        while True:
+            piece = os.read(descriptor, 1024 * 1024)
+            if not piece:
+                break
+            chunks.append(piece)
+        return _read_jobs_payload_bytes(b"".join(chunks))
+    except OSError as e:
+        logger.error("IOError reading jobs.json: %s", e)
+        raise RuntimeError(f"Failed to read cron database: {e}") from e
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _normalize_loaded_jobs_payload(
+    data: Any,
+    *,
+    strict_retry: bool,
+    repair_recoverable: bool = True,
+) -> List[Dict[str, Any]]:
+    """Validate the top-level jobs store shape and repair recoverable layouts."""
     # Validate the top-level JSON shape: accept a dict (expected) or a bare
     # list (auto-repair). Anything else (str/number/null) is corruption that
     # would otherwise raise an uncaught AttributeError on ``.get()`` and take
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
-        if _strict_retry and jobs:
+        if strict_retry and not repair_recoverable:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(jobs store requires control-character repair)."
+            )
+        if strict_retry and jobs:
             # Hit control-character corruption — rewrite with proper escaping.
-            save_jobs(jobs)
+            # Prefer the already-held Core lock identity when present so a path
+            # swap cannot redirect the auto-repair write.
+            try:
+                capability = _issue_jobs_lock_capability()
+            except CronJobGovernanceError:
+                capability = None
+            if capability is not None and _validate_jobs_lock_capability(capability) is not None:
+                _save_jobs_unlocked(jobs)
+            else:
+                save_jobs(jobs)
             logger.warning("Auto-repaired jobs.json (had invalid control characters)")
         return jobs
     if isinstance(data, list):
+        if not repair_recoverable:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(jobs store requires shape repair)."
+            )
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
         if data:
-            save_jobs(data)
+            try:
+                capability = _issue_jobs_lock_capability()
+            except CronJobGovernanceError:
+                capability = None
+            if capability is not None and _validate_jobs_lock_capability(capability) is not None:
+                _save_jobs_unlocked(data)
+            else:
+                save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
         return data
 
@@ -868,29 +2761,115 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
-def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage. Caller must hold _jobs_lock()."""
-    jobs_file = _current_cron_store().jobs_file
-    ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
+def load_jobs(*, repair_recoverable: bool = True) -> List[Dict[str, Any]]:
+    """Load all jobs from storage.
+
+    When Core's jobs lock is already held, the read stays on the same pinned
+    cron directory identity used by ``_save_jobs_unlocked``. Path-based reads
+    remain only for unlocked observers so a rename/swap cannot split load and
+    save across two trees inside one governed mutation.
+    """
+    held_cross_process = bool(
+        getattr(_jobs_lock_state, "depth", 0)
+        and getattr(_jobs_lock_state, "cross_process_acquired", False)
+    )
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        capability = _issue_jobs_lock_capability()
+    except CronJobGovernanceError:
+        capability = None
+    if capability is not None and _validate_jobs_lock_capability(capability) is not None:
+        cron_fd = _duplicate_active_jobs_lock_cron_fd()
+        try:
+            payload = _read_jobs_payload_from_cron_fd(cron_fd)
+        finally:
+            os.close(cron_fd)
+        if payload is None:
+            return []
+        data, strict_retry = payload
+        return _normalize_loaded_jobs_payload(
+            data,
+            strict_retry=strict_retry,
+            repair_recoverable=repair_recoverable,
+        )
+    if held_cross_process:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(Core jobs lock capability unavailable)."
+        )
+
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return []
+    data, strict_retry = _read_jobs_payload_from_path(jobs_file)
+    return _normalize_loaded_jobs_payload(
+        data,
+        strict_retry=strict_retry,
+        repair_recoverable=repair_recoverable,
+    )
+
+
+def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
+    """Save through the active Core lock's pinned cron directory identity."""
+    cron_fd = _duplicate_active_jobs_lock_cron_fd()
+    descriptor = -1
+    temp_name = ""
+    try:
+        try:
+            existing = os.stat("jobs.json", dir_fd=cron_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(jobs store is not a regular file)."
+            )
+        for _attempt in range(16):
+            candidate = f".jobs_{os.getpid()}_{os.urandom(8).hex()}.tmp"
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=cron_fd,
+                )
+                temp_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if descriptor < 0:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(cannot create pinned jobs store temporary file)."
+            )
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
+            descriptor = -1
             json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, jobs_file)
-        _secure_file(jobs_file)
+        validation_fd = _duplicate_active_jobs_lock_cron_fd()
+        os.close(validation_fd)
+        os.replace(temp_name, "jobs.json", src_dir_fd=cron_fd, dst_dir_fd=cron_fd)
+        temp_name = ""
+        os.fsync(cron_fd)
     except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
         raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=cron_fd)
+            except OSError:
+                pass
+        os.close(cron_fd)
 
 
 def save_jobs(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage."""
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         _save_jobs_unlocked(jobs)
 
 
@@ -1048,6 +3027,9 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    authorized_behavior_ref: Optional[str] = None,
+    implementation_categories: Optional[List[str]] = None,
+    governance_resume: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1096,6 +3078,21 @@ def create_job(
     Returns:
         The created job dict
     """
+    if governance_resume is not None:
+        candidate = _resume_candidate(governance_resume)
+        with _jobs_lock(require_cross_process=True):
+            jobs = load_jobs()
+            governed, disposition = _apply_cron_creation_governance("create", candidate, jobs)
+            if disposition == "already_persisted":
+                return _normalize_job_record(governed)
+            if any(str(item.get("id") or "") == str(governed.get("id") or "") for item in jobs):
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review (resume job id conflict)."
+                )
+            jobs.append(governed)
+            _save_jobs_unlocked(jobs)
+        return governed
+
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -1208,22 +3205,34 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        _CRON_DELIVERY_RECEIPT_FIELD: None,
+        _CRON_RUN_OUTCOME_RECEIPT_FIELD: None,
+        "last_runtime_admission_receipt": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if authorized_behavior_ref is not None:
+        job["authorized_behavior_ref"] = _normalize_job_optional_text(authorized_behavior_ref)
+    if implementation_categories is not None:
+        job["implementation_categories"] = [
+            str(item).strip() for item in implementation_categories if str(item).strip()
+        ]
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
 
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
+        job, disposition = _apply_cron_creation_governance("create", job, jobs)
+        if disposition != "allow_write":
+            return _normalize_job_record(job)
         jobs.append(job)
-        save_jobs(jobs)
+        _save_jobs_unlocked(jobs)
 
     return job
 
@@ -1250,7 +3259,11 @@ class AmbiguousJobReference(LookupError):
         )
 
 
-def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
+def resolve_job_ref(
+    ref: str,
+    *,
+    repair_recoverable: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Resolve a job reference (ID or name) to a job record.
 
     - Exact ID match wins (works even if a different job's name equals this ID).
@@ -1260,7 +3273,7 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     """
     if not ref:
         return None
-    jobs = load_jobs()
+    jobs = load_jobs(repair_recoverable=repair_recoverable)
     for job in jobs:
         if job["id"] == ref:
             return _normalize_job_record(job)
@@ -1283,8 +3296,54 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_job(
+    job_id: str,
+    updates: Dict[str, Any],
+    governance_resume: Optional[Dict[str, Any]] = None,
+    governance_refresh: bool = False,
+    deprecated_verification_retirement: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    special_requests = sum(
+        request is not None and request is not False
+        for request in (
+            governance_resume,
+            governance_refresh,
+            deprecated_verification_retirement,
+        )
+    )
+    if special_requests > 1:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(refresh, resume, and verification retirement are mutually exclusive)."
+        )
+    if (governance_refresh or deprecated_verification_retirement is not None) and updates:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(refresh and verification retirement require an otherwise unchanged Job)."
+        )
+    if governance_resume is not None:
+        candidate = _resume_candidate(governance_resume)
+        if str(candidate.get("id") or "") != str(job_id or ""):
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review (resume job id mismatch)."
+            )
+        with _jobs_lock(require_cross_process=True):
+            jobs = load_jobs()
+            target = next((index for index, item in enumerate(jobs) if item.get("id") == job_id), None)
+            if target is None:
+                return None
+            if jobs[target].get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None:
+                raise CronJobGovernanceError(
+                    "Cron job authorization cannot change while a signed run is active."
+                )
+            governed, disposition = _apply_cron_creation_governance("update", candidate, jobs)
+            if disposition == "already_persisted":
+                return _normalize_job_record(governed)
+            jobs[target] = governed
+            _save_jobs_unlocked(jobs)
+            return _normalize_job_record(governed)
+
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -1294,11 +3353,58 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
 
-    with _jobs_lock():
-        jobs = load_jobs()
+    governance_expected = _cron_creation_governance_expected()
+    if (
+        (governance_refresh or deprecated_verification_retirement is not None)
+        and not governance_expected
+    ):
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review (governance unavailable)."
+        )
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs(
+            repair_recoverable=not (
+                governance_refresh or deprecated_verification_retirement is not None
+            )
+        )
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            if deprecated_verification_retirement is not None:
+                request = deprecated_verification_retirement
+                receipt = job.get("creation_governance_receipt")
+                command = job.get("verification_command")
+                expected_keys = {
+                    "schema_version",
+                    "profile_id",
+                    "job_revision",
+                    "command_sha256",
+                }
+                command_sha256 = (
+                    "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest()
+                    if isinstance(command, str) and command
+                    else ""
+                )
+                expected_command = (
+                    f"HERMES_HOME={_cron_profile_home()} hermes cron status {job_id}"
+                )
+                if (
+                    not isinstance(request, dict)
+                    or set(request) != expected_keys
+                    or request.get("schema_version") != "cron-verification-retirement/v1"
+                    or not isinstance(receipt, dict)
+                    or receipt.get("cron_job_id") != job_id
+                    or request.get("profile_id") != receipt.get("profile_id")
+                    or request.get("job_revision") != receipt.get("receipt_id")
+                    or request.get("command_sha256") != command_sha256
+                    or command != expected_command
+                    or job.get("verification_command_mode") not in (None, "")
+                ):
+                    raise CronJobGovernanceError(
+                        "Cron job persistence needs administrator review "
+                        "(deprecated verification retirement precondition mismatch)."
+                    )
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -1309,14 +3415,32 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            special_operation = governance_refresh or deprecated_verification_retirement is not None
+            # Only re-derive the canonical skill/skills pair when the caller
+            # actually changes one of those fields. Runtime-only updates
+            # (pause/resume/trigger) must preserve the stored definition so a
+            # governed Job's candidate/material hash stays exact; unconditional
+            # normalization here rewrites legacy ``skill: null`` + ``skills``
+            # shapes and turns an authorized runtime transition into a
+            # candidate_hash_mismatch.
+            normalize_skills = "skills" in updates or "skill" in updates
             previous_inference_axes = _normalized_inference_axes(job)
-            updated = _apply_skill_fields({**job, **updates})
+            updated = (
+                copy.deepcopy(job)
+                if special_operation
+                else ({**job, **updates}
+                      if not normalize_skills
+                      else _apply_skill_fields({**job, **updates}))
+            )
+            if deprecated_verification_retirement is not None:
+                updated.pop("verification_command", None)
+                updated.pop("verification_command_mode", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
 
-            if "skills" in updates or "skill" in updates:
+            if normalize_skills:
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
@@ -1368,7 +3492,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["provider_snapshot"] = provider_snapshot
                 updated["model_snapshot"] = model_snapshot
 
-            if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
+            if (
+                not special_operation
+                and updated.get("enabled", True)
+                and updated.get("state") != "paused"
+                and not updated.get("next_run_at")
+            ):
                 next_run = compute_next_run(updated["schedule"])
                 if next_run is None and updated["schedule"].get("kind") == "once":
                     run_at = updated["schedule"].get("run_at", "unknown")
@@ -1378,8 +3507,24 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            if governance_refresh or _cron_governance_material_changed(job, updated):
+                if job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None:
+                    raise CronJobGovernanceError(
+                        "Cron job authorization cannot change while a signed run is active."
+                    )
+                if (
+                    job.get("creation_governance_receipt") is not None
+                    and not governance_expected
+                ):
+                    raise CronJobGovernanceError(
+                        "Cron job authorization cannot change while governance is unavailable."
+                    )
+                updated, disposition = _apply_cron_creation_governance("update", updated, jobs)
+                if disposition != "allow_write":
+                    return _normalize_job_record(updated)
+
             jobs[i] = updated
-            save_jobs(jobs)
+            _save_jobs_unlocked(jobs)
             return _normalize_job_record(jobs[i])
     return None
 
@@ -1444,29 +3589,45 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
-    job = resolve_job_ref(job_id)
-    if not job:
-        return False
-    canonical_id = job["id"]
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
-        original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
-        if len(jobs) < original_len:
-            # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
-            # left over from before the create-time guard) fails closed without
-            # half-applying the removal.
-            job_output_dir = _job_output_dir(canonical_id)
-            save_jobs(jobs)
-            # Clean up output directory to prevent orphaned dirs accumulating
-            if job_output_dir.exists():
-                shutil.rmtree(job_output_dir)
-            return True
-    return False
+        job = next((item for item in jobs if item.get("id") == job_id), None)
+        if job is None:
+            name_matches = [
+                item
+                for item in jobs
+                if str(item.get("name") or "").lower() == str(job_id or "").lower()
+            ]
+            if len(name_matches) > 1:
+                raise AmbiguousJobReference(
+                    job_id,
+                    [_normalize_job_record(item) for item in name_matches],
+                )
+            job = name_matches[0] if name_matches else None
+        if job is None:
+            return False
+        if job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None:
+            raise CronJobGovernanceError(
+                "Cron job cannot be removed while a signed run is active."
+            )
+        canonical_id = job["id"]
+        # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
+        # left over from before the create-time guard) fails closed without
+        # half-applying the removal.
+        _job_output_dir(canonical_id)
+        retained = [item for item in jobs if item["id"] != canonical_id]
+        _save_jobs_unlocked(retained)
+        # Clean up output directory to prevent orphaned dirs accumulating.
+        _remove_pinned_job_output(canonical_id)
+        return True
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 runtime_admission_receipt: Optional[Dict[str, Any]] = None,
+                 delivery_receipt: Optional[Dict[str, Any]] = None,
+                 run_outcome_receipt: Optional[Dict[str, Any]] = None,
+                 run_outcome_claim: Optional[Dict[str, Any]] = None):
     """
     Mark a job as having been run.
     
@@ -1475,17 +3636,102 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``runtime_admission_receipt`` records a fail-closed pre-execution decision
+    without putting raw prompts, routes, or exception text in jobs.json.
+    ``delivery_receipt`` records only aggregate terminal delivery proof; it
+    never includes transport identifiers, targets, content, or raw errors.
+    ``run_outcome_receipt`` binds the technical terminal state to the signed
+    Job revision. ``run_outcome_claim`` is the pre-run CAS token that cleared
+    stale proof before side effects. It is not a business-semantic judgment.
     """
-    with _jobs_lock():
+    if runtime_admission_receipt is not None:
+        runtime_admission_receipt = _validated_runtime_admission_receipt(
+            runtime_admission_receipt
+        )
+    if delivery_receipt is not None:
+        delivery_receipt = _validated_delivery_receipt(delivery_receipt)
+    if run_outcome_receipt is not None:
+        run_outcome_receipt = _validated_run_outcome_receipt(
+            run_outcome_receipt
+        )
+    if run_outcome_claim is not None:
+        run_outcome_claim = _validated_run_outcome_claim(run_outcome_claim)
+    if run_outcome_receipt is not None and run_outcome_claim is None:
+        raise ValueError("cron run outcome receipt requires its pre-run claim")
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                creation = job.get("creation_governance_receipt")
+                if isinstance(creation, dict) and run_outcome_claim is None:
+                    logger.warning(
+                        "mark_job_run: signed job_id %s requires its active run outcome claim; skipping save",
+                        job_id,
+                    )
+                    return False
+                if run_outcome_claim is not None:
+                    if (
+                        not isinstance(creation, dict)
+                        or creation.get("receipt_id") != run_outcome_claim.get("job_revision")
+                        or job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) != run_outcome_claim
+                        or not _run_outcome_claim_is_active(run_outcome_claim)
+                    ):
+                        logger.warning(
+                            "mark_job_run: stale run outcome claim for job_id %s; skipping save",
+                            job_id,
+                        )
+                        return False
+                    if run_outcome_receipt is not None and any(
+                        run_outcome_receipt.get(field) != run_outcome_claim.get(field)
+                        for field in (
+                            "profile_id",
+                            "job_id",
+                            "job_revision",
+                            "run_id",
+                            "implementation_hash",
+                        )
+                    ):
+                        raise ValueError("cron run outcome receipt does not match its claim")
+                    if run_outcome_receipt is not None:
+                        expected_checkpoint = _cron_checkpoint_invariant_hash(
+                            job,
+                            run_outcome_claim,
+                            success=success,
+                        )
+                        expected_delivery = _cron_delivery_receipt_hash(
+                            run_outcome_claim["run_id"],
+                            delivery_receipt,
+                        )
+                        if (
+                            run_outcome_receipt.get("terminal_state")
+                            != ("success" if success else "failed")
+                            or expected_checkpoint != run_outcome_receipt.get("checkpoint_invariant_hash")
+                            or expected_delivery != run_outcome_receipt.get("delivery_receipt_hash")
+                        ):
+                            raise ValueError("cron run outcome receipt does not match its claim")
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                job[_CRON_DELIVERY_RECEIPT_FIELD] = (
+                    copy.deepcopy(delivery_receipt)
+                    if delivery_receipt is not None
+                    else None
+                )
+                job[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = (
+                    copy.deepcopy(run_outcome_receipt)
+                    if run_outcome_receipt is not None
+                    else None
+                )
+                job[_CRON_RUN_OUTCOME_CLAIM_FIELD] = None
+                if runtime_admission_receipt is None:
+                    job[_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD] = None
+                else:
+                    job[_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD] = copy.deepcopy(
+                        runtime_admission_receipt
+                    )
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1520,7 +3766,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         # Remove the job (limit reached)
                         jobs.pop(i)
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1555,12 +3801,105 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
-def claim_dispatch(job_id: str) -> bool:
+def mark_job_delivery_recovered(job_id: str) -> bool:
+    """Clear delivery health after a confirmed recovery without changing run state."""
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            job["last_delivery_error"] = None
+            job["last_delivery_recovered_at"] = _hermes_now().isoformat()
+            _save_jobs_unlocked(jobs)
+            return True
+    logger.warning(
+        "mark_job_delivery_recovered: job_id %s not found, skipping save",
+        job_id,
+    )
+    return False
+
+
+def claim_operational_notice_delivery(job_id: str, idempotency_key: str) -> Dict[str, Any]:
+    """Durably claim one supplemental notice before its adapter send.
+
+    The receipt intentionally provides at-most-once automatic delivery. A
+    restart after a claimed but uncertain send is recorded for explicit
+    operator recovery instead of guessing and duplicating an admin message.
+    """
+    key = str(idempotency_key or "").strip()
+    if not key or len(key) > 512:
+        return {"status": "invalid_key", "claimed": False}
+    started = time.monotonic()
+    # A duplicate admin diagnostic is still an external side effect.  This
+    # receipt must not degrade to process-local protection under contention.
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            receipts = job.get("operational_notice_receipts")
+            receipts = dict(receipts) if isinstance(receipts, dict) else {}
+            existing = receipts.get(key)
+            if isinstance(existing, dict):
+                return {"status": str(existing.get("status") or "claimed"), "claimed": False}
+            if len(receipts) >= OPERATIONAL_NOTICE_RECEIPT_LIMIT:
+                oldest = sorted(receipts, key=lambda item: str(receipts[item].get("updated_at") or ""))
+                for stale_key in oldest[: len(receipts) - OPERATIONAL_NOTICE_RECEIPT_LIMIT + 1]:
+                    receipts.pop(stale_key, None)
+            now = _hermes_now().isoformat()
+            receipts[key] = {
+                "status": "claimed",
+                "claimed_at": now,
+                "updated_at": now,
+                "caller": "cron_scheduler",
+                "parameters": {"idempotency_key": key},
+                "result": {"status": "claimed"},
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+            job["operational_notice_receipts"] = receipts
+            _save_jobs_unlocked(jobs)
+            return {"status": "claimed", "claimed": True}
+    return {"status": "job_not_found", "claimed": False}
+
+
+def mark_operational_notice_delivery(job_id: str, idempotency_key: str, status: str) -> Dict[str, Any]:
+    """Record a safe terminal result for an already claimed notice."""
+    if status not in {"sent", "failed", "uncertain"}:
+        return {"status": "invalid_status"}
+    key = str(idempotency_key or "").strip()
+    started = time.monotonic()
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            receipts = job.get("operational_notice_receipts")
+            if not isinstance(receipts, dict) or not isinstance(receipts.get(key), dict):
+                return {"status": "not_claimed"}
+            receipts[key] = {
+                **receipts[key],
+                "status": status,
+                "updated_at": _hermes_now().isoformat(),
+                "result": {"status": status},
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+            job["operational_notice_receipts"] = receipts
+            _save_jobs_unlocked(jobs)
+            return {"status": status}
+    return {"status": "job_not_found"}
+
+
+def claim_dispatch(
+    job_id: str,
+    *,
+    run_outcome_claim: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Atomically claim a finite one-shot job dispatch BEFORE execution.
 
     Increments ``repeat.completed`` under the cross-process jobs lock and
@@ -1577,11 +3916,33 @@ def claim_dispatch(job_id: str) -> bool:
     Recurring jobs (they use ``advance_next_run``) and infinite-repeat / no-repeat
     jobs are left unchanged and always allowed to proceed.
     """
-    with _jobs_lock():
+    if run_outcome_claim is not None:
+        run_outcome_claim = _validated_run_outcome_claim(run_outcome_claim)
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+            creation = job.get("creation_governance_receipt")
+            if creation is not None and run_outcome_claim is None:
+                logger.warning(
+                    "claim_dispatch: signed job_id %s requires an exact run outcome claim; refusing dispatch",
+                    job_id,
+                )
+                return False
+            if run_outcome_claim is not None:
+                if (
+                    not isinstance(creation, dict)
+                    or creation.get("receipt_id")
+                    != run_outcome_claim.get("job_revision")
+                    or job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD)
+                    != run_outcome_claim
+                ):
+                    logger.warning(
+                        "claim_dispatch: stale run outcome claim for job_id %s; refusing dispatch",
+                        job_id,
+                    )
+                    return False
             if job.get("schedule", {}).get("kind") != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
             repeat = job.get("repeat")
@@ -1615,8 +3976,14 @@ def claim_dispatch(job_id: str) -> bool:
             )
             return True
 
+        if run_outcome_claim is not None:
+            logger.warning(
+                "claim_dispatch: exact run outcome claim has no stored job_id %s; refusing dispatch",
+                job_id,
+            )
+            return False
         logger.debug(
-            "claim_dispatch: job_id %s not in store — proceeding without claim "
+            "claim_dispatch: unsigned job_id %s not in store — proceeding "
             "(handed-in job dict; nothing to persist a claim against)",
             job_id,
         )
@@ -1639,7 +4006,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     Returns True if this owner's one-shot claim was refreshed; False when the
     job, claim, or ownership no longer matches.
     """
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
         for job in jobs:
             if job.get("id") != job_id:
@@ -1667,7 +4034,7 @@ def advance_next_run(job_id: str) -> bool:
 
     Returns True if next_run_at was advanced, False otherwise.
     """
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
         for job in jobs:
             if job["id"] == job_id:
@@ -1722,7 +4089,7 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
     completing doesn't wedge the job forever — after the TTL another fire can
     reclaim it.
     """
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
         for job in jobs:
             if job["id"] != job_id:
@@ -1770,7 +4137,7 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     Note: firing once on catch-up flows through ``mark_job_run``, so a job with
     a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
     """
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         return _get_due_jobs_locked()
 
 
@@ -1885,6 +4252,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         try:
             if not job.get("enabled", True):
                 continue
+            active_outcome_claim = job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD)
+            if active_outcome_claim is not None:
+                try:
+                    if _run_outcome_claim_is_active(active_outcome_claim):
+                        continue
+                except ValueError:
+                    # Invalid durable evidence belongs to the existing HAK
+                    # repair path and must never be dispatched automatically.
+                    continue
 
             # Cross-process running-claim guard (#59229): if another scheduler
             # process already claimed this one-shot and its run is still in flight
@@ -2160,33 +4536,26 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
 
 def save_job_output(job_id: str, output: str):
     """Save job output to file."""
-    ensure_dirs()
-    job_output_dir = _job_output_dir(job_id)
-    job_output_dir.mkdir(parents=True, exist_ok=True)
-    _secure_dir(job_output_dir)
-
+    job_name = _job_output_dir(job_id).name
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
-
-    fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
+    filename = f"{timestamp}.md"
+    cron_fd = -1
+    output_fd = -1
+    job_fd = -1
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(output)
-            f.flush()
-            os.fsync(f.fileno())
-        atomic_replace(tmp_path, output_file)
-        _secure_file(output_file)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-    # Bound per-job output growth so long-running deploys don't fill the disk (#52383).
-    _prune_job_output(job_output_dir, _cron_output_keep())
-
-    return output_file
+        cron_fd, output_fd = _open_pinned_cron_output_dir()
+        job_fd = _open_pinned_job_output_dir(output_fd, job_name)
+        _write_pinned_job_output(job_fd, filename, output)
+        _prune_pinned_job_output(job_fd, _cron_output_keep())
+        _validate_pinned_cron_path(cron_fd)
+        return _current_cron_store().output_dir / job_name / filename
+    finally:
+        if job_fd >= 0:
+            os.close(job_fd)
+        if output_fd >= 0:
+            os.close(output_fd)
+        if cron_fd >= 0:
+            os.close(cron_fd)
 
 
 # =============================================================================
@@ -2281,7 +4650,7 @@ def rewrite_skill_refs(
     if not consolidated and not pruned_set:
         return {"rewrites": [], "jobs_updated": 0, "jobs_scanned": 0}
 
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
         rewrites: List[Dict[str, Any]] = []
         changed = False

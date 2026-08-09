@@ -11,6 +11,9 @@ Events:
   - session:start       -- New session created (first message of a new session)
   - session:end         -- Session ends (user ran /new or /reset)
   - session:reset       -- Session reset completed (new session entry created)
+  - message:received    -- Decision hook before agent processing; handlers
+                           may deny (swallow + optional reply) or rewrite
+                           (mutate message / append context prompt)
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
   - agent:end           -- Agent finishes processing
@@ -62,6 +65,8 @@ class HookRegistry:
     def __init__(self):
         # event_type -> [handler_fn, ...]
         self._handlers: Dict[str, List[Callable]] = {}
+        self._handler_owners: Dict[int, str] = {}
+        self._handler_capabilities: Dict[int, frozenset[str]] = {}
         self._loaded_hooks: List[dict] = []  # metadata for listing
 
     @property
@@ -146,6 +151,18 @@ class HookRegistry:
                 # Register the handler for each declared event
                 for event in events:
                     self._handlers.setdefault(event, []).append(handle_fn)
+                self._handler_owners[id(handle_fn)] = hook_dir.name
+                raw_capabilities = manifest.get("capabilities", [])
+                capabilities = (
+                    frozenset(
+                        value.strip()
+                        for value in raw_capabilities
+                        if isinstance(value, str) and value.strip()
+                    )
+                    if isinstance(raw_capabilities, list)
+                    else frozenset()
+                )
+                self._handler_capabilities[id(handle_fn)] = capabilities
 
                 self._loaded_hooks.append({
                     "name": hook_name,
@@ -171,6 +188,22 @@ class HookRegistry:
             wildcard_key = f"{base}:*"
             handlers.extend(self._handlers.get(wildcard_key, []))
         return handlers
+
+    def resolve_handlers_with_metadata(
+        self,
+        event_type: str,
+    ) -> List[tuple[Callable, Dict[str, Any]]]:
+        """Resolve handlers with loader-owned identity and capabilities."""
+        return [
+            (
+                handler,
+                {
+                    "owner": self._handler_owners.get(id(handler), ""),
+                    "capabilities": sorted(self._handler_capabilities.get(id(handler), ())),
+                },
+            )
+            for handler in self._resolve_handlers(event_type)
+        ]
 
     async def emit(self, event_type: str, context: Optional[Dict[str, Any]] = None) -> None:
         """

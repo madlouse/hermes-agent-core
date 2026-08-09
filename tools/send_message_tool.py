@@ -15,6 +15,7 @@ import time
 from email.utils import formatdate
 
 from agent.redact import redact_sensitive_text
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +145,29 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
+def _is_registered_plugin_platform(platform_name: str) -> bool:
+    """Return True for plugin platforms without broadening unknown targets."""
+    name = (platform_name or "").strip().lower()
+    if not name:
+        return False
+    try:
+        from gateway.config import _BUILTIN_PLATFORM_VALUES
+        if name in _BUILTIN_PLATFORM_VALUES:
+            return False
+    except Exception:
+        return False
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception:
+        pass
+    try:
+        from gateway.platform_registry import platform_registry
+        return platform_registry.is_registered(name)
+    except Exception:
+        return False
+
+
 def _display_chat_id(platform_name: str, chat_id: str) -> str:
     """Return a result-safe chat identifier for tool transcripts/log consumers."""
     if platform_name == "signal" and str(chat_id).startswith("group:"):
@@ -247,7 +271,7 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
-    return _handle_send(args)
+    return _handle_send(args, outbound_hooks=kw.get("outbound_hooks"))
 
 
 def _handle_list():
@@ -351,7 +375,7 @@ def _handle_react(args, remove=False):
     return json.dumps({"success": bool(result)})
 
 
-def _handle_send(args):
+def _handle_send(args, *, outbound_hooks=None):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
@@ -429,16 +453,6 @@ def _handle_send(args):
 
     from gateway.platforms.base import BasePlatformAdapter
 
-    # Capture [[as_document]] directive before extract_media strips it.
-    # Image-extension files in this batch will route through send_document
-    # instead of send_photo so the original bytes survive (e.g. info-graph
-    # JPGs where Telegram's sendPhoto recompresses to 1280px).
-    force_document_attachments = "[[as_document]]" in message
-
-    media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
-
     used_home_channel = False
     if not chat_id:
         home = config.get_home_channel(platform)
@@ -487,6 +501,55 @@ def _handle_send(args):
             return json.dumps({"error": f"Failed to open Slack DM: {e}"})
 
     try:
+        from gateway.outbound_boundary import (
+            build_outbound_context,
+            outbound_after_send_sync,
+            outbound_before_send_sync,
+            send_result_payload,
+        )
+
+        if outbound_hooks is None:
+            try:
+                from gateway.run import _gateway_runner_ref
+
+                runner = _gateway_runner_ref()
+                outbound_hooks = getattr(runner, "hooks", None) if runner is not None else None
+            except Exception:
+                outbound_hooks = None
+
+        boundary_context = build_outbound_context(
+            source_kind="send_message",
+            content=message,
+            platform=platform_name,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            profile_id=str(args.get("profile_id") or ""),
+            profile_path=str(get_hermes_home()),
+            producer_id="send_message",
+            target={"transport_id": platform_name, "channel_id": chat_id, "thread_id": thread_id or ""},
+            action_spec=args.get("action_spec"),
+            action_specs=args.get("action_specs"),
+            actionability=args.get("actionability"),
+            gate_mode=args.get("actionable_gate_mode"),
+            decision_route=args.get("decision_route"),
+            result_route=args.get("result_route"),
+            output_screening_required=True,
+        )
+        boundary_decision = outbound_before_send_sync(outbound_hooks, boundary_context)
+        boundary_context["before_send_decision"] = boundary_decision.raw
+        if not boundary_decision.transmit:
+            return json.dumps({
+                "success": False,
+                "error": f"outbound boundary {boundary_decision.decision}: {boundary_decision.reason}",
+                "boundary_decision": boundary_decision.raw,
+            })
+        screened_message = boundary_decision.content
+        force_document_attachments = "[[as_document]]" in screened_message
+        media_files, cleaned_message = BasePlatformAdapter.extract_media(screened_message)
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        boundary_context["content"] = cleaned_message
+        mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
+
         from model_tools import _run_async
         result = _run_async(
             _send_to_platform(
@@ -499,6 +562,22 @@ def _handle_send(args):
                 force_document=force_document_attachments,
             )
         )
+        _boundary_send_payload = send_result_payload(result)
+        if isinstance(result, dict) and result.get("success"):
+            outbound_after_send_sync(
+                outbound_hooks,
+                {
+                    **boundary_context,
+                    "send_result": _boundary_send_payload,
+                    "source_outbox_id": (
+                        _boundary_send_payload.get("outbox_id")
+                        or _boundary_send_payload.get("message_id")
+                        or _boundary_send_payload.get("id")
+                        or ""
+                    ),
+                    "success": True,
+                },
+            )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
@@ -613,6 +692,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     # XMPP JIDs (user@server or room@conference.server) are explicit
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
+    if _is_registered_plugin_platform(platform_name) and stripped_target:
+        return stripped_target, None, True
     return None, None, False
 
 

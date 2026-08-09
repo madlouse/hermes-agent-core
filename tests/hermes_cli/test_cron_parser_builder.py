@@ -70,6 +70,30 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_edit_governance_refresh_is_explicit():
+    parser = _build()
+    assert parser.parse_args(["cron", "edit", "j"]).refresh_governance is False
+    assert parser.parse_args(["cron", "edit", "j", "--refresh-governance"]).refresh_governance is True
+
+
+def test_cron_edit_verification_retirement_preconditions_are_explicit():
+    parser = _build()
+    args = parser.parse_args([
+        "cron",
+        "edit",
+        "j",
+        "--retire-verification-profile-id",
+        "yuange",
+        "--retire-verification-job-revision",
+        "sha256:" + "1" * 64,
+        "--retire-verification-command-sha256",
+        "sha256:" + "2" * 64,
+    ])
+    assert args.retire_verification_profile_id == "yuange"
+    assert args.retire_verification_job_revision == "sha256:" + "1" * 64
+    assert args.retire_verification_command_sha256 == "sha256:" + "2" * 64
+
+
 def test_cron_dispatch_func_is_injected_handler():
     parser = _build()
     ns = parser.parse_args(["cron", "list"])

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 
 import pytest
 
@@ -36,9 +37,11 @@ class _FakeTool:
     def __init__(self, payload):
         self.payload = payload
         self.calls = []
+        self.kwargs = []
 
-    def __call__(self, args, **_kw):
+    def __call__(self, args, **kw):
         self.calls.append(dict(args))
+        self.kwargs.append(dict(kw))
         return json.dumps(self.payload)
 
 
@@ -72,8 +75,31 @@ def test_positional_message_success(fake_tool, capsys):
     assert fake_tool.calls == [
         {"action": "send", "target": "telegram", "message": "hello world"}
     ]
+    hooks = fake_tool.kwargs[0]["outbound_hooks"]
+    assert callable(hooks.emit_collect)
     out = capsys.readouterr()
     assert "sent" in out.out or out.out == ""  # "sent" is the default success banner
+
+
+def test_send_preserves_owner_bound_profile_context_from_dotenv(
+    fake_tool, monkeypatch, tmp_path
+):
+    profile = tmp_path / "atlas"
+    profile.mkdir()
+    (profile / ".env").write_text(
+        f"HERMES_HOME={tmp_path / 'other'}\nHERMES_PROFILE_ID=yuange\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_PROFILE_ID", "atlas")
+
+    args = _parse(["--to", "telegram", "hello world"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert os.environ["HERMES_HOME"] == str(profile)
+    assert os.environ["HERMES_PROFILE_ID"] == "atlas"
 
 
 def test_stdin_message(fake_tool, monkeypatch, capsys):

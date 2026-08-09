@@ -103,15 +103,34 @@ _yaml_load_fn = None
 
 
 def yaml_load(content: str):
-    """Parse YAML with lazy import and CSafeLoader preference."""
+    """Parse YAML with lazy import and CSafeLoader preference.
+
+    YAML values that parse as Python ``datetime.date`` objects
+    (pyyaml auto-converts ``YYYY-MM-DD`` strings) are recursively
+    converted back to ISO-8601 strings so that downstream JSON
+    serialisation never fails with ``TypeError: Object of type date
+    is not JSON serializable``.
+    """
     global _yaml_load_fn
     if _yaml_load_fn is None:
         import yaml
+        from datetime import date
 
         loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
 
+        def _sanitize(obj):
+            """Recursively convert :class:`datetime.date` → ISO str."""
+            if isinstance(obj, date):
+                return obj.isoformat()
+            if isinstance(obj, dict):
+                return {k: _sanitize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_sanitize(v) for v in obj]
+            return obj
+
         def _load(value: str):
-            return yaml.load(value, Loader=loader)
+            parsed = yaml.load(value, Loader=loader)
+            return _sanitize(parsed)
 
         _yaml_load_fn = _load
     return _yaml_load_fn(content)

@@ -6,6 +6,7 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -61,6 +62,24 @@ def _active_cron_provider_name() -> str:
         return resolve_cron_scheduler().name or "builtin"
     except Exception:
         return "builtin"
+
+
+def _runtime_admission_summary(job: dict) -> Optional[str]:
+    """Return a safe display summary for a Core-created admission receipt."""
+    receipt = job.get("last_runtime_admission_receipt")
+    if not isinstance(receipt, dict):
+        return None
+    reason = str(receipt.get("reason_code") or "")
+    state = str(receipt.get("state") or "")
+    if (
+        receipt.get("schema_version") != "cron-runtime-admission/v1"
+        or receipt.get("stage") != "pre_cron_job_run"
+        or receipt.get("status") != "blocked"
+        or not re.fullmatch(r"[a-z][a-z0-9_.:-]{0,95}", reason)
+        or not re.fullmatch(r"[a-z][a-z0-9_.:-]{0,95}", state)
+    ):
+        return None
+    return f"blocked: {reason} ({state})"
 
 
 def _warn_if_gateway_not_running() -> None:
@@ -173,6 +192,10 @@ def cron_list(show_all: bool = False):
             else:
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
             print(f"    Last run:  {last_run}  {status_display}")
+
+        admission_summary = _runtime_admission_summary(job)
+        if admission_summary:
+            print(f"    Runtime gate: {color(admission_summary, Colors.YELLOW)}")
 
         delivery_err = job.get("last_delivery_error")
         if delivery_err:
@@ -332,14 +355,38 @@ def cron_create(args):
 
 
 def cron_edit(args):
-    from cron.jobs import AmbiguousJobReference, resolve_job_ref
+    from cron.jobs import AmbiguousJobReference, CronJobGovernanceError, resolve_job_ref
+
+    retirement_values = {
+        "profile_id": getattr(args, "retire_verification_profile_id", None),
+        "job_revision": getattr(args, "retire_verification_job_revision", None),
+        "command_sha256": getattr(args, "retire_verification_command_sha256", None),
+    }
+    retirement = None
+    if any(retirement_values.values()):
+        if not all(retirement_values.values()):
+            print(color("All verification retirement preconditions are required.", Colors.RED))
+            return 1
+        retirement = {
+            "schema_version": "cron-verification-retirement/v1",
+            **retirement_values,
+        }
+    special_governance_update = bool(
+        getattr(args, "refresh_governance", False) or retirement is not None
+    )
 
     try:
-        job = resolve_job_ref(args.job_id)
+        job = resolve_job_ref(
+            args.job_id,
+            repair_recoverable=not special_governance_update,
+        )
     except AmbiguousJobReference as exc:
         print(color(str(exc), Colors.RED))
         for m in exc.matches:
             print(f"  {m['id']}  (name: {m.get('name')!r})")
+        return 1
+    except CronJobGovernanceError as exc:
+        print(color(f"Failed to update job: {exc}", Colors.RED))
         return 1
     if not job:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
@@ -373,6 +420,8 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        governance_refresh=getattr(args, "refresh_governance", False),
+        deprecated_verification_retirement=retirement,
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

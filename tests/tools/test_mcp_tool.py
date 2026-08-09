@@ -3581,6 +3581,22 @@ class TestMCPServerTaskSamplingIntegration:
 # Discovery failed_count tracking
 # ---------------------------------------------------------------------------
 
+class TestDiscoveryAllowlist:
+    def test_requested_servers_limit_discovery_scope(self):
+        """A cron job must not connect unrelated configured MCP servers."""
+        import tools.mcp_tool as mcp_tool
+
+        config = {
+            "needed": {"enabled": True, "command": "needed"},
+            "unrelated": {"enabled": True, "command": "unrelated"},
+        }
+        with patch.object(mcp_tool, "_MCP_AVAILABLE", True), \
+             patch.object(mcp_tool, "_load_mcp_config", return_value=config), \
+             patch.object(mcp_tool, "register_mcp_servers", return_value=[]) as register:
+            assert mcp_tool.discover_mcp_tools(server_names=["needed"]) == []
+
+        register.assert_called_once_with({"needed": config["needed"]})
+
 class TestDiscoveryFailedCount:
     """Verify discover_mcp_tools() correctly tracks failed server connections."""
 

@@ -45,6 +45,29 @@ class TestDiscoverAndLoad:
         assert reg.loaded_hooks[0]["name"] == "my-hook"
         assert "agent:start" in reg.loaded_hooks[0]["events"]
 
+    def test_loader_exposes_declared_handler_capabilities(self, tmp_path):
+        hook_dir = _create_hook(
+            tmp_path,
+            "policy-screen",
+            '["outbound:before_send"]',
+            "def handle(event_type, context):\n    return {'decision': 'allow'}\n",
+        )
+        (hook_dir / "HOOK.yaml").write_text(
+            "name: spoofed-manifest-name\n"
+            "events: ['outbound:before_send']\n"
+            "capabilities: ['output-screening']\n"
+        )
+
+        reg = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+            reg.discover_and_load()
+
+        entries = reg.resolve_handlers_with_metadata("outbound:before_send")
+        assert entries[0][1] == {
+            "owner": "policy-screen",
+            "capabilities": ["output-screening"],
+        }
+
     def test_skips_missing_hook_yaml(self, tmp_path):
         hook_dir = tmp_path / "bad-hook"
         hook_dir.mkdir()

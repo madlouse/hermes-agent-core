@@ -120,6 +120,32 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Cron authorization identity vars: set per-job in run_job() so Kit runtime
+# hooks can authorize detached cron tool calls by durable behavior identity
+# instead of falling back to profile-default compatibility.
+_CRON_JOB_ID: ContextVar = ContextVar("HERMES_CRON_JOB_ID", default=_UNSET)
+_CRON_AUTHORIZED_BEHAVIOR_REF: ContextVar = ContextVar("HERMES_CRON_AUTHORIZED_BEHAVIOR_REF", default=_UNSET)
+_CRON_PROCESS_CHARTER_REF: ContextVar = ContextVar("HERMES_CRON_PROCESS_CHARTER_REF", default=_UNSET)
+_CRON_RISK_TIER: ContextVar = ContextVar("HERMES_CRON_RISK_TIER", default=_UNSET)
+_CRON_IMPLEMENTATION_CATEGORIES: ContextVar = ContextVar("HERMES_CRON_IMPLEMENTATION_CATEGORIES", default=_UNSET)
+_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF: ContextVar = ContextVar("HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF", default=_UNSET)
+_CRON_OBSERVED_SCOPE_EVIDENCE_REF: ContextVar = ContextVar("HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF", default=_UNSET)
+_CRON_CANDIDATE_HASH: ContextVar = ContextVar("HERMES_CRON_CANDIDATE_HASH", default=_UNSET)
+
+# Authorization identity is intentionally separate from _VAR_MAP. The local
+# subprocess environment bridge exports _VAR_MAP values; cron authority must
+# stay in-process and context-local so child processes cannot retain/replay it.
+_CRON_AUTH_VAR_MAP = {
+    "HERMES_CRON_JOB_ID": _CRON_JOB_ID,
+    "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": _CRON_AUTHORIZED_BEHAVIOR_REF,
+    "HERMES_CRON_PROCESS_CHARTER_REF": _CRON_PROCESS_CHARTER_REF,
+    "HERMES_CRON_RISK_TIER": _CRON_RISK_TIER,
+    "HERMES_CRON_IMPLEMENTATION_CATEGORIES": _CRON_IMPLEMENTATION_CATEGORIES,
+    "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": _CRON_IMPLEMENTATION_PATH_EVIDENCE_REF,
+    "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": _CRON_OBSERVED_SCOPE_EVIDENCE_REF,
+    "HERMES_CRON_CANDIDATE_HASH": _CRON_CANDIDATE_HASH,
+}
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -319,6 +345,8 @@ def get_session_env(name: str, default: str = "") -> str:
     import os
 
     var = _VAR_MAP.get(name)
+    if var is None:
+        var = _CRON_AUTH_VAR_MAP.get(name)
     if var is not None:
         value = var.get()
         if value is not _UNSET:

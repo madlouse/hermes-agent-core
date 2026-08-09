@@ -939,6 +939,38 @@ class TestFreshnessHelpers:
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_skips_group_sessions():
+    """Group/channel sessions should not receive synthetic startup replies.
+
+    They remain resume_pending and continue on the next real user message,
+    avoiding noisy "restart recovery" chatter in shared chats.
+    """
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="group-chat", chat_type="group")
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:group:group-chat:u1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="group",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    assert pending_entry.resume_pending is True
+
+
+@pytest.mark.asyncio
 async def test_drain_timeout_marks_resume_pending():
     """End-to-end: a drain timeout during gateway stop should flag every
     active session as resume_pending BEFORE the interrupt fires, so the

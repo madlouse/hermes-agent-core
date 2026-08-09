@@ -4832,15 +4832,14 @@ class BasePlatformAdapter(ABC):
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
-        delivery_succeeded = False
+        delivery_receipts = []
 
-        def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
-            if result is None:
-                return
+        def _record_delivery(result, *, kind: str) -> None:
+            nonlocal delivery_attempted
+            from gateway.outbound_boundary import delivery_receipt
+
+            delivery_receipts.append(delivery_receipt(result, kind=kind))
             delivery_attempted = True
-            if getattr(result, "success", False):
-                delivery_succeeded = True
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -4912,6 +4911,74 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+            outbound_boundary_context = None
+            outbound_hooks = None
+            if response:
+                try:
+                    from gateway.outbound_boundary import (
+                        build_outbound_context,
+                        gateway_reply_source_kind,
+                        outbound_before_send,
+                    )
+                    from gateway.run import _gateway_runner_ref
+
+                    runner = _gateway_runner_ref()
+                    outbound_hooks = getattr(runner, "hooks", None) if runner is not None else None
+                    enforced_channel = False
+                    try:
+                        from gateway.run import _operator_enforce_streaming_boundary_source_armed
+
+                        enforced_channel = _operator_enforce_streaming_boundary_source_armed(
+                            _HERMES_HOME,
+                            event.source,
+                        )
+                    except (ImportError, AttributeError):
+                        # Streaming-boundary support is optional during a staged
+                        # upgrade; final-reply screening remains available first.
+                        pass
+                    outbound_source_kind = gateway_reply_source_kind(
+                        response,
+                        enforced_channel=enforced_channel,
+                    )
+                    outbound_boundary_context = build_outbound_context(
+                        source_kind=outbound_source_kind,
+                        content=response,
+                        platform=self.platform,
+                        chat_id=event.source.chat_id,
+                        thread_id=getattr(event.source, "thread_id", None),
+                        profile_path=str(_HERMES_HOME),
+                        producer_id="gateway_final_reply",
+                        message_id=getattr(event, "message_id", None),
+                        enforced_channel=enforced_channel,
+                        output_screening_required=True,
+                    )
+                    boundary_decision = await outbound_before_send(
+                        outbound_hooks,
+                        outbound_boundary_context,
+                    )
+                    outbound_boundary_context["before_send_decision"] = boundary_decision.raw
+                    if not boundary_decision.transmit:
+                        logger.warning(
+                            "[%s] outbound boundary %s for %s: %s",
+                            self.name,
+                            boundary_decision.decision,
+                            event.source.chat_id,
+                            boundary_decision.reason,
+                        )
+                        response = None
+                    else:
+                        response = boundary_decision.content
+                        outbound_boundary_context["content"] = response
+                except Exception as boundary_err:
+                    logger.warning(
+                        "[%s] outbound boundary bridge failed: %s",
+                        self.name,
+                        boundary_err,
+                    )
+                    # Every final reply is output-screened. A bridge fault must
+                    # not reopen the generic-reply bypass that this boundary closes.
+                    response = None
+
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
@@ -5013,6 +5080,7 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result, kind="tts")
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -5032,7 +5100,7 @@ class BasePlatformAdapter(ABC):
                         reply_to=_reply_anchor,
                         metadata=_final_thread_metadata,
                     )
-                    _record_delivery(result)
+                    _record_delivery(result, kind="text")
 
                     # Schedule auto-deletion of system-notice replies.
                     # Detached so the handler returns immediately; errors
@@ -5056,14 +5124,16 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        batch_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(batch_result, kind="image_batch")
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery({"success": False}, kind="image_batch")
 
 
                 # Send extracted media files — route by file type
@@ -5098,14 +5168,16 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        batch_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(batch_result, kind="image_batch")
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery({"success": False}, kind="image_batch")
 
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
@@ -5133,8 +5205,10 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                        _record_delivery(media_result, kind="media")
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        _record_delivery({"success": False}, kind="media")
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -5143,25 +5217,30 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            local_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            local_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(local_result, kind="local_file")
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        _record_delivery({"success": False}, kind="local_file")
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
-                _anything_delivered = (
-                    delivery_attempted or _tts_caption_delivered
-                    or images or local_files or media_files
+                from gateway.outbound_boundary import summarize_delivery_receipts
+
+                delivery_summary = summarize_delivery_receipts(delivery_receipts)
+                _anything_delivered = any(
+                    receipt.get("status") == "confirmed"
+                    for receipt in delivery_summary["receipts"]
                 )
                 if not _anything_delivered and _response_pre_extract.strip():
                     logger.error(
@@ -5171,8 +5250,33 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
+                if outbound_boundary_context is not None:
+                    try:
+                        from gateway.outbound_boundary import (
+                            outbound_after_send,
+                        )
+
+                        await outbound_after_send(
+                            outbound_hooks,
+                            {
+                                **outbound_boundary_context,
+                                "send_result": delivery_summary["send_result"],
+                                "source_outbox_id": delivery_summary["source_outbox_id"],
+                                "delivery_receipts": delivery_summary["receipts"],
+                                "delivery_receipts_truncated": delivery_summary["receipts_truncated"],
+                                "delivery_status": delivery_summary["status"],
+                                "success": delivery_summary["success"],
+                            },
+                        )
+                    except Exception as boundary_err:
+                        logger.warning(
+                            "[%s] outbound after_send bridge failed: %s",
+                            self.name,
+                            boundary_err,
+                        )
+
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = delivery_summary["success"] if delivery_attempted else not bool(response)
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,

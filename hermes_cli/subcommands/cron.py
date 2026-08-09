@@ -134,6 +134,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--workdir",
         help="Absolute path for the job to run from (injects AGENTS.md etc. and sets terminal cwd). Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--refresh-governance",
+        action="store_true",
+        help="Re-evaluate the unchanged Job through existing persistence governance",
+    )
+    cron_edit.add_argument("--retire-verification-profile-id")
+    cron_edit.add_argument("--retire-verification-job-revision")
+    cron_edit.add_argument("--retire-verification-command-sha256")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

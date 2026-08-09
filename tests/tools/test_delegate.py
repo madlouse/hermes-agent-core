@@ -1947,6 +1947,39 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
+    def test_run_single_child_inherits_cron_authorization_context(self):
+        from gateway.session_context import _CRON_JOB_ID, _UNSET, get_session_env
+        from tools.delegate_tool import _run_single_child
+
+        previous = _CRON_JOB_ID.get()
+        seen = []
+        child = MagicMock()
+
+        def run_conversation(**kwargs):
+            seen.append(get_session_env("HERMES_CRON_JOB_ID"))
+            return {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = run_conversation
+        _CRON_JOB_ID.set("bound-job")
+        try:
+            result = _run_single_child(
+                task_index=0,
+                goal="Keep the cron authorization context",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+        finally:
+            _CRON_JOB_ID.set(previous if previous is not _UNSET else _UNSET)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(seen, ["bound-job"])
+
     def test_run_single_child_acquires_and_releases_lease(self):
         from tools.delegate_tool import _run_single_child
 

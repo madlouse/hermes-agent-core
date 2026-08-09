@@ -1,10 +1,27 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import hashlib
+import json
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from cron.jobs import (
+    _cron_checkpoint_invariant_hash,
+    _cron_delivery_receipt_hash,
+    _cron_interpreter_artifact_hash,
+    _cron_run_artifact_hash,
+    _cron_run_outcome_claim,
+    _cron_run_outcome_receipt,
+    _cron_run_script_snapshot,
+    _cron_script_artifact_hash,
+    _cron_support_artifact_hash,
+    _validated_run_outcome_claim,
+    _validated_run_outcome_receipt,
+    CronJobGovernanceError,
+    abandon_job_run_outcome,
+    begin_job_run_outcome,
     parse_duration,
     parse_schedule,
     compute_next_run,
@@ -12,18 +29,35 @@ from cron.jobs import (
     load_jobs,
     save_jobs,
     get_job,
+    heartbeat_job_run_outcome,
     list_jobs,
     update_job,
     pause_job,
+    record_job_run_preflight_denial,
     resume_job,
     remove_job,
     mark_job_run,
+    mark_job_delivery_recovered,
     advance_next_run,
     claim_dispatch,
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
 )
+
+
+def _signed_job_revision(job_id="job.receipt", profile_id="profile-custom"):
+    return {
+        "id": job_id,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": profile_id,
+            "cron_job_id": job_id,
+            "receipt_id": "sha256:" + "1" * 64,
+            "candidate_hash": "sha256:" + "2" * 64,
+            "job_semantic_hash": "sha256:" + "3" * 64,
+        },
+    }
 
 
 # =========================================================================
@@ -236,6 +270,8 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    import cron.jobs as jobs_mod
+    jobs_mod.ensure_dirs()
     return tmp_path
 
 
@@ -279,8 +315,12 @@ class TestJobCRUD:
 
     def test_remove_job(self, tmp_cron_dir):
         job = create_job(prompt="Temp job", schedule="30m")
+        output_dir = tmp_cron_dir / "cron" / "output" / job["id"]
+        output_dir.mkdir(parents=True)
+        (output_dir / "result.md").write_text("done", encoding="utf-8")
         assert remove_job(job["id"]) is True
         assert get_job(job["id"]) is None
+        assert not output_dir.exists()
 
     def test_remove_job_rejects_unsafe_legacy_id_before_output_cleanup(self, tmp_cron_dir):
         """Legacy unsafe IDs left over from before the create-time guard
@@ -299,8 +339,59 @@ class TestJobCRUD:
         assert load_jobs()[0]["id"] == "../escape"
         assert (outside / "keep.txt").exists()
 
+    def test_remove_job_does_not_follow_a_swapped_output_directory(self, tmp_cron_dir, monkeypatch):
+        import cron.jobs as jobs_mod
+
+        job = create_job(prompt="safe cleanup", schedule="30m")
+        cron_dir = tmp_cron_dir / "cron"
+        output_dir = cron_dir / "output"
+        job_dir = output_dir / job["id"]
+        job_dir.mkdir(parents=True)
+        (job_dir / "result.md").write_text("local", encoding="utf-8")
+        external = tmp_cron_dir / "external-output"
+        external_job_dir = external / job["id"]
+        external_job_dir.mkdir(parents=True)
+        sentinel = external_job_dir / "keep.txt"
+        sentinel.write_text("unchanged", encoding="utf-8")
+        original_save = jobs_mod._save_jobs_unlocked
+
+        def swap_output_after_save(retained):
+            original_save(retained)
+            output_dir.rename(tmp_cron_dir / "output-before-swap")
+            output_dir.symlink_to(external, target_is_directory=True)
+
+        monkeypatch.setattr(jobs_mod, "_save_jobs_unlocked", swap_output_after_save)
+
+        with pytest.raises(OSError, match="Cron output path is not a directory"):
+            remove_job(job["id"])
+
+        assert sentinel.read_text(encoding="utf-8") == "unchanged"
+        assert external_job_dir.exists()
+
     def test_remove_nonexistent_returns_false(self, tmp_cron_dir):
         assert remove_job("nonexistent") is False
+
+    def test_remove_rejects_active_signed_job_between_begin_and_dispatch(
+        self,
+        tmp_cron_dir,
+    ):
+        signed = {
+            "name": "active signed removal",
+            "schedule": {"kind": "once", "run_at": "2099-01-01T00:00:00+00:00"},
+            "repeat": {"times": 1, "completed": 0},
+            **_signed_job_revision("active-remove"),
+        }
+        save_jobs([signed])
+        claim = begin_job_run_outcome(signed)
+        assert claim is not None
+
+        with pytest.raises(CronJobGovernanceError, match="signed run is active"):
+            remove_job(signed["id"])
+
+        persisted = load_jobs()[0]
+        assert persisted["active_run_outcome_claim"] == claim
+        assert claim_dispatch(signed["id"], run_outcome_claim=claim) is True
+        assert load_jobs()[0]["repeat"]["completed"] == 1
 
     def test_auto_repeat_for_once(self, tmp_cron_dir):
         job = create_job(prompt="One-shot", schedule="1h")
@@ -444,6 +535,49 @@ class TestPauseResumeJob:
         assert resumed["state"] == "scheduled"
         assert resumed["paused_at"] is None
         assert resumed["paused_reason"] is None
+
+    def test_resume_preserves_legacy_null_skill_shape(self, tmp_cron_dir):
+        """A runtime-only resume must not rewrite the stored skill pair.
+
+        Jobs authorized before multi-skill normalization can carry
+        ``skill: null`` plus a populated ``skills`` list.  Unconditional
+        ``_apply_skill_fields`` during pause/resume/trigger re-derived
+        ``skill = skills[0]``, which changed the governed material hash and
+        made an already-authorized runtime transition fail closed as
+        candidate_hash_mismatch.  Runtime transitions must leave definition
+        fields byte-for-byte intact.
+        """
+        job = create_job(prompt="legacy skills", schedule="every 1h")
+        legacy = {
+            **job,
+            "skill": None,
+            "skills": ["work/yuange-learning-retrospective", "work/yuange-knowledge-recall"],
+            "enabled": False,
+            "state": "paused",
+            "paused_reason": "test",
+        }
+        save_jobs([legacy])
+        stored_before = load_jobs()[0]
+        definition_before = {
+            key: value
+            for key, value in stored_before.items()
+            if key not in {"enabled", "state", "paused_at", "paused_reason", "next_run_at"}
+        }
+
+        resumed = resume_job(job["id"])
+        assert resumed is not None
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+
+        stored = load_jobs()[0]
+        assert stored["skill"] is None
+        assert stored["skills"] == legacy["skills"]
+        definition_after = {
+            key: value
+            for key, value in stored.items()
+            if key not in {"enabled", "state", "paused_at", "paused_reason", "next_run_at"}
+        }
+        assert definition_after == definition_before
 
     def test_resume_rejects_past_oneshot(self, tmp_cron_dir, monkeypatch):
         """Resuming a paused one-shot whose time is now in the past must raise
@@ -620,6 +754,996 @@ class TestMarkJobRun:
         mark_job_run(job["id"], success=True, delivery_error=None)
         updated = get_job(job["id"])
         assert updated["last_delivery_error"] is None
+
+    def test_delivery_recovery_clears_only_delivery_health(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=True, delivery_error="transient audit failure")
+
+        assert mark_job_delivery_recovered(job["id"]) is True
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "ok"
+        assert updated["last_delivery_error"] is None
+        assert updated["last_delivery_recovered_at"]
+
+    def test_delivery_receipt_persists_only_aggregate_terminal_facts(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        receipt = {
+            "schema_version": "cron-delivery/v1",
+            "status": "partial",
+            "required_count": 2,
+            "confirmed_count": 1,
+            "failed_count": 1,
+            "unconfirmed_count": 0,
+            "receipts_truncated": False,
+        }
+
+        mark_job_run(job["id"], success=True, delivery_receipt=receipt)
+
+        updated = get_job(job["id"])
+        assert updated["last_delivery_receipt"] == receipt
+        serialized = json.dumps(updated["last_delivery_receipt"])
+        assert "message_id" not in serialized
+        assert "chat_id" not in serialized
+        assert "outbox_id" not in serialized
+
+    def test_delivery_receipt_rejects_transport_identifiers(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        unsafe_receipt = {
+            "schema_version": "cron-delivery/v1",
+            "status": "success",
+            "required_count": 1,
+            "confirmed_count": 1,
+            "failed_count": 0,
+            "unconfirmed_count": 0,
+            "receipts_truncated": False,
+            "message_id": "must-not-persist",
+        }
+
+        with pytest.raises(ValueError, match="invalid cron delivery receipt"):
+            mark_job_run(job["id"], success=True, delivery_receipt=unsafe_receipt)
+
+        assert get_job(job["id"])["last_delivery_receipt"] is None
+
+    def test_run_outcome_receipt_persists_revision_bound_terminal_fact(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        job.update(_signed_job_revision(job["id"]))
+        save_jobs([job])
+        claim = begin_job_run_outcome(job)
+        assert claim is not None
+        receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+        )
+        assert receipt is not None
+
+        assert mark_job_run(
+            job["id"],
+            success=True,
+            run_outcome_receipt=receipt,
+            run_outcome_claim=claim,
+        ) is True
+
+        assert get_job(job["id"])["last_run_outcome_receipt"] == receipt
+        next_claim = begin_job_run_outcome(job)
+        assert next_claim is not None
+        mark_job_run(
+            job["id"],
+            success=False,
+            error="next run failed",
+            run_outcome_claim=next_claim,
+        )
+        assert get_job(job["id"])["last_run_outcome_receipt"] is None
+
+    def test_run_outcome_writer_enforces_claim_and_terminal_binding(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        job.update(_signed_job_revision(job["id"]))
+        save_jobs([job])
+
+        claim = begin_job_run_outcome(job)
+        assert claim is not None
+        delivery = {
+            "schema_version": "cron-delivery/v1",
+            "status": "success",
+            "required_count": 1,
+            "confirmed_count": 1,
+            "failed_count": 0,
+            "unconfirmed_count": 0,
+            "receipts_truncated": False,
+        }
+        receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+            delivery_receipt=delivery,
+        )
+        assert receipt is not None
+        assert mark_job_run(
+            job["id"],
+            success=True,
+            delivery_receipt=delivery,
+            run_outcome_receipt=receipt,
+            run_outcome_claim=claim,
+        ) is True
+
+        claim = begin_job_run_outcome(job)
+        assert claim is not None
+        before = get_job(job["id"])
+        assert mark_job_run(
+            job["id"],
+            success=False,
+            error="claim-less writer must not win",
+        ) is False
+        assert get_job(job["id"]) == before
+
+        with pytest.raises(ValueError, match="requires its pre-run claim"):
+            mark_job_run(job["id"], success=True, run_outcome_receipt=receipt)
+
+        assert mark_job_run(
+            job["id"],
+            success=False,
+            error="failed before receipt construction",
+            run_outcome_claim=claim,
+        ) is True
+        assert get_job(job["id"])["last_run_outcome_receipt"] is None
+
+        claim = begin_job_run_outcome(job)
+        receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+            delivery_receipt=delivery,
+        )
+        assert receipt is not None
+
+        with pytest.raises(ValueError, match="does not match its claim"):
+            mark_job_run(
+                job["id"],
+                success=True,
+                run_outcome_receipt={**receipt, "profile_id": "other-profile"},
+                run_outcome_claim=claim,
+            )
+
+        with pytest.raises(ValueError, match="does not match its claim"):
+            mark_job_run(
+                job["id"],
+                success=True,
+                delivery_receipt=None,
+                run_outcome_receipt=receipt,
+                run_outcome_claim=claim,
+            )
+
+        with pytest.raises(ValueError, match="does not match its claim"):
+            mark_job_run(
+                job["id"],
+                success=False,
+                run_outcome_receipt=receipt,
+                run_outcome_claim=claim,
+            )
+
+        assert mark_job_run("missing-job", success=False) is False
+
+    def test_run_outcome_receipt_rejects_unredacted_or_malformed_data(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        receipt = {
+            "schema_version": "cron-run-outcome/v1",
+            "profile_id": "profile-custom",
+            "job_id": job["id"],
+            "job_revision": "sha256:" + "1" * 64,
+            "run_id": "cron-run:" + "2" * 32,
+            "terminal_state": "success",
+            "implementation_hash": "sha256:" + "3" * 64,
+            "checkpoint_invariant_hash": "sha256:" + "4" * 64,
+            "raw_output": "must-not-persist",
+        }
+
+        with pytest.raises(ValueError, match="invalid cron run outcome receipt"):
+            mark_job_run(job["id"], success=True, run_outcome_receipt=receipt)
+
+        assert get_job(job["id"])["last_run_outcome_receipt"] is None
+
+    def test_run_outcome_builder_executes_only_claimed_script_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        task = scripts / "task.py"
+        task.write_text("import helper\nprint('task-v1')\n", encoding="utf-8")
+        helper = scripts / "helper.py"
+        helper.write_text("VALUE = 'v1'\n", encoding="utf-8")
+        interpreter = tmp_path / "python-runtime"
+        interpreter.write_bytes(b"runtime-v1")
+        monkeypatch.setattr(
+            "cron.jobs._cron_script_interpreter",
+            lambda _path: interpreter,
+        )
+        job = {
+            **_signed_job_revision(profile_id="任意-profile"),
+            "no_agent": True,
+            "script": "task.py",
+            "workdir": str(scripts),
+            "deterministic_no_agent_exception": True,
+        }
+        claim = _cron_run_outcome_claim(
+            job,
+            run_id="cron-run:" + "a" * 32,
+            profile_home=tmp_path,
+        )
+        assert claim is not None
+        matches, snapshot = _cron_run_script_snapshot(
+            job,
+            claim,
+            profile_home=tmp_path,
+        )
+        assert matches is True
+        assert snapshot["script_bytes"] == b"import helper\nprint('task-v1')\n"
+        assert snapshot["interpreter_bytes"] == b"runtime-v1"
+        assert any(
+            item["root"] == "script_root"
+            and item["path"] == "helper.py"
+            and item["content"] == b"VALUE = 'v1'\n"
+            and item["mode"] == 0o644
+            for item in snapshot["support_files"]
+        )
+        with monkeypatch.context() as scoped:
+            scoped.setitem(
+                _cron_run_script_snapshot.__globals__,
+                "_cron_script_artifact",
+                lambda *_args: (
+                    claim["script_artifact_hash"],
+                    claim["interpreter_artifact_hash"],
+                    b"captured",
+                ),
+            )
+            scoped.setitem(
+                _cron_run_script_snapshot.__globals__,
+                "_cron_support_artifact",
+                lambda *_args: (claim["support_artifact_hash"], []),
+            )
+            scoped.setitem(
+                _cron_run_script_snapshot.__globals__,
+                "_cron_script_interpreter",
+                lambda _path: None,
+            )
+            assert _cron_run_script_snapshot(
+                job,
+                claim,
+                profile_home=tmp_path,
+            ) == (False, None)
+
+        helper.write_text("VALUE = 'v2'\n", encoding="utf-8")
+        assert _cron_run_script_snapshot(
+            job,
+            claim,
+            profile_home=tmp_path,
+        )[0] is False
+        assert _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+            profile_home=tmp_path,
+        ) is None
+        helper.write_text("VALUE = 'v1'\n", encoding="utf-8")
+
+        receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+            profile_home=tmp_path,
+        )
+
+        assert receipt is not None
+        assert receipt["profile_id"] == "任意-profile"
+        assert receipt["job_revision"] == "sha256:" + "1" * 64
+        assert receipt["run_id"] == "cron-run:" + "a" * 32
+        assert receipt["terminal_state"] == "success"
+        assert receipt["implementation_hash"].startswith("sha256:")
+        assert receipt["checkpoint_invariant_hash"].startswith("sha256:")
+        assert receipt["delivery_receipt_hash"] == _cron_delivery_receipt_hash(
+            claim["run_id"],
+            None,
+        )
+
+        task.write_text("import helper\nprint('task-v2')\n", encoding="utf-8")
+        assert _cron_run_script_snapshot(
+            job,
+            claim,
+            profile_home=tmp_path,
+        ) == (False, None)
+        assert _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+            profile_home=tmp_path,
+        ) is None
+
+        task.write_text("import helper\nprint('task-v1')\n", encoding="utf-8")
+        interpreter.write_bytes(b"runtime-v2")
+        changed_claim = _cron_run_outcome_claim(
+            job,
+            run_id=claim["run_id"],
+            profile_home=tmp_path,
+        )
+        assert changed_claim["implementation_hash"] != claim["implementation_hash"]
+        assert (
+            changed_claim["interpreter_artifact_hash"]
+            != claim["interpreter_artifact_hash"]
+        )
+        assert _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+            profile_home=tmp_path,
+        ) is None
+
+    def test_run_executes_captured_helper_and_interpreter_bytes(
+        self, tmp_path, monkeypatch
+    ):
+        from cron import scheduler
+
+        profile = tmp_path / "profile"
+        scripts = profile / "scripts"
+        scripts.mkdir(parents=True)
+        task = scripts / "task.py"
+        helper = scripts / "helper.py"
+        task.write_text("import helper\nprint(helper.VALUE)\n", encoding="utf-8")
+        helper.write_text("VALUE = 'claimed'\n", encoding="utf-8")
+        job = {
+            **_signed_job_revision(profile_id="profile-custom"),
+            "no_agent": True,
+            "script": "task.py",
+            "deterministic_no_agent_exception": True,
+        }
+        claim = _cron_run_outcome_claim(
+            job,
+            run_id="cron-run:" + "c" * 32,
+            profile_home=profile,
+        )
+        assert claim is not None
+        matches, snapshot = _cron_run_script_snapshot(
+            job,
+            claim,
+            profile_home=profile,
+        )
+        assert matches is True
+        assert snapshot is not None
+
+        helper.write_text("VALUE = 'mutated-during-run'\n", encoding="utf-8")
+        monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: profile)
+        success, output = scheduler._run_job_script(
+            "task.py",
+            script_snapshot=snapshot,
+        )
+        assert success is True, output
+        assert output == "claimed"
+
+        helper.write_text("VALUE = 'claimed'\n", encoding="utf-8")
+        assert _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+            profile_home=profile,
+        ) is not None
+
+    def test_run_executes_captured_extensionless_helper_mode(
+        self, tmp_path, monkeypatch
+    ):
+        from cron import scheduler
+
+        profile = tmp_path / "profile"
+        scripts = profile / "scripts"
+        scripts.mkdir(parents=True)
+        task = scripts / "task.sh"
+        helper = scripts / "helper"
+        task.write_text("./helper\n", encoding="utf-8")
+        helper.write_text("#!/bin/sh\nprintf claimed\n", encoding="utf-8")
+        helper.chmod(0o755)
+        job = {
+            **_signed_job_revision(profile_id="profile-custom"),
+            "no_agent": True,
+            "script": "task.sh",
+            "deterministic_no_agent_exception": True,
+        }
+        claim = _cron_run_outcome_claim(
+            job,
+            run_id="cron-run:" + "d" * 32,
+            profile_home=profile,
+        )
+        assert claim is not None
+        matches, snapshot = _cron_run_script_snapshot(
+            job,
+            claim,
+            profile_home=profile,
+        )
+        assert matches is True
+        assert snapshot is not None
+
+        helper.write_text("#!/bin/sh\nprintf live\n", encoding="utf-8")
+        helper.chmod(0o644)
+        monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: profile)
+        success, output = scheduler._run_job_script(
+            "task.sh",
+            script_snapshot=snapshot,
+        )
+
+        assert success is True, output
+        assert output == "claimed"
+
+    @pytest.mark.parametrize(
+        "declaration",
+        [
+            {"verification_command": "python verify.py"},
+            {"verification_command_mode": "read_only"},
+            {
+                "verification_command_mode": "read_only",
+                "verification_command": "python verify.py",
+            },
+        ],
+    )
+    def test_declared_verification_fails_closed_without_os_sandbox(
+        self, tmp_path, declaration
+    ):
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        (scripts / "task.py").write_text("print('task')\n", encoding="utf-8")
+        (tmp_path / "verify.py").write_text("print('{}')\n", encoding="utf-8")
+        job = {
+            **_signed_job_revision(),
+            "no_agent": True,
+            "script": "task.py",
+            "workdir": str(tmp_path),
+            "deterministic_no_agent_exception": True,
+            **declaration,
+        }
+        assert _cron_run_outcome_claim(job, profile_home=tmp_path) is None
+
+    def test_declared_checkpoint_policy_stays_unproven_until_runtime_observation_exists(self):
+        job = {
+            **_signed_job_revision(),
+            "checkpoint_policy": {"mode": "phase_commit", "required": True},
+        }
+        claim = _cron_run_outcome_claim(job)
+        assert claim is not None
+
+        assert _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+        ) is None
+        failed = _cron_run_outcome_receipt(
+            job,
+            success=False,
+            run_outcome_claim=claim,
+        )
+        assert failed is not None
+        assert failed["terminal_state"] == "failed"
+
+    def test_runtime_budget_is_implementation_material_not_checkpoint_policy(self):
+        job = {
+            **_signed_job_revision(),
+            "max_turns": 12,
+            "run_timeout_seconds": 300,
+        }
+        claim = _cron_run_outcome_claim(job)
+        assert claim is not None
+        receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+        )
+        assert receipt is not None
+
+        changed = {**job, "run_timeout_seconds": 301}
+        assert _cron_run_outcome_receipt(
+            changed,
+            success=True,
+            run_outcome_claim=claim,
+        ) is None
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            lambda job: job.pop("creation_governance_receipt"),
+            lambda job: job["creation_governance_receipt"].update(schema_version="legacy"),
+            lambda job: job["creation_governance_receipt"].update(cron_job_id="other"),
+            lambda job: job["creation_governance_receipt"].update(profile_id=" bad "),
+            lambda job: job["creation_governance_receipt"].update(profile_id="\ud800"),
+            lambda job: job.update(id="bad\njob"),
+            lambda job: job["creation_governance_receipt"].update(receipt_id="not-a-hash"),
+        ],
+    )
+    def test_run_outcome_builder_refuses_unbound_revision(self, mutation):
+        job = _signed_job_revision()
+        mutation(job)
+        assert _cron_run_outcome_claim(job) is None
+
+    def test_run_outcome_builder_requires_boolean_terminal_state(self):
+        job = _signed_job_revision()
+        claim = _cron_run_outcome_claim(job)
+        assert claim is not None
+        with pytest.raises(ValueError, match="must be boolean"):
+            _cron_run_outcome_receipt(job, success=1, run_outcome_claim=claim)
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("schema_version", "legacy"),
+            ("profile_id", " bad "),
+            ("job_id", "bad\njob"),
+            ("run_id", "run-opaque"),
+            ("terminal_state", "unknown"),
+            ("job_revision", "not-a-hash"),
+            ("implementation_hash", "not-a-hash"),
+            ("checkpoint_invariant_hash", "not-a-hash"),
+            ("delivery_receipt_hash", "not-a-hash"),
+        ],
+    )
+    def test_run_outcome_validator_rejects_invalid_fields(self, field, value):
+        job = _signed_job_revision()
+        claim = _cron_run_outcome_claim(
+            job,
+            run_id="cron-run:" + "a" * 32,
+        )
+        assert claim is not None
+        receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+        )
+        assert receipt is not None
+        receipt[field] = value
+        with pytest.raises(ValueError, match="invalid cron run outcome receipt"):
+            _validated_run_outcome_receipt(receipt)
+
+    def test_run_outcome_validator_rejects_unversioned_extra_fields(self):
+        job = _signed_job_revision()
+        claim = _cron_run_outcome_claim(
+            job,
+            run_id="cron-run:" + "a" * 32,
+        )
+        assert claim is not None
+        receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=claim,
+        )
+        assert receipt is not None
+        receipt["verification_command"] = {"mode": "read_only"}
+        with pytest.raises(ValueError, match="invalid cron run outcome receipt"):
+            _validated_run_outcome_receipt(receipt)
+
+    def test_begin_clears_stale_success_and_rejects_concurrent_attempt(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        job.update(_signed_job_revision(job["id"]))
+        job["last_run_outcome_receipt"] = {"stale": True}
+        save_jobs([job])
+
+        first = begin_job_run_outcome(job)
+        assert first is not None
+        assert get_job(job["id"])["last_run_outcome_receipt"] is None
+        second = begin_job_run_outcome(job)
+        assert second is None
+        stale = {**first, "run_id": "cron-run:" + "9" * 32}
+        assert mark_job_run(
+            job["id"],
+            success=False,
+            run_outcome_claim=stale,
+        ) is False
+        first_receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=first,
+        )
+        assert first_receipt is not None
+
+        assert mark_job_run(
+            job["id"],
+            success=True,
+            run_outcome_receipt=first_receipt,
+            run_outcome_claim=first,
+        ) is True
+        current = get_job(job["id"])
+        assert current["active_run_outcome_claim"] is None
+        assert current["last_run_outcome_receipt"] == first_receipt
+
+    def test_begin_recovers_expired_claim_and_rejects_old_owner(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        job = create_job(prompt="Report", schedule="every 1h")
+        job.update(_signed_job_revision(job["id"]))
+        save_jobs([job])
+
+        monkeypatch.setattr("cron.jobs.time.time", lambda: 1_000_000)
+        first = begin_job_run_outcome(job)
+        assert first is not None
+        assert begin_job_run_outcome(get_job(job["id"])) is None
+
+        original_expiry = first["claim_expires_at_epoch"]
+        monkeypatch.setattr("cron.jobs.time.time", lambda: original_expiry - 60)
+        refreshed = heartbeat_job_run_outcome(job["id"], first)
+        assert refreshed is not None
+        assert refreshed["claim_expires_at_epoch"] > original_expiry
+        assert heartbeat_job_run_outcome("missing-job", refreshed) is None
+        mismatched = {
+            **refreshed,
+            "run_id": "cron-run:" + "8" * 32,
+        }
+        assert heartbeat_job_run_outcome(job["id"], mismatched) is None
+
+        monkeypatch.setattr("cron.jobs.time.time", lambda: original_expiry + 10)
+        assert begin_job_run_outcome(get_job(job["id"])) is None
+
+        monkeypatch.setattr(
+            "cron.jobs.time.time",
+            lambda: refreshed["claim_expires_at_epoch"],
+        )
+        assert heartbeat_job_run_outcome(job["id"], refreshed) is None
+        assert mark_job_run(
+            job["id"],
+            success=False,
+            run_outcome_claim=refreshed,
+        ) is False
+        replacement = begin_job_run_outcome(get_job(job["id"]))
+        assert replacement is not None
+        assert replacement["run_id"] != first["run_id"]
+        assert get_job(job["id"])["active_run_outcome_claim"] == replacement
+        assert mark_job_run(
+            job["id"],
+            success=False,
+            run_outcome_claim=refreshed,
+        ) is False
+
+        receipt = _cron_run_outcome_receipt(
+            job,
+            success=True,
+            run_outcome_claim=replacement,
+        )
+        assert receipt is not None
+        assert mark_job_run(
+            job["id"],
+            success=True,
+            run_outcome_receipt=receipt,
+            run_outcome_claim=replacement,
+        ) is True
+
+    def test_begin_does_not_replace_malformed_persisted_claim(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        job.update(_signed_job_revision(job["id"]))
+        malformed = {"schema_version": "cron-run-claim/v1"}
+        job["active_run_outcome_claim"] = malformed
+        save_jobs([job])
+
+        assert begin_job_run_outcome(job) is None
+        assert get_job(job["id"])["active_run_outcome_claim"] == malformed
+
+    def test_claim_validator_rejects_surrogate_without_throwing_from_builder(self):
+        job = _signed_job_revision(profile_id="\ud800")
+        assert _cron_run_outcome_claim(job) is None
+
+        valid = _cron_run_outcome_claim(_signed_job_revision())
+        assert valid is not None
+        valid["profile_id"] = "\ud800"
+        with pytest.raises(ValueError, match="invalid cron run outcome"):
+            _validated_run_outcome_claim(valid)
+
+    def test_run_artifact_and_script_hashes_fail_closed(self, tmp_path, monkeypatch):
+        profile = tmp_path / "profile"
+        scripts = profile / "scripts"
+        scripts.mkdir(parents=True)
+        outside = tmp_path / "outside.py"
+        outside.write_text("print('outside')\n", encoding="utf-8")
+        script = scripts / "task.py"
+        script.write_text("print('ok')\n", encoding="utf-8")
+
+        assert _cron_run_artifact_hash(scripts) is None
+        assert _cron_run_artifact_hash(tmp_path / "missing.py") is None
+        with monkeypatch.context() as scoped:
+            original_read = type(script).read_bytes
+
+            def oversized_read(path):
+                if path.resolve(strict=False) == script.resolve(strict=False):
+                    return b"x" * 1001
+                return original_read(path)
+
+            scoped.setattr(type(script), "read_bytes", oversized_read)
+            scoped.setattr("cron.jobs._CRON_RUN_ARTIFACT_MAX_BYTES", 1000)
+            assert _cron_run_artifact_hash(script) is None
+        monkeypatch.setattr("cron.jobs._CRON_RUN_ARTIFACT_MAX_BYTES", 0)
+        assert _cron_run_artifact_hash(script) is None
+        monkeypatch.setattr("cron.jobs._CRON_RUN_ARTIFACT_MAX_BYTES", 8 * 1024 * 1024)
+        assert _cron_script_artifact_hash({"script": str(outside)}, profile) is None
+        assert _cron_script_artifact_hash({"script": "missing.py"}, profile) is None
+        assert _cron_script_artifact_hash({"script": "task.py"}, profile).startswith("sha256:")
+        shell = scripts / "task.sh"
+        shell.write_text("printf ok\n", encoding="utf-8")
+        assert _cron_script_artifact_hash({"script": "task.sh"}, profile).startswith(
+            "sha256:"
+        )
+
+    def test_support_artifact_hash_fail_closed_edges(self, tmp_path, monkeypatch):
+        profile = tmp_path / "profile"
+        scripts = profile / "scripts"
+        scripts.mkdir(parents=True)
+        script = scripts / "task.py"
+        script.write_text("print('ok')\n", encoding="utf-8")
+
+        outside = tmp_path / "outside.py"
+        outside.write_text("print('outside')\n", encoding="utf-8")
+        assert _cron_support_artifact_hash({"script": str(outside)}, profile) is None
+
+        same_root = {
+            "script": "task.py",
+            "workdir": str(scripts),
+        }
+        assert _cron_support_artifact_hash(same_root, profile).startswith("sha256:")
+
+        ignored = scripts / "__pycache__"
+        ignored.mkdir()
+        (ignored / "cached.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (scripts / "lib").mkdir()
+        assert _cron_support_artifact_hash(same_root, profile).startswith("sha256:")
+
+        extensionless = scripts / "sourced-helper"
+        extensionless.write_text("VALUE=one\n", encoding="utf-8")
+        extensionless.chmod(0o644)
+        before = _cron_support_artifact_hash(same_root, profile)
+        extensionless.chmod(0o755)
+        after_mode_change = _cron_support_artifact_hash(same_root, profile)
+        assert after_mode_change != before
+        extensionless.write_text("VALUE=two\n", encoding="utf-8")
+        assert _cron_support_artifact_hash(same_root, profile) != after_mode_change
+
+        external_root = tmp_path / "external-workdir"
+        external_root.mkdir()
+        (external_root / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
+        linked_root = tmp_path / "linked-workdir"
+        linked_root.symlink_to(external_root, target_is_directory=True)
+        assert _cron_support_artifact_hash(
+            {"script": "task.py", "workdir": str(linked_root)}, profile
+        ) is None
+
+        linked_file = scripts / "linked.py"
+        linked_file.symlink_to(script)
+        assert _cron_support_artifact_hash(same_root, profile) is None
+        linked_file.unlink()
+
+        monkeypatch.setattr("cron.jobs._cron_run_artifact", lambda _path: (None, None))
+        assert _cron_support_artifact_hash(same_root, profile) is None
+
+    def test_shell_interpreter_ignores_caller_path(self, tmp_path, monkeypatch):
+        from cron import jobs
+
+        caller_bin = tmp_path / "caller-bin"
+        caller_bin.mkdir()
+        caller_bash = caller_bin / "bash"
+        caller_bash.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        caller_bash.chmod(0o755)
+        trusted_bash = tmp_path / "trusted-bash"
+        trusted_bash.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        trusted_bash.chmod(0o755)
+        monkeypatch.setenv("PATH", str(caller_bin))
+        monkeypatch.setattr(
+            jobs, "_CRON_TRUSTED_BASH_PATHS", (str(trusted_bash),)
+        )
+
+        assert jobs._cron_script_interpreter(Path("task.sh")) == trusted_bash
+
+        monkeypatch.setattr(
+            jobs, "_CRON_TRUSTED_BASH_PATHS", (str(tmp_path / "missing"),)
+        )
+        assert jobs._cron_script_interpreter(Path("task.sh")) is None
+
+        monkeypatch.setattr(jobs.sys, "platform", "win32")
+        assert jobs._cron_script_interpreter(Path("task.py")) is None
+
+    def test_support_artifact_hash_enforces_tree_bounds(self, tmp_path, monkeypatch):
+        profile = tmp_path / "profile"
+        scripts = profile / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "task.py").write_text("print('ok')\n", encoding="utf-8")
+        job = {"script": "task.py", "workdir": str(scripts)}
+
+        monkeypatch.setattr("cron.jobs._CRON_SUPPORT_ARTIFACT_MAX_FILES", 0)
+        assert _cron_support_artifact_hash(job, profile) is None
+
+        monkeypatch.setattr("cron.jobs._CRON_SUPPORT_ARTIFACT_MAX_FILES", 512)
+        monkeypatch.setattr("cron.jobs._CRON_SUPPORT_ARTIFACT_MAX_BYTES", 0)
+        assert _cron_support_artifact_hash(job, profile) is None
+
+    def test_interpreter_hash_streams_beyond_script_snapshot_limit(
+        self, tmp_path, monkeypatch
+    ):
+        interpreter = tmp_path / "python-runtime"
+        interpreter.write_bytes(b"runtime-binary-v1")
+
+        monkeypatch.setattr("cron.jobs._CRON_RUN_ARTIFACT_MAX_BYTES", 4)
+        monkeypatch.setattr("cron.jobs._CRON_INTERPRETER_ARTIFACT_MAX_BYTES", 64)
+        assert _cron_run_artifact_hash(interpreter) is None
+        assert _cron_interpreter_artifact_hash(interpreter) == (
+            "sha256:" + hashlib.sha256(interpreter.read_bytes()).hexdigest()
+        )
+
+        monkeypatch.setattr("cron.jobs._CRON_INTERPRETER_ARTIFACT_MAX_BYTES", 4)
+        assert _cron_interpreter_artifact_hash(interpreter) is None
+        assert _cron_interpreter_artifact_hash(tmp_path) is None
+        assert _cron_interpreter_artifact_hash(tmp_path / "missing-python") is None
+
+    def test_claim_and_receipt_fail_closed_edges(self, tmp_path):
+        invalid_script = {**_signed_job_revision(), "script": "missing.py"}
+        assert _cron_run_outcome_claim(invalid_script, profile_home=tmp_path) is None
+        assert _cron_run_outcome_receipt(
+            _signed_job_revision(), success=False, run_outcome_claim=None
+        ) is None
+
+        claim = _cron_run_outcome_claim(_signed_job_revision())
+        assert claim is not None
+        with pytest.raises(ValueError, match="invalid cron run outcome claim"):
+            _validated_run_outcome_claim({**claim, "extra": True})
+        with pytest.raises(ValueError, match="invalid cron run outcome claim"):
+            _validated_run_outcome_claim({**claim, "schema_version": "legacy"})
+
+        malformed_claim = dict(claim)
+        malformed_claim["script_artifact_hash"] = "not-a-hash"
+        with pytest.raises(ValueError, match="invalid cron run outcome claim"):
+            _validated_run_outcome_claim(malformed_claim)
+
+        checkpoint_job = _signed_job_revision()
+        checkpoint_claim = _cron_run_outcome_claim(checkpoint_job)
+        assert checkpoint_claim is not None
+        checkpoint_job["checkpoint_policy"] = {"mode": "changed-after-claim"}
+        assert _cron_checkpoint_invariant_hash(
+            checkpoint_job,
+            checkpoint_claim,
+            success=False,
+        ) is None
+
+    def test_begin_run_outcome_fail_closed_edges(self, tmp_cron_dir):
+        original = create_job(prompt="Report", schedule="every 1h")
+        signed = {**original, **_signed_job_revision(original["id"])}
+
+        save_jobs([{**signed, "id": "other"}, signed])
+        claim = begin_job_run_outcome(signed)
+        assert claim is not None
+
+        save_jobs([{**signed, "creation_governance_receipt": {**signed["creation_governance_receipt"], "receipt_id": "sha256:" + "9" * 64}}])
+        assert begin_job_run_outcome(signed) is None
+
+        invalid_script = {**signed, "script": "missing.py"}
+        save_jobs([invalid_script])
+        assert begin_job_run_outcome(invalid_script) is None
+        persisted = get_job(invalid_script["id"])
+        assert persisted["last_run_outcome_receipt"] is None
+        assert persisted["active_run_outcome_claim"] is None
+
+        save_jobs([])
+        assert begin_job_run_outcome(signed) is None
+
+    def test_abandon_run_outcome_clears_only_the_matching_active_claim(
+        self, tmp_cron_dir
+    ):
+        original = create_job(prompt="Report", schedule="every 1h")
+        signed = {**original, **_signed_job_revision(original["id"])}
+        save_jobs([signed])
+        first = begin_job_run_outcome(signed)
+        assert first is not None
+        stale = {**first, "run_id": "cron-run:" + "9" * 32}
+
+        assert abandon_job_run_outcome(signed["id"], stale) is False
+        assert abandon_job_run_outcome(
+            signed["id"], first, run_claim=None, fire_claim=None
+        ) is True
+        persisted = get_job(signed["id"])
+        assert persisted["active_run_outcome_claim"] is None
+        assert persisted["last_run_outcome_receipt"] is None
+        assert abandon_job_run_outcome("missing", first) is False
+
+        save_jobs([signed])
+        next_claim = begin_job_run_outcome(signed)
+        assert next_claim is not None
+        assert abandon_job_run_outcome(signed["id"], next_claim) is True
+
+    def test_preflight_denial_releases_matching_scheduler_claims_without_run_count(
+        self, tmp_cron_dir
+    ):
+        original = create_job(prompt="Report", schedule="every 1h")
+        run_claim = {"at": "2026-07-22T00:00:00+00:00", "by": "scheduler-a"}
+        fire_claim = {"at": "2026-07-22T00:00:00+00:00", "by": "scheduler-a"}
+        signed = {
+            **original,
+            **_signed_job_revision(original["id"]),
+            "run_claim": run_claim,
+            "fire_claim": fire_claim,
+        }
+        save_jobs([signed])
+
+        assert record_job_run_preflight_denial(
+            signed["id"],
+            job_revision=signed["creation_governance_receipt"]["receipt_id"],
+            reason_code="unsupported_verification_contract",
+            run_claim=run_claim,
+            fire_claim=fire_claim,
+        ) is True
+
+        persisted = get_job(signed["id"])
+        assert persisted["run_claim"] is None
+        assert persisted["fire_claim"] is None
+        assert persisted["repeat"]["completed"] == 0
+        assert persisted["last_runtime_admission_receipt"]["reason_code"] == (
+            "unsupported_verification_contract"
+        )
+        assert record_job_run_preflight_denial(
+            "missing",
+            job_revision=signed["creation_governance_receipt"]["receipt_id"],
+            reason_code="missing",
+        ) is False
+
+        fire_only = {
+            **signed,
+            "run_claim": None,
+            "fire_claim": fire_claim,
+            "last_runtime_admission_receipt": None,
+        }
+        save_jobs([fire_only])
+        assert record_job_run_preflight_denial(
+            signed["id"],
+            job_revision=signed["creation_governance_receipt"]["receipt_id"],
+            reason_code="run_outcome_claim_unavailable",
+            run_claim=None,
+            fire_claim=fire_claim,
+        ) is True
+        assert get_job(signed["id"])["fire_claim"] is None
+
+        no_scheduler_claims = {
+            **signed,
+            "run_claim": None,
+            "fire_claim": None,
+            "last_runtime_admission_receipt": None,
+        }
+        save_jobs([no_scheduler_claims])
+        assert record_job_run_preflight_denial(
+            signed["id"],
+            job_revision=signed["creation_governance_receipt"]["receipt_id"],
+            reason_code="run_outcome_claim_unavailable",
+        ) is True
+
+    def test_preflight_denial_and_abandon_are_claim_bound(self, tmp_cron_dir):
+        original = create_job(prompt="Report", schedule="every 1h")
+        run_claim = {"at": "2026-07-22T00:00:00+00:00", "by": "scheduler-a"}
+        fire_claim = {"at": "2026-07-22T00:00:00+00:00", "by": "scheduler-a"}
+        signed = {
+            **original,
+            **_signed_job_revision(original["id"]),
+            "run_claim": run_claim,
+            "fire_claim": fire_claim,
+        }
+        save_jobs([signed])
+        claim = begin_job_run_outcome(signed)
+        assert claim is not None
+
+        assert record_job_run_preflight_denial(
+            signed["id"],
+            job_revision=claim["job_revision"],
+            reason_code="must-not-overwrite-active",
+            run_claim=run_claim,
+        ) is False
+        assert abandon_job_run_outcome(
+            signed["id"],
+            claim,
+            run_claim={**run_claim, "by": "scheduler-b"},
+        ) is False
+        assert abandon_job_run_outcome(
+            signed["id"],
+            claim,
+            reason_code="run_outcome_script_changed",
+            run_claim=run_claim,
+            fire_claim=fire_claim,
+        ) is True
+        persisted = get_job(signed["id"])
+        assert persisted["run_claim"] is None
+        assert persisted["fire_claim"] is None
+        assert persisted["last_runtime_admission_receipt"]["reason_code"] == (
+            "run_outcome_script_changed"
+        )
 
     def test_both_agent_and_delivery_error(self, tmp_cron_dir):
         """Agent fails AND delivery fails — both errors recorded."""
@@ -813,6 +1937,38 @@ class TestGetDueJobs:
         due = get_due_jobs()
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
+
+    def test_active_run_outcome_claim_is_not_dispatched_again(self, tmp_cron_dir):
+        job = create_job(prompt="Already running", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=10)).isoformat()
+        jobs[0]["active_run_outcome_claim"] = {"run_id": "cron-run:" + "1" * 32}
+        save_jobs(jobs)
+
+        assert get_due_jobs() == []
+        assert get_job(job["id"])["active_run_outcome_claim"] is not None
+
+    def test_expired_run_outcome_claim_is_due_after_restart(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        job = create_job(prompt="Recover after crash", schedule="every 1h")
+        signed = _signed_job_revision(job["id"])
+        job.update(signed)
+        jobs = [job]
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=10)).isoformat()
+        monkeypatch.setattr("cron.jobs.time.time", lambda: 1_000_000)
+        claim = _cron_run_outcome_claim(jobs[0])
+        assert claim is not None
+        jobs[0]["active_run_outcome_claim"] = claim
+        save_jobs(jobs)
+
+        assert get_due_jobs() == []
+        monkeypatch.setattr(
+            "cron.jobs.time.time",
+            lambda: claim["claim_expires_at_epoch"],
+        )
+        due = get_due_jobs()
+        assert [item["id"] for item in due] == [job["id"]]
 
     def test_stale_past_due_runs_once_and_fast_forwards(self, tmp_cron_dir):
         """Recurring jobs past their grace window run once now and fast-forward next_run_at.
@@ -1705,6 +2861,48 @@ class TestSaveJobOutput:
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
 
+    def test_rejects_symlinked_output_directory_without_external_write(self, tmp_cron_dir):
+        external = tmp_cron_dir.parent / "external-output"
+        external.mkdir()
+        external_sentinel = external / "sentinel.txt"
+        external_sentinel.write_text("unchanged", encoding="utf-8")
+        output_dir = tmp_cron_dir / "cron" / "output"
+        if output_dir.exists():
+            output_dir.rmdir()
+        output_dir.symlink_to(external, target_is_directory=True)
+
+        with pytest.raises(OSError, match="Cron output path is not a directory"):
+            save_job_output("safe-job", "must not escape")
+
+        assert external_sentinel.read_text(encoding="utf-8") == "unchanged"
+        assert not (external / "safe-job").exists()
+
+    def test_output_path_swap_after_open_never_writes_the_replacement(self, tmp_cron_dir, monkeypatch):
+        import cron.jobs as jobs_mod
+
+        external = tmp_cron_dir.parent / "external-cron"
+        external.mkdir()
+        external_sentinel = external / "sentinel.txt"
+        external_sentinel.write_text("unchanged", encoding="utf-8")
+        cron_dir = tmp_cron_dir / "cron"
+        original_cron = tmp_cron_dir.parent / "cron-original"
+        original_open = jobs_mod._open_pinned_cron_output_dir
+
+        def replace_after_open():
+            cron_fd, output_fd = original_open()
+            cron_dir.rename(original_cron)
+            cron_dir.symlink_to(external, target_is_directory=True)
+            return cron_fd, output_fd
+
+        monkeypatch.setattr(jobs_mod, "_open_pinned_cron_output_dir", replace_after_open)
+
+        with pytest.raises(OSError, match="Cron directory changed during output persistence"):
+            save_job_output("safe-job", "pinned output")
+
+        assert external_sentinel.read_text(encoding="utf-8") == "unchanged"
+        assert not (external / "output").exists()
+        assert any((original_cron / "output" / "safe-job").glob("*.md"))
+
 
 class TestCronOutputRetention:
     """Per-run cron output must self-prune so long deploys don't fill the disk (#52383)."""
@@ -1802,6 +3000,39 @@ class TestClaimDispatch:
         # Persisted BEFORE any side effect — survives a crash.
         assert load_jobs()[0]["repeat"]["completed"] == 1
 
+    def test_signed_dispatch_requires_the_exact_active_revision_claim(
+        self,
+        tmp_cron_dir,
+    ):
+        signed = {
+            **self._oneshot(times=1, completed=0),
+            **_signed_job_revision("os1"),
+        }
+        save_jobs([signed])
+        claim = begin_job_run_outcome(signed)
+        assert claim is not None
+        stale = {**claim, "run_id": "cron-run:" + "9" * 32}
+
+        assert claim_dispatch("os1", run_outcome_claim=stale) is False
+        assert load_jobs()[0]["repeat"]["completed"] == 0
+        assert claim_dispatch("os1", run_outcome_claim=claim) is True
+        assert load_jobs()[0]["repeat"]["completed"] == 1
+
+    def test_signed_dispatch_without_claim_is_refused_without_consuming_count(
+        self,
+        tmp_cron_dir,
+    ):
+        signed = {
+            **self._oneshot(times=1, completed=0),
+            **_signed_job_revision("os1"),
+        }
+        save_jobs([signed])
+
+        assert claim_dispatch("os1") is False
+        persisted = load_jobs()[0]
+        assert persisted["repeat"]["completed"] == 0
+        assert persisted.get("active_run_outcome_claim") is None
+
     def test_already_dispatched_oneshot_is_removed(self, tmp_cron_dir):
         # A prior tick claimed (completed==times) then died before mark_job_run
         # could remove the job.  The next claim must refuse AND clean up.
@@ -1837,6 +3068,18 @@ class TestClaimDispatch:
         # direct caller) can't be claimed — proceed rather than suppress it.
         save_jobs([])
         assert claim_dispatch("ghost") is True
+
+    def test_missing_job_with_exact_claim_is_refused(self, tmp_cron_dir):
+        signed = {
+            **self._oneshot(times=1, completed=0),
+            **_signed_job_revision("os1"),
+        }
+        save_jobs([signed])
+        claim = begin_job_run_outcome(signed)
+        assert claim is not None
+        save_jobs([])
+
+        assert claim_dispatch("os1", run_outcome_claim=claim) is False
 
     def test_mark_job_run_does_not_double_count_preclaimed_oneshot(self, tmp_cron_dir):
         # Full lifecycle: claim bumps completed to times, then mark_job_run must
@@ -1912,3 +3155,104 @@ class TestClaimDispatch:
         # At minimum, the good job's record is still intact (no corruption from the bad neighbor)
         loaded = {j["id"]: j for j in load_jobs()}
         assert "good" in loaded
+
+
+class TestLateEnvRepointScopesStore:
+    """A HERMES_HOME set AFTER cron.jobs import must scope the store even
+    without use_cron_store(): fixtures that patch the environment too late
+    previously read/wrote the import-time jobs.json — the user's real file."""
+
+    def test_late_env_repoint_scopes_store(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        store = jobs._current_cron_store()
+        expected = tmp_path.resolve() / "cron"
+        assert store.cron_dir == expected
+        assert store.jobs_file == expected / "jobs.json"
+        assert store.output_dir == expected / "output"
+        # the import-time compatibility constants are untouched
+        assert jobs.JOBS_FILE != store.jobs_file
+
+    def test_unchanged_home_returns_import_time_constants(self, monkeypatch):
+        import cron.jobs as jobs
+
+        monkeypatch.setenv("HERMES_HOME", str(jobs.HERMES_DIR))
+        store = jobs._current_cron_store()
+        assert store.jobs_file is jobs.JOBS_FILE
+
+    def test_use_cron_store_override_still_wins(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-home"))
+        with jobs.use_cron_store(tmp_path / "override-home"):
+            store = jobs._current_cron_store()
+            assert store.jobs_file == (tmp_path / "override-home").resolve() / "cron" / "jobs.json"
+
+    def test_patched_compatibility_constants_beat_env(self, tmp_path, monkeypatch):
+        """Deliberately re-pointed module constants are the documented
+        process-wide escape hatch — they win over a repointed HERMES_HOME."""
+        import cron.jobs as jobs
+
+        patched_dir = tmp_path / "patched-cron"
+        monkeypatch.setattr(jobs, "CRON_DIR", patched_dir)
+        monkeypatch.setattr(jobs, "JOBS_FILE", patched_dir / "jobs.json")
+        monkeypatch.setattr(jobs, "OUTPUT_DIR", patched_dir / "output")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env-home"))
+        store = jobs._current_cron_store()
+        assert store.jobs_file == patched_dir / "jobs.json"
+
+    def test_public_io_after_late_env_repoint_leaves_old_file_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        """The public API, not the store internals: save_jobs()/load_jobs()
+        called after a post-import HERMES_HOME repoint must operate on the NEW
+        home's jobs.json and leave the import-time file byte-identical.
+
+        The "import-time home" is SIMULATED at a tmp location by patching the
+        module constants and the import-time snapshot together (so they still
+        compare equal and the deliberate-repoint branch does not fire). The
+        test must never touch the real import-time jobs.json: if this module
+        was first imported before the suite's env isolation applied, that
+        path IS the developer's live file — writing a sentinel there is
+        exactly the incident this PR exists to prevent."""
+        import cron.jobs as jobs
+
+        sim_old_home = tmp_path / "import-time-home"
+        sim_cron = sim_old_home / "cron"
+        monkeypatch.setattr(jobs, "HERMES_DIR", sim_old_home)
+        monkeypatch.setattr(jobs, "CRON_DIR", sim_cron)
+        monkeypatch.setattr(jobs, "JOBS_FILE", sim_cron / "jobs.json")
+        monkeypatch.setattr(jobs, "OUTPUT_DIR", sim_cron / "output")
+        monkeypatch.setattr(
+            jobs, "_IMPORT_STORE",
+            jobs._CronStorePaths(jobs.CRON_DIR, jobs.JOBS_FILE, jobs.OUTPUT_DIR),
+        )
+
+        # Plant a sentinel at the (simulated) import-time location — the file
+        # a late-patching fixture used to clobber.
+        old_file = jobs.JOBS_FILE
+        old_file.parent.mkdir(parents=True, exist_ok=True)
+        sentinel = '[{"id": "sentinel-do-not-touch"}]'
+        old_file.write_text(sentinel, encoding="utf-8")
+
+        new_home = tmp_path / "late-home"
+        monkeypatch.setenv("HERMES_HOME", str(new_home))
+
+        job = {
+            "id": "lateenvjob01",
+            "name": "late-env",
+            "prompt": None,
+            "schedule_display": None,
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+            "enabled": True,
+        }
+        save_jobs([job])
+
+        # public read round-trips from the NEW home...
+        loaded = load_jobs()
+        assert [j["id"] for j in loaded] == ["lateenvjob01"]
+        new_file = new_home.resolve() / "cron" / "jobs.json"
+        assert new_file.is_file()
+        # ...and the import-time file is byte-identical to the sentinel.
+        assert old_file.read_text(encoding="utf-8") == sentinel

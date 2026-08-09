@@ -1,17 +1,56 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import asyncio
 import contextlib
 import itertools
 import json
 import logging
 import os
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _resolve_cron_max_iterations, _resolve_cron_run_timeout_seconds, _strip_cron_silence_markers_from_report
+from gateway.hooks import HookRegistry
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+_REAL_ASYNCIO_RUN = asyncio.run
+
+
+def _run_boundary_but_force_transport_fallback(coro):
+    """Keep the output gate live while forcing only transport into fallback."""
+    code = getattr(coro, "cr_code", None)
+    filename = str(getattr(code, "co_filename", ""))
+    if filename.endswith("gateway/outbound_boundary.py"):
+        return _REAL_ASYNCIO_RUN(coro)
+    raise RuntimeError("no running loop")
+
+
+async def _allowing_boundary_handler(_event_type, _context):
+    return {"decision": "allow", "reason": "test_screened"}
+
+
+def _allowing_boundary_hooks():
+    registry = HookRegistry()
+    registry._handlers["outbound:before_send"] = [_allowing_boundary_handler]
+    registry._handler_owners[id(_allowing_boundary_handler)] = "outbound-actionable"
+    registry._handler_capabilities[id(_allowing_boundary_handler)] = frozenset(
+        {"output-screening"}
+    )
+    return registry
+
+
+@pytest.fixture(autouse=True)
+def _installed_output_screening_hook(monkeypatch):
+    """Scheduler mechanics run with the normally installed output Hook."""
+    monkeypatch.setattr(
+        "cron.scheduler._active_outbound_hooks",
+        _allowing_boundary_hooks,
+    )
 
 
 class TestPerJobToolsetMcpMerge:
@@ -76,6 +115,20 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestCronExecutionBudget:
+    def test_turn_budget_prefers_governed_job_then_cron_then_interactive_default(self):
+        cfg = {"cron": {"max_turns": 16}, "agent": {"max_turns": 90}}
+        assert _resolve_cron_max_iterations({"max_turns": 8}, cfg) == 8
+        assert _resolve_cron_max_iterations({}, cfg) == 16
+        assert _resolve_cron_max_iterations({}, {"agent": {"max_turns": 90}}) == 90
+
+    def test_total_runtime_budget_is_explicit_and_can_be_exceptionally_opted_out(self):
+        cfg = {"cron": {"run_timeout_seconds": 180}}
+        assert _resolve_cron_run_timeout_seconds({"run_timeout_seconds": 30}, cfg) == 30
+        assert _resolve_cron_run_timeout_seconds({}, cfg) == 180
+        assert _resolve_cron_run_timeout_seconds({"run_timeout_seconds": 0}, cfg) is None
 
 
 class TestResolveOrigin:
@@ -576,6 +629,7 @@ class TestDeliverResultWrapping:
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
 
+        heartbeats = []
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
             job = {
@@ -584,7 +638,11 @@ class TestDeliverResultWrapping:
                 "deliver": "origin",
                 "origin": {"platform": "telegram", "chat_id": "123"},
             }
-            _deliver_result(job, "Here is today's summary.")
+            _deliver_result(
+                job,
+                "Here is today's summary.",
+                heartbeat=lambda: heartbeats.append("renewed"),
+            )
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
@@ -593,6 +651,192 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+        assert len(heartbeats) >= 3
+
+    def test_live_delivery_propagates_outcome_ownership_loss(self):
+        import cron.scheduler as scheduler
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        adapter = MagicMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="business result",
+            raw={"decision": "allow"},
+        )
+        heartbeat_count = 0
+
+        def lose_before_send():
+            nonlocal heartbeat_count
+            heartbeat_count += 1
+            if heartbeat_count == 2:
+                raise scheduler.CronRunOutcomeOwnershipLost("ownership lost")
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision):
+            with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+                _deliver_result(
+                    {
+                        "id": "live-owner-lost",
+                        "deliver": "origin",
+                        "origin": {"platform": "telegram", "chat_id": "123"},
+                    },
+                    "business result",
+                    adapters={Platform.TELEGRAM: adapter},
+                    loop=loop,
+                    heartbeat=lose_before_send,
+                )
+
+        assert heartbeat_count == 2
+
+    def test_boundary_suppression_is_not_a_delivery_failure(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=False,
+            decision="suppress",
+            content="",
+            reason="intentional_silence",
+            raw={"decision": "suppress", "reason": "intentional_silence"},
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as send_mock:
+            result = _deliver_result(
+                {
+                    "id": "silent-boundary",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "internal process text",
+            )
+
+        assert result is None
+        send_mock.assert_not_called()
+
+    def test_standalone_delivery_cancels_when_periodic_renewal_loses_owner(self):
+        import cron.scheduler as scheduler
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="business result",
+            raw={"decision": "allow"},
+        )
+        heartbeat_count = 0
+
+        def lose_during_wait():
+            nonlocal heartbeat_count
+            heartbeat_count += 1
+            if heartbeat_count == 3:
+                raise scheduler.CronRunOutcomeOwnershipLost("ownership lost")
+
+        async def slow_send(*_args, **_kwargs):
+            await asyncio.sleep(3600)
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("tools.send_message_tool._send_to_platform", side_effect=slow_send), \
+             patch("cron.scheduler.asyncio.wait", new=AsyncMock(return_value=(set(), set()))):
+            with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+                _deliver_result(
+                    {
+                        "id": "standalone-owner-lost",
+                        "deliver": "origin",
+                        "origin": {"platform": "telegram", "chat_id": "123"},
+                    },
+                    "business result",
+                    heartbeat=lose_during_wait,
+                )
+
+        assert heartbeat_count == 3
+
+    def test_standalone_delivery_renews_until_async_send_completes(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="business result",
+            raw={"decision": "allow"},
+        )
+        wait_count = 0
+        heartbeats = []
+
+        async def wait_once_then_finish(tasks, **_kwargs):
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 1:
+                return set(), set(tasks)
+            task = next(iter(tasks))
+            await task
+            return set(tasks), set()
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("cron.scheduler.asyncio.wait", side_effect=wait_once_then_finish):
+            assert _deliver_result(
+                {
+                    "id": "standalone-renewed",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "business result",
+                heartbeat=lambda: heartbeats.append("renewed"),
+            ) is None
+
+        assert wait_count == 2
+        assert len(heartbeats) >= 4
+
+    def test_standalone_fresh_loop_propagates_outcome_ownership_loss(self):
+        import cron.scheduler as scheduler
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="business result",
+            raw={"decision": "allow"},
+        )
+
+        def lose_in_fresh_loop(coro):
+            coro.close()
+            raise scheduler.CronRunOutcomeOwnershipLost("ownership lost")
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("cron.scheduler.asyncio.run", side_effect=RuntimeError("running loop")), \
+             patch("gateway.outbound_boundary._run_coro_in_new_loop", side_effect=lose_in_fresh_loop):
+            with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+                _deliver_result(
+                    {
+                        "id": "fresh-loop-owner-lost",
+                        "deliver": "origin",
+                        "origin": {"platform": "telegram", "chat_id": "123"},
+                    },
+                    "business result",
+                    heartbeat=lambda: None,
+                )
 
     def test_delivery_uses_job_id_when_no_name(self):
         """When a job has no name, the wrapper should fall back to job id."""
@@ -640,6 +884,124 @@ class TestDeliverResultWrapping:
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
+
+    def test_delivery_requires_installed_screening_hook(self, monkeypatch):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        send_mock = AsyncMock(return_value={"success": True})
+        monkeypatch.setattr("cron.scheduler._active_outbound_hooks", lambda: None)
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(
+                {
+                    "id": "screening-required-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "business result",
+            )
+
+        assert "required_output_screening_hook_missing" in result
+        send_mock.assert_not_called()
+
+    def test_runtime_error_retry_preserves_boundary_rewrite(self):
+        """The standalone retry must never fall back to pre-boundary content."""
+        from gateway.config import Platform
+        from gateway.outbound_boundary import build_outbound_context
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="rewrite",
+            content="safe projected result",
+            raw={"decision": "rewrite"},
+        )
+        run_count = 0
+
+        def fake_asyncio_run(coro):
+            nonlocal run_count
+            run_count += 1
+            if run_count == 1:
+                raise RuntimeError("running loop")
+            coro.close()
+            return {"success": True}
+
+        send_mock = AsyncMock(return_value={"success": True})
+        continuation_evidence = {
+            "kind": "decision_frame",
+            "frame_id": "frame-1",
+            "phase": "pre_send",
+        }
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("cron.scheduler._active_outbound_hooks", return_value=object()), \
+             patch("gateway.outbound_boundary.build_outbound_context", wraps=build_outbound_context) as build_mock, \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("gateway.outbound_boundary.outbound_after_send_sync"), \
+             patch("gateway.platforms.base.BasePlatformAdapter.filter_media_delivery_paths", side_effect=lambda value: value), \
+             patch("cron.scheduler._cron_mirror_delivery_enabled", return_value=True), \
+             patch("cron.scheduler._maybe_mirror_cron_delivery") as mirror_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("cron.scheduler.asyncio.run", side_effect=fake_asyncio_run):
+            result = _deliver_result(
+                {
+                    "id": "boundary-retry-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                    "continuation_evidence": continuation_evidence,
+                },
+                "raw process narrative\nMEDIA:/private/tmp/internal.txt",
+            )
+
+        assert result is None
+        assert send_mock.call_count == 2
+        assert send_mock.call_args_list[1].args[3] == "safe projected result"
+        assert send_mock.call_args_list[1].kwargs["media_files"] == []
+        assert mirror_mock.call_args.args[3] == "safe projected result"
+        assert build_mock.call_args.kwargs["continuation_evidence"] == continuation_evidence
+
+    def test_allow_rebuilds_media_from_screened_candidate(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="safe business result",
+            raw={"decision": "allow"},
+            reason="screened",
+        )
+        send_mock = AsyncMock(return_value={"success": True})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("gateway.outbound_boundary.outbound_after_send_sync"), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(
+                {
+                    "id": "screened-media-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "raw process\nMEDIA:/private/tmp/internal.png",
+            )
+
+        assert result is None
+        assert send_mock.await_args.args[3] == "safe business result"
+        assert send_mock.await_args.kwargs["media_files"] == []
 
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
@@ -955,6 +1317,38 @@ class TestDeliverResultErrorReturns:
         result = _deliver_result(job, "Output.")
         assert result is not None
         assert "no delivery target" in result
+
+    def test_confirmed_delivery_survives_after_send_audit_failure(self):
+        """The audit record is best effort after the transport confirms send."""
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        future = MagicMock()
+        future.result.return_value = MagicMock(success=True, message_id="sent-1")
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return future
+
+        platform_config = MagicMock()
+        platform_config.enabled = True
+        gateway_config = MagicMock()
+        gateway_config.platforms = {Platform.TELEGRAM: platform_config}
+        job = {
+            "id": "after-send-audit-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=gateway_config), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_schedule), \
+             patch("gateway.outbound_boundary.outbound_after_send_sync", side_effect=RuntimeError("audit down")):
+            assert _deliver_result(
+                job, "confirmed report", adapters={Platform.TELEGRAM: adapter}, loop=loop
+            ) is None
 
 
 class TestRunJobSessionPersistence:
@@ -1654,6 +2048,14 @@ class TestRunJobSessionPersistence:
         fake_pool.submit.return_value = fake_future
         wait_results = [(set(), set()), ({fake_future}, set())]
         monotonic_ticks = itertools.count(step=61.0)
+        outcome_claim = {"run_id": "cron-run:" + "a" * 32, "lease": 1}
+        refreshed_outcome_claim = {**outcome_claim, "lease": 2}
+        observed_outcome_heartbeats = []
+
+        def refresh_outcome_claim(job_id, claim):
+            observed_outcome_heartbeats.append((job_id, dict(claim)))
+            return refreshed_outcome_claim
+
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", timeout_value)
 
         with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -1671,8 +2073,15 @@ class TestRunJobSessionPersistence:
              patch("cron.scheduler.concurrent.futures.ThreadPoolExecutor", return_value=fake_pool), \
              patch("cron.scheduler.concurrent.futures.wait", side_effect=wait_results), \
              patch("cron.scheduler.time.monotonic", side_effect=monotonic_ticks.__next__), \
-             patch("cron.scheduler.heartbeat_run_claim", return_value=True) as heartbeat:
-            success, _output, final_response, error = run_job(job)
+             patch("cron.scheduler.heartbeat_run_claim", return_value=True) as heartbeat, \
+             patch(
+                 "cron.scheduler.heartbeat_job_run_outcome",
+                 side_effect=refresh_outcome_claim,
+             ) as outcome_heartbeat:
+            success, _output, final_response, error = run_job(
+                job,
+                run_outcome_claim=outcome_claim,
+            )
 
         assert success is True
         assert error is None
@@ -1680,6 +2089,394 @@ class TestRunJobSessionPersistence:
         heartbeat.assert_called_once_with(
             "heartbeat-job", expected_owner="owner-token"
         )
+        outcome_heartbeat.assert_called_once()
+        assert observed_outcome_heartbeats == [
+            (
+                "heartbeat-job",
+                {"run_id": "cron-run:" + "a" * 32, "lease": 1},
+            )
+        ]
+        assert outcome_claim == refreshed_outcome_claim
+
+    def test_run_job_script_heartbeats_while_subprocess_is_alive(
+        self, tmp_path, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        script = scripts / "slow.py"
+        script.write_text(
+            "import time\ntime.sleep(0.08)\nprint('done')\n",
+            encoding="utf-8",
+        )
+        heartbeats = []
+        monkeypatch.setattr(scheduler, "_hermes_home", tmp_path)
+        monkeypatch.setattr(scheduler, "_CRON_SCRIPT_HEARTBEAT_POLL_SECONDS", 0.01)
+
+        success, output = scheduler._run_job_script(
+            "slow.py",
+            heartbeat=lambda: heartbeats.append("renewed"),
+        )
+
+        assert success is True
+        assert output == "done"
+        assert heartbeats
+
+    @pytest.mark.live_system_guard_bypass
+    def test_run_job_script_kills_process_on_timeout_and_heartbeat_error(
+        self, tmp_path, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        script = scripts / "slow.py"
+        script.write_text(
+            "import time\ntime.sleep(2)\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(scheduler, "_hermes_home", tmp_path)
+        monkeypatch.setattr(scheduler, "_CRON_SCRIPT_HEARTBEAT_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(scheduler, "_SCRIPT_TIMEOUT", 1)
+
+        timed_out, timeout_output = scheduler._run_job_script(
+            "slow.py",
+            heartbeat=lambda: None,
+        )
+        assert timed_out is False
+        assert "timed out" in timeout_output.lower()
+
+        with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+            scheduler._run_job_script(
+                "slow.py",
+                heartbeat=lambda: (_ for _ in ()).throw(
+                    scheduler.CronRunOutcomeOwnershipLost("ownership lost")
+                ),
+            )
+
+    def test_no_agent_snapshot_renews_outcome_claim_after_initial_interval(
+        self, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+
+        job = {
+            "id": "signed-script",
+            "name": "signed script",
+            "no_agent": True,
+            "script": "task.py",
+        }
+        claim = {"run_id": "cron-run:" + "a" * 32, "lease": 1}
+        refreshed = {**claim, "lease": 2}
+        monotonic_ticks = iter((0.0, 30.0, 61.0))
+        observed = []
+
+        def run_script(_path, **kwargs):
+            observed.append(set(kwargs))
+            kwargs["heartbeat"]()
+            kwargs["heartbeat"]()
+            return True, "payload"
+
+        with patch("cron.jobs._apply_cron_runtime_governance"), \
+             patch("cron.scheduler._run_job_script", side_effect=run_script), \
+             patch("cron.scheduler.time.monotonic", side_effect=monotonic_ticks.__next__), \
+             patch(
+                 "cron.scheduler.heartbeat_job_run_outcome",
+                 return_value=refreshed,
+             ) as heartbeat:
+            success, _output, final_response, error = scheduler.run_job(
+                job,
+                script_snapshot=b"claimed",
+                run_outcome_claim=claim,
+            )
+
+        assert success is True
+        assert error is None
+        assert final_response == "payload"
+        assert observed == [{"script_snapshot", "heartbeat"}]
+        heartbeat.assert_called_once()
+        assert claim == refreshed
+
+    @pytest.mark.parametrize("outcome_failure", [None, RuntimeError("outcome claim")])
+    def test_agent_monitor_stops_when_outcome_claim_renewal_fails(
+        self, tmp_path, monkeypatch, outcome_failure
+    ):
+        import cron.scheduler as scheduler
+
+        job = {
+            "id": "heartbeat-errors",
+            "name": "heartbeat errors",
+            "prompt": "hello",
+            "script": "gate.py",
+            "schedule": {"kind": "once", "run_at": "2026-07-10T12:00:00Z"},
+            "run_claim": {"at": "2026-07-10T12:00:00Z", "by": "owner-token"},
+        }
+        outcome_claim = {"run_id": "cron-run:" + "a" * 32}
+        fake_db = MagicMock()
+
+        class FakeAgent:
+            interrupted = []
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+            def interrupt(self, reason):
+                if outcome_failure is not None:
+                    raise RuntimeError("interrupt failed")
+                self.interrupted.append(reason)
+
+        class FakeFuture:
+            def __init__(self):
+                self.cancel = MagicMock(return_value=True)
+
+            def result(self):
+                return {"final_response": "ok"}
+
+        fake_future = FakeFuture()
+        fake_pool = MagicMock()
+        fake_pool.submit.return_value = fake_future
+        wait_results = [(set(), set()), ({fake_future}, set())]
+        monotonic_ticks = itertools.count(step=61.0)
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "600")
+
+        outcome_behavior = (
+            {"return_value": None}
+            if outcome_failure is None
+            else {"side_effect": outcome_failure}
+        )
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent), \
+             patch("cron.scheduler._run_job_script", return_value=(True, "wake")) as script, \
+             patch("cron.scheduler.concurrent.futures.ThreadPoolExecutor", return_value=fake_pool), \
+             patch("cron.scheduler.concurrent.futures.wait", side_effect=wait_results), \
+             patch("cron.scheduler.time.monotonic", side_effect=monotonic_ticks.__next__), \
+             patch("cron.scheduler.heartbeat_run_claim", side_effect=RuntimeError("run claim")), \
+             patch(
+                 "cron.scheduler.heartbeat_job_run_outcome",
+                 **outcome_behavior,
+             ):
+            with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+                run_job(
+                    job,
+                    script_snapshot=b"claimed",
+                    run_outcome_claim=outcome_claim,
+                )
+
+        assert FakeAgent.interrupted == (
+            ["Cron run-outcome ownership lost"]
+            if outcome_failure is None
+            else []
+        )
+        fake_future.cancel.assert_called_once()
+        assert "heartbeat" in script.call_args.kwargs
+
+    def test_agent_monitor_without_claims_uses_unlimited_fast_path(
+        self, tmp_path, monkeypatch
+    ):
+        job = {"id": "no-claims", "name": "no claims", "prompt": "hello"}
+        fake_db = MagicMock()
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+        fake_pool = MagicMock()
+        fake_pool.submit.return_value.result.return_value = {"final_response": "ok"}
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent), \
+             patch("cron.scheduler.concurrent.futures.ThreadPoolExecutor", return_value=fake_pool), \
+             patch("cron.scheduler.concurrent.futures.wait") as wait:
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        wait.assert_not_called()
+
+    @pytest.mark.parametrize("mode", ["no_claims", "oneshot_only", "outcome_none"])
+    def test_agent_monitor_claim_heartbeat_boundary_modes(
+        self, tmp_path, monkeypatch, mode
+    ):
+        job = {"id": mode, "name": mode, "prompt": "hello"}
+        outcome_claim = None
+        if mode == "oneshot_only":
+            job["schedule"] = {"kind": "once", "run_at": "2026-07-10T12:00:00Z"}
+            job["run_claim"] = {
+                "at": "2026-07-10T12:00:00Z",
+                "by": "owner-token",
+            }
+        elif mode == "outcome_none":
+            outcome_claim = {"run_id": "cron-run:" + "a" * 32}
+        fake_db = MagicMock()
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                return {"final_response": "ok"}
+
+        class FakeFuture:
+            def result(self):
+                return {"final_response": "ok"}
+
+        fake_future = FakeFuture()
+        fake_pool = MagicMock()
+        fake_pool.submit.return_value = fake_future
+        wait_results = [(set(), set()), ({fake_future}, set())]
+        monotonic_ticks = itertools.count(step=61.0)
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "600")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent), \
+             patch("cron.scheduler.concurrent.futures.ThreadPoolExecutor", return_value=fake_pool), \
+             patch("cron.scheduler.concurrent.futures.wait", side_effect=wait_results), \
+             patch("cron.scheduler.time.monotonic", side_effect=monotonic_ticks.__next__), \
+             patch("cron.scheduler.heartbeat_run_claim", return_value=True) as run_heartbeat, \
+             patch(
+                 "cron.scheduler.heartbeat_job_run_outcome",
+                 return_value=outcome_claim,
+             ) as outcome_heartbeat:
+            success, _output, final_response, error = run_job(
+                job,
+                run_outcome_claim=outcome_claim,
+            )
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert run_heartbeat.call_count == (1 if mode == "oneshot_only" else 0)
+        assert outcome_heartbeat.call_count == (1 if mode == "outcome_none" else 0)
+
+    def test_run_job_binds_and_clears_behavior_authorization_context(self, tmp_path, monkeypatch):
+        jobs = [
+            {
+                "id": "bound-job",
+                "name": "bound",
+                "prompt": "hello",
+                "authorized_behavior_ref": "behavior.cron.bound-job",
+                "process_charter_ref": "process-charter.cron.bound-job",
+                "risk_tier": "high",
+                "implementation_categories": ["cron", "browser_cdp"],
+                "implementation_path_evidence_ref": "evidence.impl.bound-job",
+                "observed_scope_evidence_ref": "evidence.scope.bound-job",
+                "join_keys": {"candidate_hash": "sha256:bound-job"},
+            },
+            {
+                "id": "plain-job",
+                "name": "plain",
+                "prompt": "hello again",
+            },
+        ]
+        auth_names = (
+            "HERMES_CRON_JOB_ID",
+            "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF",
+            "HERMES_CRON_PROCESS_CHARTER_REF",
+            "HERMES_CRON_RISK_TIER",
+            "HERMES_CRON_IMPLEMENTATION_CATEGORIES",
+            "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF",
+            "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF",
+            "HERMES_CRON_CANDIDATE_HASH",
+        )
+        fake_db = MagicMock()
+        seen = []
+
+        for name in auth_names:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv("HERMES_CRON_RUNTIME_BINDING_REQUIRED", raising=False)
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, *args, **kwargs):
+                from gateway.session_context import get_session_env
+                from tools.environments.local import _make_run_env
+
+                child_env = _make_run_env({})
+                seen.append(
+                    {
+                        "context": {name: get_session_env(name) for name in auth_names},
+                        "exported": {name: child_env.get(name) for name in auth_names},
+                    }
+                )
+                return {"final_response": "ok"}
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "***",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent", FakeAgent):
+            for job in jobs:
+                success, _output, final_response, error = run_job(job)
+                assert success is True
+                assert error is None
+                assert final_response == "ok"
+
+        assert seen[0]["context"] == {
+            "HERMES_CRON_JOB_ID": "bound-job",
+            "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": "behavior.cron.bound-job",
+            "HERMES_CRON_PROCESS_CHARTER_REF": "process-charter.cron.bound-job",
+            "HERMES_CRON_RISK_TIER": "high",
+            "HERMES_CRON_IMPLEMENTATION_CATEGORIES": '["cron", "browser_cdp"]',
+            "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": "evidence.impl.bound-job",
+            "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": "evidence.scope.bound-job",
+            "HERMES_CRON_CANDIDATE_HASH": "sha256:bound-job",
+        }
+        assert seen[1]["context"] == {
+            "HERMES_CRON_JOB_ID": "plain-job",
+            **{name: "" for name in auth_names if name != "HERMES_CRON_JOB_ID"},
+        }
+        assert all(value is None for run in seen for value in run["exported"].values())
+        from gateway.session_context import get_session_env
+        assert all(get_session_env(name) == "" for name in auth_names)
+        assert "HERMES_CRON_RUNTIME_BINDING_REQUIRED" not in os.environ
+        assert fake_db.close.call_count == 2
 
     def test_run_job_resets_secret_source_cache_before_reload(self, tmp_path, monkeypatch):
         """Each run must clear the secret-source cache before re-reading the
@@ -2519,8 +3316,8 @@ class TestSilentDelivery:
             tick(verbose=False)
         deliver_mock.assert_not_called()
 
-    def test_silent_trailing_suppresses_delivery(self):
-        """Agent appended [SILENT] after explanation text — must still suppress."""
+    def test_silent_trailing_preserves_report_without_marker(self):
+        """A real report with a trailing marker must remain user-visible."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
@@ -2529,7 +3326,17 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
+        assert deliver_mock.call_args.args[1] == "2 deals filtered out (like<10, reply<15)."
+
+    def test_fenced_silent_example_in_report_still_delivers(self):
+        response = (
+            "Report documentation:\n```markdown\n## Response\n[SILENT]\n"
+            "## End Response\n```\nThree real changes were found."
+        )
+        from cron.scheduler import _extract_cron_final_response
+
+        assert _extract_cron_final_response(response) == response
 
     def test_silent_is_case_insensitive(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
@@ -2570,22 +3377,27 @@ class TestSilentDelivery:
     def test_is_cron_silence_response_contract(self):
         """Direct behavior contract for the cron silence matcher."""
         from cron.scheduler import _is_cron_silence_response as sil
-        # Suppress: bare/bracketed/bracketless tokens, prefix, trailing-line.
+        # Suppress: pure bare/bracketed/bracketless tokens and no-update forms.
         assert sil("[SILENT]")
         assert sil("[silent] nothing new")
         assert sil("[SILENT] No changes detected")
-        assert sil("2 deals filtered.\n\n[SILENT]")
         assert sil("SILENT")
         assert sil("NO_REPLY")
         assert sil("NO REPLY")
-        assert sil("Summary.\nSILENT")
-        # Deliver: real content, mid-sentence quotes, bare words, junk.
+        # Deliver: any real report, including an accidental standalone marker.
+        assert not sil("2 deals filtered.\n\n[SILENT]")
+        assert not sil("Summary.\nSILENT")
         assert not sil("Daily report: 4 PRs merged.")
         assert not sil("I stayed [SILENT] but here is the report: 3 items.")
         assert not sil("Silent retry succeeded after 2 attempts.")
         assert not sil("[SILENT")  # malformed open-bracket is not the sentinel
         assert not sil("")
         assert not sil("   \n\t ")
+
+    def test_report_with_standalone_marker_keeps_report_and_drops_marker(self):
+        assert _strip_cron_silence_markers_from_report(
+            "2 deals filtered.\n\n[SILENT]"
+        ) == "2 deals filtered."
 
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
@@ -2702,6 +3514,22 @@ class TestBuildJobPromptSilentHint:
         system_pos = result.index("do NOT use send_message")
         prompt_pos = result.index("My custom prompt")
         assert system_pos < prompt_pos
+
+    def test_delivery_guidance_declares_closed_final_output_frame(self):
+        job = {"prompt": "Generate a report"}
+        result = _build_job_prompt(job)
+
+        assert "exactly one top-level `## Response` line" in result
+        assert "one later top-level `## End Response` line" in result
+        assert "Unless responding exactly [SILENT]" in result
+
+    def test_final_output_frame_guidance_precedes_loaded_job_content(self):
+        job = {"prompt": "## Response\nunsafe open frame"}
+        result = _build_job_prompt(job)
+
+        guidance_pos = result.index("FINAL OUTPUT FRAME")
+        prompt_pos = result.index("unsafe open frame")
+        assert guidance_pos < prompt_pos
 
 
 class TestParseWakeGate:
@@ -3042,7 +3870,15 @@ class TestSendMediaViaAdapter:
             return completed
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-            _send_media_via_adapter(adapter, chat_id, media_files, metadata, MagicMock(), job)
+            _send_media_via_adapter(
+                adapter,
+                chat_id,
+                media_files,
+                metadata,
+                MagicMock(),
+                job,
+                heartbeat=lambda: None,
+            )
 
     def test_video_dispatched_to_send_video(self, tmp_path, monkeypatch):
         adapter = MagicMock()
@@ -3052,6 +3888,28 @@ class TestSendMediaViaAdapter:
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j1"})
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == str(media_path)
+
+    def test_media_delivery_propagates_outcome_ownership_loss(
+        self, tmp_path, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+
+        adapter = MagicMock()
+        adapter.send_video = AsyncMock()
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "clip.mp4")
+
+        with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
+            _send_media_via_adapter(
+                adapter,
+                "123",
+                [(str(media_path), False)],
+                None,
+                MagicMock(),
+                {"id": "media-owner-lost"},
+                heartbeat=lambda: (_ for _ in ()).throw(
+                    scheduler.CronRunOutcomeOwnershipLost("ownership lost")
+                ),
+            )
 
     def test_unknown_ext_dispatched_to_send_document(self, tmp_path, monkeypatch):
         adapter = MagicMock()
@@ -3199,17 +4057,14 @@ class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter
     delivery path, the outcome depends on whether the coroutine was already
     running.  future.cancel() returning False means it is in flight on the wire
-    (cannot be un-sent) → treat as DELIVERED and skip the standalone fallback to
-    avoid a duplicate (#38922).  future.cancel() returning True means it never
-    started (wedged loop) → nothing was sent, so fall through to standalone or
-    the message is silently dropped.  Regression for #38922.
+    (cannot be un-sent): signed runs wait under their active claim, while legacy
+    callers preserve the assume-delivered behavior that avoids a duplicate.
+    future.cancel() returning True means it never started (wedged loop), so the
+    standalone fallback remains safe. Regression for #38922 and #1453.
     """
 
     def test_live_adapter_timeout_assumes_delivered_no_duplicate(self):
-        """End-to-end: live adapter confirmation times out past the 60s budget.
-        The fix (#38922) treats the send as already-dispatched/delivered and
-        does NOT run the standalone fallback — otherwise the message is sent
-        twice."""
+        """An unsigned legacy send keeps the no-duplicate timeout behavior."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -3269,6 +4124,104 @@ class TestDeliverResultTimeoutCancelsFuture:
         assert result is None, f"expected successful delivery, got error: {result!r}"
         # 3. The standalone fallback must NOT run — that is the #38922 fix:
         #    an in-flight confirmation timeout is assume-delivered, not a resend.
+        standalone_send.assert_not_awaited()
+
+    def test_signed_live_adapter_waits_for_inflight_confirmation_with_heartbeats(
+        self, monkeypatch
+    ):
+        import threading
+        import time
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        captured_future = Future()
+        assert captured_future.set_running_or_notify_cancel() is True
+        resolver_threads = []
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+
+            def resolve_after_first_timeout():
+                time.sleep(0.05)
+                captured_future.set_result(MagicMock(success=True))
+
+            thread = threading.Thread(target=resolve_after_first_timeout)
+            thread.start()
+            resolver_threads.append(thread)
+            return captured_future
+
+        heartbeats = []
+        standalone_send = AsyncMock(return_value={"success": True})
+        monkeypatch.setattr(
+            "cron.scheduler._CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS", 0.01
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                {
+                    "id": "signed-inflight-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "Hello world",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+                heartbeat=lambda: heartbeats.append("renewed"),
+            )
+
+        for thread in resolver_threads:
+            thread.join(timeout=1)
+        assert result is None
+        assert heartbeats
+        assert captured_future.done()
+        standalone_send.assert_not_awaited()
+
+    def test_live_adapter_timeout_reports_screened_media_drop(self):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        captured_future = Future()
+        captured_future.cancel = MagicMock(return_value=False)
+        captured_future.result = MagicMock(side_effect=TimeoutError("timed out"))
+
+        def fake_run_coro(coro, _loop):
+            coro.close()
+            return captured_future
+
+        standalone_send = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("gateway.platforms.base.BasePlatformAdapter.filter_media_delivery_paths", side_effect=lambda value: value), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                {
+                    "id": "timeout-media-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "Hello world\nMEDIA:/private/tmp/internal.txt",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert "1 media attachment(s) not delivered" in result
         standalone_send.assert_not_awaited()
 
     def test_live_adapter_timeout_before_dispatch_falls_back_to_standalone(self):
@@ -3882,6 +4835,1273 @@ class TestDeliverResultTimeoutCancelsFuture:
         # Forum target routes via message_thread_id (mode 1), not DM-topic.
         sent_metadata = adapter.send.call_args[1]["metadata"]
         assert not sent_metadata.get("direct_messages_topic_id")
+
+
+def test_cron_delivery_receipt_summary_redacts_transport_ids_and_preserves_partial():
+    from cron.scheduler import _cron_delivery_receipt_summary
+
+    receipt = _cron_delivery_receipt_summary([
+        {
+            "kind": "text",
+            "required": True,
+            "status": "confirmed",
+            "message_id": "transport-id-must-not-persist",
+        },
+        {
+            "kind": "media",
+            "required": True,
+            "status": "failed",
+            "error_kind": "delivery_failed",
+        },
+    ])
+
+    assert receipt == {
+        "schema_version": "cron-delivery/v1",
+        "status": "partial",
+        "required_count": 2,
+        "confirmed_count": 1,
+        "failed_count": 1,
+        "unconfirmed_count": 0,
+        "receipts_truncated": False,
+    }
+
+
+def test_run_one_job_persists_confirmed_terminal_delivery_receipt():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "delivery-proof-job", "name": "Delivery proof", "deliver": "origin"}
+
+    def deliver_with_confirmed_receipt(*_args, delivery_receipts, **_kwargs):
+        delivery_receipts.append(
+            {"kind": "text", "required": True, "status": "confirmed", "message_id": "transport-only"}
+        )
+        return None
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._deliver_result", side_effect=deliver_with_confirmed_receipt), \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job, verbose=True) is True
+
+    assert mark_mock.call_args.args == ("delivery-proof-job", True, None)
+    assert mark_mock.call_args.kwargs == {
+        "delivery_error": None,
+        "delivery_receipt": {
+            "schema_version": "cron-delivery/v1",
+            "status": "success",
+            "required_count": 1,
+            "confirmed_count": 1,
+            "failed_count": 0,
+            "unconfirmed_count": 0,
+            "receipts_truncated": False,
+        },
+    }
+
+
+def test_run_one_job_persists_core_terminal_run_outcome_receipt():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "run-proof-job", "name": "Run proof", "deliver": "local"}
+    claim = {
+        "schema_version": "cron-run-claim/v1",
+        "profile_id": "profile-custom",
+        "job_id": "run-proof-job",
+        "job_revision": "sha256:" + "1" * 64,
+        "run_id": "cron-run:" + "2" * 32,
+        "script_artifact_hash": "sha256:" + "6" * 64,
+        "implementation_hash": "sha256:" + "3" * 64,
+        "checkpoint_policy_hash": "sha256:" + "4" * 64,
+    }
+    receipt = {
+        "schema_version": "cron-run-outcome/v1",
+        "profile_id": claim["profile_id"],
+        "job_id": claim["job_id"],
+        "job_revision": claim["job_revision"],
+        "run_id": claim["run_id"],
+        "terminal_state": "success",
+        "implementation_hash": claim["implementation_hash"],
+        "checkpoint_invariant_hash": "sha256:" + "5" * 64,
+        "delivery_receipt_hash": "sha256:" + "7" * 64,
+    }
+    delivery = {
+        "schema_version": "cron-delivery/v1",
+        "status": "success",
+        "required_count": 1,
+        "confirmed_count": 1,
+        "failed_count": 0,
+        "unconfirmed_count": 0,
+        "receipts_truncated": False,
+    }
+
+    renewed_claim = {**claim, "lease": "renewed"}
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", return_value=renewed_claim) as heartbeat_mock, \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._cron_delivery_receipt_summary", return_value=delivery), \
+         patch("cron.scheduler._cron_run_outcome_receipt", return_value=receipt) as receipt_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is True
+
+    receipt_mock.assert_called_once_with(
+        job,
+        success=True,
+        run_outcome_claim=renewed_claim,
+        delivery_receipt=delivery,
+    )
+    assert heartbeat_mock.call_count == 3
+    assert mark_mock.call_args.args == ("run-proof-job", True, None)
+    assert mark_mock.call_args.kwargs == {
+        "delivery_error": None,
+        "delivery_receipt": delivery,
+        "run_outcome_receipt": receipt,
+        "run_outcome_claim": renewed_claim,
+    }
+
+
+def test_run_one_job_stops_before_save_when_outcome_ownership_is_lost():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "lost-owner", "name": "Lost owner", "deliver": "origin"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    closed = []
+
+    class FakeAgent:
+        def close(self):
+            closed.append("closed")
+
+    def fake_run(_job, *, defer_agent_teardown, **_kwargs):
+        defer_agent_teardown.append(FakeAgent())
+        return True, "# output", "report", None
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", side_effect=fake_run), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", return_value=None), \
+         patch("cron.scheduler.save_job_output") as save_mock, \
+         patch("cron.scheduler._deliver_result") as deliver_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock, \
+         patch("agent.auxiliary_client.cleanup_stale_async_clients"):
+        assert run_one_job(job) is False
+
+    save_mock.assert_not_called()
+    deliver_mock.assert_not_called()
+    mark_mock.assert_not_called()
+    assert closed == ["closed"]
+
+
+def test_run_one_job_propagates_delivery_ownership_loss_without_terminal_write():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "lost-during-delivery", "name": "Lost delivery", "deliver": "origin"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    heartbeat_results = iter((dict(claim), dict(claim), None))
+
+    def lose_in_delivery(_job, _content, *, heartbeat, **_kwargs):
+        heartbeat()
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda *_args: next(heartbeat_results)), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._deliver_result", side_effect=lose_in_delivery), \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    mark_mock.assert_not_called()
+
+
+def test_run_one_job_exception_stops_when_terminal_renewal_loses_owner():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "lost-before-failure-terminal", "name": "Lost failure", "deliver": "local"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    heartbeat_results = iter((dict(claim), None))
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda *_args: next(heartbeat_results)), \
+         patch("cron.scheduler.save_job_output", side_effect=RuntimeError("disk unavailable")), \
+         patch("cron.scheduler._cron_run_outcome_receipt") as receipt_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    receipt_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_run_one_job_pre_admission_exception_stops_when_terminal_owner_is_lost():
+    from cron.scheduler import run_one_job
+
+    job = {
+        "id": "lost-before-admission-token",
+        "name": "Lost before admission",
+        "deliver": "local",
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("agent.secret_scope.build_profile_secret_scope", side_effect=RuntimeError("scope unavailable")), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", return_value=None), \
+         patch("cron.scheduler._cron_run_outcome_receipt") as receipt_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    receipt_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_run_one_job_real_claim_producer_and_writer_round_trip(tmp_path, monkeypatch):
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    cron_dir.mkdir()
+    (cron_dir / ".jobs.lock").touch(mode=0o600)
+    job = {
+        "id": "run-proof-real-writer",
+        "name": "Run proof",
+        "prompt": "report",
+        "skills": [],
+        "schedule": {"kind": "interval", "minutes": 60},
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "deliver": "local",
+        "last_status": None,
+        "last_error": None,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": "profile-custom",
+            "cron_job_id": "run-proof-real-writer",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    jobs.save_jobs([job])
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "output.md")):
+        assert scheduler.run_one_job(job) is True
+
+    persisted = jobs.get_job(job["id"])
+    receipt = persisted["last_run_outcome_receipt"]
+    assert receipt["schema_version"] == "cron-run-outcome/v1"
+    assert receipt["job_revision"] == "sha256:" + "1" * 64
+    assert receipt["terminal_state"] == "success"
+    assert receipt["implementation_hash"].startswith("sha256:")
+    assert receipt["checkpoint_invariant_hash"].startswith("sha256:")
+    assert receipt["delivery_receipt_hash"].startswith("sha256:")
+    assert persisted["active_run_outcome_claim"] is None
+    assert list(tmp_path.rglob("*.db")) == []
+
+
+def test_delivery_heartbeat_keeps_second_owner_out_past_original_expiry(
+    tmp_path, monkeypatch
+):
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    now_epoch = [1_000_000]
+    monkeypatch.setattr(jobs.time, "time", lambda: now_epoch[0])
+    cron_dir.mkdir()
+    (cron_dir / ".jobs.lock").touch(mode=0o600)
+    job = {
+        "id": "delivery-lease",
+        "name": "Delivery lease",
+        "prompt": "report",
+        "skills": [],
+        "schedule": {"kind": "interval", "minutes": 60},
+        "repeat": {"times": None, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "deliver": "origin",
+        "last_status": None,
+        "last_error": None,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": "profile-custom",
+            "cron_job_id": "delivery-lease",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    jobs.save_jobs([job])
+    original_expiry = []
+
+    def fake_run(_job, *, run_outcome_claim, **_kwargs):
+        original_expiry.append(run_outcome_claim["claim_expires_at_epoch"])
+        return True, "# output", "report", None
+
+    def fake_delivery(_job, _content, *, heartbeat, **_kwargs):
+        initial_expiry = original_expiry[0]
+        now_epoch[0] = initial_expiry - 60
+        heartbeat()
+        refreshed = jobs.get_job(job["id"])["active_run_outcome_claim"]
+        assert refreshed["claim_expires_at_epoch"] > initial_expiry
+
+        now_epoch[0] = initial_expiry + 10
+        assert jobs.begin_job_run_outcome(jobs.get_job(job["id"])) is None
+        heartbeat()
+        return None
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.run_job", side_effect=fake_run), \
+         patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "output.md")), \
+         patch("cron.scheduler._deliver_result", side_effect=fake_delivery):
+        assert scheduler.run_one_job(job) is True
+
+    persisted = jobs.get_job(job["id"])
+    assert persisted["active_run_outcome_claim"] is None
+    assert persisted["last_run_outcome_receipt"]["terminal_state"] == "success"
+
+
+def test_signed_job_claim_failure_aborts_before_any_run_side_effect():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "signed-claim-failed",
+        "name": "Signed claim failed",
+        "deliver": "local",
+        "creation_governance_receipt": {
+            "schema_version": "invalid",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    with patch("cron.scheduler.claim_dispatch", return_value=True) as dispatch_mock, \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=None), \
+         patch("cron.scheduler.record_job_run_preflight_denial") as denial_mock, \
+         patch("cron.scheduler.run_job") as run_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    dispatch_mock.assert_not_called()
+    denial_mock.assert_called_once_with(
+        job["id"],
+        job_revision="sha256:" + "1" * 64,
+        reason_code="run_outcome_claim_unavailable",
+        run_claim=None,
+        fire_claim=None,
+    )
+    run_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_unsupported_verification_preflight_preserves_finite_oneshot(
+    tmp_path, monkeypatch
+):
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    cron_dir = tmp_path / "cron"
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    marker = tmp_path / "must-not-run"
+    (scripts / "task.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('wrong')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    cron_dir.mkdir()
+    (cron_dir / ".jobs.lock").touch(mode=0o600)
+    run_claim = {"at": "2026-07-22T00:00:00+00:00", "by": "scheduler-a"}
+    job = {
+        "id": "unsupported-verifier",
+        "name": "Unsupported verifier",
+        "schedule": {"kind": "once", "run_at": "2026-07-22T00:00:00+00:00"},
+        "repeat": {"times": 1, "completed": 0},
+        "enabled": True,
+        "deliver": "local",
+        "no_agent": True,
+        "script": "task.py",
+        "verification_command": "python verify.py",
+        "verification_command_mode": "read_only",
+        "run_claim": run_claim,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": "profile-custom",
+            "cron_job_id": "unsupported-verifier",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    jobs.save_jobs([job])
+
+    assert scheduler.run_one_job(job) is False
+
+    persisted = jobs.get_job(job["id"])
+    assert persisted is not None
+    assert persisted["repeat"]["completed"] == 0
+    assert persisted["run_claim"] is None
+    assert persisted["last_runtime_admission_receipt"]["reason_code"] == (
+        "unsupported_verification_contract"
+    )
+    assert marker.exists() is False
+
+
+def test_script_snapshot_mismatch_abandons_claim_before_side_effect():
+    import cron.scheduler as scheduler
+
+    job = {"id": "snapshot-drift", "name": "Snapshot drift", "deliver": "local"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.claim_dispatch", return_value=True) as dispatch_mock, \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(False, b"drift")), \
+         patch("cron.scheduler.abandon_job_run_outcome", return_value=True) as abandon_mock, \
+         patch("cron.scheduler.run_job") as run_mock:
+        assert scheduler.run_one_job(job) is False
+
+    dispatch_mock.assert_not_called()
+    abandon_mock.assert_called_once_with(
+        job["id"],
+        claim,
+        reason_code="run_outcome_script_changed",
+        run_claim=None,
+        fire_claim=None,
+    )
+    run_mock.assert_not_called()
+
+
+def test_pre_dispatch_exception_does_not_consume_finite_legacy_job():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "pre-dispatch-exception",
+        "name": "Pre-dispatch exception",
+        "deliver": "local",
+        "schedule": {"kind": "once", "run_at": "2026-07-22T00:00:00+00:00"},
+        "repeat": {"times": 1, "completed": 0},
+    }
+    with patch(
+        "cron.scheduler.begin_job_run_outcome",
+        side_effect=RuntimeError("preflight unavailable"),
+    ), patch("cron.scheduler.claim_dispatch") as dispatch_mock, patch(
+        "cron.scheduler.mark_job_run"
+    ) as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    dispatch_mock.assert_not_called()
+    mark_mock.assert_not_called()
+    assert job["repeat"]["completed"] == 0
+
+
+def test_signed_begin_exception_records_exact_preflight_denial():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "signed-begin-exception",
+        "name": "Signed begin exception",
+        "deliver": "local",
+        "run_claim": None,
+        "fire_claim": {"at": "2026-07-22T00:00:00+00:00", "by": "manual"},
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    with patch(
+        "cron.scheduler.begin_job_run_outcome",
+        side_effect=RuntimeError("claim store unavailable"),
+    ), patch(
+        "cron.scheduler.record_job_run_preflight_denial", return_value=True
+    ) as denial_mock, patch("cron.scheduler.claim_dispatch") as dispatch_mock, patch(
+        "cron.scheduler.mark_job_run"
+    ) as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    denial_mock.assert_called_once_with(
+        job["id"],
+        job_revision="sha256:" + "1" * 64,
+        reason_code="run_outcome_preflight_exception",
+        run_claim=None,
+        fire_claim=job["fire_claim"],
+    )
+    dispatch_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_signed_pre_dispatch_exception_abandons_only_exact_active_claim():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "signed-pre-dispatch-exception",
+        "name": "Signed pre-dispatch exception",
+        "deliver": "local",
+        "run_claim": {"at": "2026-07-22T00:00:00+00:00", "by": "ticker"},
+        "fire_claim": None,
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.begin_job_run_outcome", return_value=claim), patch(
+        "cron.scheduler._cron_run_script_snapshot",
+        side_effect=RuntimeError("snapshot unavailable"),
+    ), patch("cron.scheduler.abandon_job_run_outcome", return_value=True) as abandon_mock, patch(
+        "cron.scheduler.claim_dispatch"
+    ) as dispatch_mock, patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    abandon_mock.assert_called_once_with(
+        job["id"],
+        claim,
+        reason_code="run_outcome_preflight_exception",
+        run_claim=job["run_claim"],
+        fire_claim=None,
+    )
+    dispatch_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_pre_dispatch_cleanup_failure_never_falls_through_to_terminal_write(caplog):
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "pre-dispatch-cleanup-failed",
+        "name": "Pre-dispatch cleanup failed",
+        "deliver": "local",
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.begin_job_run_outcome", return_value=claim), patch(
+        "cron.scheduler._cron_run_script_snapshot",
+        side_effect=RuntimeError("snapshot unavailable"),
+    ), patch(
+        "cron.scheduler.abandon_job_run_outcome",
+        side_effect=RuntimeError("lock unavailable"),
+    ), patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    mark_mock.assert_not_called()
+    assert "failed to persist preflight exception state" in caplog.text
+
+
+def test_dispatch_exception_preserves_ambiguous_claim_state():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "dispatch-ambiguous",
+        "name": "Dispatch ambiguous",
+        "deliver": "local",
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.begin_job_run_outcome", return_value=claim), patch(
+        "cron.scheduler._cron_run_script_snapshot", return_value=(True, None)
+    ), patch(
+        "cron.scheduler.claim_dispatch", side_effect=RuntimeError("commit unknown")
+    ), patch("cron.scheduler.abandon_job_run_outcome") as abandon_mock, patch(
+        "cron.scheduler.record_job_run_preflight_denial"
+    ) as denial_mock, patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    abandon_mock.assert_not_called()
+    denial_mock.assert_not_called()
+    mark_mock.assert_not_called()
+
+
+def test_refused_finite_dispatch_releases_signed_outcome_claim():
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "dispatch-refused",
+        "name": "Dispatch refused",
+        "deliver": "local",
+        "creation_governance_receipt": {
+            "schema_version": "cron-creation-governance/v1",
+            "receipt_id": "sha256:" + "1" * 64,
+        },
+    }
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.claim_dispatch", return_value=False), \
+         patch("cron.scheduler.abandon_job_run_outcome", return_value=True) as abandon_mock, \
+         patch("cron.scheduler.run_job") as run_mock:
+        assert scheduler.run_one_job(job) is True
+
+    abandon_mock.assert_called_once_with(
+        job["id"],
+        claim,
+        run_claim=None,
+        fire_claim=None,
+    )
+    run_mock.assert_not_called()
+
+
+def test_run_job_script_executes_bound_snapshot_not_mutated_path(tmp_path, monkeypatch):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    script = scripts / "task.py"
+    side_effect = tmp_path / "must-not-exist"
+    script.write_text(
+        f"from pathlib import Path\nPath({str(side_effect)!r}).write_text('wrong')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+
+    success, output = scheduler._run_job_script(
+        "task.py",
+        script_snapshot=(
+            b"import sys\n"
+            b"assert sys.argv == [__file__]\n"
+            b"assert __spec__ is None\n"
+            b"assert __loader__.name == '__main__'\n"
+            b"assert __loader__.path == __file__\n"
+            b"print('claimed-snapshot')\n"
+        ),
+    )
+
+    assert success is True
+    assert output == "claimed-snapshot"
+    assert side_effect.exists() is False
+
+    script.write_text("print('mutable-path')\n", encoding="utf-8")
+    success, output = scheduler._run_job_script("task.py")
+    assert success is True
+    assert output == "mutable-path"
+
+    shell = scripts / "task.sh"
+    shell.write_text(f"touch {side_effect}\n", encoding="utf-8")
+    success, output = scheduler._run_job_script(
+        "task.sh",
+        script_snapshot=(
+            b"printf '%s|%s|%s|%s' \"$0\" \"$#\" "
+            b"\"${1-unset}\" \"${BASH_SOURCE[0]-}\"\n"
+        ),
+    )
+    assert success is True
+    assert output == f"{shell}|0|unset|{shell}"
+    assert side_effect.exists() is False
+
+
+def test_materialized_execution_snapshot_rejects_ambiguous_shapes():
+    import cron.scheduler as scheduler
+
+    base = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.py",
+        "script_suffix": ".py",
+        "script_bytes": b"print('ok')\n",
+        "interpreter_path": "/runtime/bin/python",
+        "interpreter_bytes": b"runtime",
+        "support_files": [],
+    }
+    with pytest.raises(ValueError, match="invalid cron script execution snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {**base, "script_name": "../task.py"}
+        ):
+            pass
+    with pytest.raises(ValueError, match="invalid cron support snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {**base, "support_files": ["bad"]}
+        ):
+            pass
+    with pytest.raises(ValueError, match="invalid cron support snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {
+                **base,
+                "support_files": [
+                    {
+                        "root": "unknown",
+                        "path": "task.py",
+                        "content": b"x",
+                        "mode": 0o644,
+                    }
+                ],
+            }
+        ):
+            pass
+    for invalid_mode in (True, "0644", -1, 0o1000):
+        with pytest.raises(ValueError, match="invalid cron support snapshot"):
+            with scheduler._materialized_cron_execution_snapshot(
+                {
+                    **base,
+                    "support_files": [
+                        {
+                            "root": "script_root",
+                            "path": "task.py",
+                            "content": base["script_bytes"],
+                            "mode": invalid_mode,
+                        }
+                    ],
+                }
+            ):
+                pass
+    with pytest.raises(ValueError, match="conflicting cron support snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {
+                **base,
+                "support_files": [
+                    {
+                        "root": "script_root",
+                        "path": "helper.py",
+                        "content": b"one",
+                        "mode": 0o644,
+                    },
+                    {
+                        "root": "script_root",
+                        "path": "helper.py",
+                        "content": b"two",
+                        "mode": 0o644,
+                    },
+                ],
+            }
+        ):
+            pass
+    with pytest.raises(ValueError, match="conflicting cron support snapshot"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {
+                **base,
+                "support_files": [
+                    {
+                        "root": "script_root",
+                        "path": "helper.py",
+                        "content": b"same",
+                        "mode": 0o644,
+                    },
+                    {
+                        "root": "script_root",
+                        "path": "helper.py",
+                        "content": b"same",
+                        "mode": 0o755,
+                    },
+                ],
+            }
+        ):
+            pass
+    with pytest.raises(ValueError, match="script bytes disagree"):
+        with scheduler._materialized_cron_execution_snapshot(
+            {
+                **base,
+                "support_files": [
+                    {
+                        "root": "script_root",
+                        "path": "task.py",
+                        "content": b"other",
+                        "mode": 0o644,
+                    }
+                ],
+            }
+        ):
+            pass
+    with scheduler._materialized_cron_execution_snapshot(
+        {
+            **base,
+            "support_files": [
+                {
+                    "root": "script_root",
+                    "path": "task.py",
+                    "content": base["script_bytes"],
+                    "mode": 0o644,
+                },
+                {
+                    "root": "script_root",
+                    "path": "task.py",
+                    "content": base["script_bytes"],
+                    "mode": 0o644,
+                },
+            ],
+        }
+    ) as (script_path, interpreter_path, roots):
+        assert script_path.read_bytes() == base["script_bytes"]
+        assert interpreter_path.read_bytes() == base["interpreter_bytes"]
+        assert len(roots) == 1
+
+
+def test_materialized_shell_snapshot_uses_captured_extensionless_helper(
+    tmp_path, monkeypatch
+):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "task.sh").write_text("printf wrong\n", encoding="utf-8")
+    (scripts / "helper").write_text("VALUE=wrong\n", encoding="utf-8")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    success, output = scheduler._run_job_script("missing.py")
+    assert success is False
+    assert "not found" in output
+    (scripts / "directory.py").mkdir()
+    success, output = scheduler._run_job_script("directory.py")
+    assert success is False
+    assert "not a file" in output
+
+    bash = Path("/bin/bash")
+    if not bash.is_file():
+        pytest.skip("trusted system Bash is unavailable")
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.sh",
+        "script_suffix": ".sh",
+        "script_bytes": b"printf '%s' \"$(./helper)\"\n",
+        "interpreter_path": str(bash.resolve()),
+        "interpreter_bytes": bash.resolve().read_bytes(),
+        "support_files": [
+            {
+                "root": "script_root",
+                "path": "task.sh",
+                "content": b"printf '%s' \"$(./helper)\"\n",
+                "mode": 0o644,
+            },
+            {
+                "root": "script_root",
+                "path": "helper",
+                "content": b"#!/bin/sh\nprintf claimed\n",
+                "mode": 0o755,
+            },
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.sh", script_snapshot=snapshot)
+    assert success is True, output
+    assert output == "claimed"
+    assert scheduler._trusted_snapshot_shell_interpreter(snapshot) == bash.resolve()
+    assert scheduler._trusted_snapshot_shell_interpreter(
+        {**snapshot, "interpreter_bytes": b"changed"}
+    ) is None
+    untrusted_bash = tmp_path / "untrusted-bash"
+    untrusted_bash.write_bytes(snapshot["interpreter_bytes"])
+    untrusted_bash.chmod(0o755)
+    assert scheduler._trusted_snapshot_shell_interpreter(
+        {**snapshot, "interpreter_path": str(untrusted_bash)}
+    ) is None
+    assert scheduler._trusted_snapshot_shell_interpreter(
+        {**snapshot, "interpreter_path": str(tmp_path / "missing-bash")}
+    ) is None
+    assert scheduler._trusted_snapshot_shell_interpreter(
+        {**snapshot, "interpreter_path": None}
+    ) is None
+
+    (scripts / "task.sh").write_text("printf live\n", encoding="utf-8")
+    success, output = scheduler._run_job_script("task.sh")
+    assert success is True, output
+    assert output == "live"
+
+    monkeypatch.setattr(scheduler.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(scheduler.os.path, "isfile", lambda _path: False)
+    success, output = scheduler._run_job_script(
+        "task.sh", script_snapshot=b"printf unreachable\n"
+    )
+    assert success is False
+    assert "bash not found" in output
+
+
+def test_snapshot_execution_drops_caller_path_and_shell_startup_injection(
+    tmp_path, monkeypatch
+):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    scripts.joinpath("task.sh").write_text("printf live\n", encoding="utf-8")
+    marker = tmp_path / "injected"
+    injected_bin = tmp_path / "caller-bin"
+    injected_bin.mkdir()
+    command_name = "hak_review_path_probe_1453"
+    injected_bin.joinpath(command_name).write_text(
+        f"#!/bin/sh\nprintf injected\ntouch {marker}\n",
+        encoding="utf-8",
+    )
+    injected_bin.joinpath(command_name).chmod(0o755)
+    bash_env = tmp_path / "caller-bash-env"
+    bash_env.write_text(f"touch {marker}\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(injected_bin))
+    monkeypatch.setenv("BASH_ENV", str(bash_env))
+    monkeypatch.setenv(
+        f"BASH_FUNC_{command_name}%%",
+        f"() {{ touch {marker}; }}",
+    )
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    bash = Path("/bin/bash")
+    if not bash.is_file():
+        pytest.skip("trusted system Bash is unavailable")
+    bash = bash.resolve()
+    content = (
+        f"if command -v {command_name} >/dev/null; then {command_name}; fi\n"
+        "if [ -n \"${BASH_ENV-}\" ]; then exit 41; fi\n"
+        "printf safe\n"
+    ).encode()
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.sh",
+        "script_suffix": ".sh",
+        "script_bytes": content,
+        "interpreter_path": str(bash),
+        "interpreter_bytes": bash.read_bytes(),
+        "support_files": [
+            {
+                "root": "script_root",
+                "path": "task.sh",
+                "content": content,
+                "mode": 0o644,
+            }
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.sh", script_snapshot=snapshot)
+
+    assert success is True, output
+    assert output == "safe"
+    assert marker.exists() is False
+
+
+def test_snapshot_execution_drops_caller_pythonpath(tmp_path, monkeypatch):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    scripts.joinpath("task.py").write_text("print('live')\n", encoding="utf-8")
+    injected = tmp_path / "caller-pythonpath"
+    injected.mkdir()
+    injected.joinpath("external_probe.py").write_text(
+        "VALUE = 'injected'\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(injected))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    interpreter = Path(sys.executable).resolve()
+    content = b"import external_probe\nprint(external_probe.VALUE)\n"
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.py",
+        "script_suffix": ".py",
+        "script_bytes": content,
+        "interpreter_path": str(interpreter),
+        "interpreter_bytes": interpreter.read_bytes(),
+        "support_files": [
+            {
+                "root": "script_root",
+                "path": "task.py",
+                "content": content,
+                "mode": 0o644,
+            }
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.py", script_snapshot=snapshot)
+
+    assert success is False
+    assert "external_probe" in output
+
+
+def test_snapshot_execution_disables_python_user_site_startup(tmp_path, monkeypatch):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    scripts.joinpath("task.py").write_text("print('live')\n", encoding="utf-8")
+    marker = tmp_path / "sitecustomize-ran"
+    userbase = tmp_path / "caller-userbase"
+    user_site = (
+        userbase
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    user_site.mkdir(parents=True)
+    user_site.joinpath("sitecustomize.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('injected')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PYTHONUSERBASE", str(userbase))
+    monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    interpreter = Path(sys.executable).resolve()
+    content = b"print('claimed')\n"
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.py",
+        "script_suffix": ".py",
+        "script_bytes": content,
+        "interpreter_path": str(interpreter),
+        "interpreter_bytes": interpreter.read_bytes(),
+        "support_files": [
+            {
+                "root": "script_root",
+                "path": "task.py",
+                "content": content,
+                "mode": 0o644,
+            }
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.py", script_snapshot=snapshot)
+
+    assert success is True, output
+    assert output == "claimed"
+    assert marker.exists() is False
+
+
+def test_snapshot_without_runtime_lib_stays_on_captured_execution_path(
+    tmp_path, monkeypatch
+):
+    import cron.scheduler as scheduler
+
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "task.py").write_text("print('live')\n", encoding="utf-8")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    completed = MagicMock(returncode=0, stdout=b"captured\n", stderr=b"")
+    monkeypatch.setattr(scheduler.subprocess, "run", MagicMock(return_value=completed))
+    snapshot = {
+        "schema_version": "cron-script-execution-snapshot/v1",
+        "script_name": "task.py",
+        "script_suffix": ".py",
+        "script_bytes": b"print('captured')\n",
+        "interpreter_path": str(tmp_path / "runtime" / "bin" / "python"),
+        "interpreter_bytes": b"captured-runtime",
+        "support_files": [
+            {
+                "root": "script_root",
+                "path": "task.py",
+                "content": b"print('captured')\n",
+                "mode": 0o644,
+            }
+        ],
+    }
+
+    success, output = scheduler._run_job_script("task.py", script_snapshot=snapshot)
+    assert success is True
+    assert output == "captured"
+
+
+def test_run_job_routes_no_agent_script_through_optional_snapshot():
+    import cron.scheduler as scheduler
+
+    job = {"id": "no-agent-snapshot", "name": "Snapshot", "no_agent": True, "script": "task.py"}
+    with patch("cron.jobs._apply_cron_runtime_governance"), \
+         patch("cron.scheduler._run_job_script", return_value=(True, "payload")) as script_mock:
+        assert scheduler.run_job(job)[0] is True
+        script_mock.assert_called_once_with("task.py")
+
+        script_mock.reset_mock()
+        assert scheduler.run_job(job, script_snapshot=b"claimed")[0] is True
+        script_mock.assert_called_once_with(
+            "task.py",
+            script_snapshot=b"claimed",
+        )
+
+
+def test_run_one_job_passes_claimed_script_snapshot_to_executor():
+    import cron.scheduler as scheduler
+
+    job = {"id": "snapshot-bound", "name": "Snapshot", "deliver": "local"}
+    claim = {"run_id": "cron-run:" + "2" * 32}
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, b"claimed")), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)) as run_mock, \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._cron_run_outcome_receipt", return_value=None), \
+         patch("cron.scheduler.mark_job_run"):
+        assert scheduler.run_one_job(job) is True
+
+    assert run_mock.call_args.kwargs["script_snapshot"] == b"claimed"
+
+
+def test_run_one_job_persists_failed_receipt_when_terminal_pipeline_raises():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "run-proof-failed", "name": "Run proof", "deliver": "local"}
+    claim = {
+        "schema_version": "cron-run-claim/v1",
+        "profile_id": "profile-custom",
+        "job_id": "run-proof-failed",
+        "job_revision": "sha256:" + "1" * 64,
+        "run_id": "cron-run:" + "2" * 32,
+        "script_artifact_hash": "sha256:" + "6" * 64,
+        "implementation_hash": "sha256:" + "3" * 64,
+        "checkpoint_policy_hash": "sha256:" + "4" * 64,
+    }
+    receipt = {
+        "schema_version": "cron-run-outcome/v1",
+        "profile_id": claim["profile_id"],
+        "job_id": claim["job_id"],
+        "job_revision": claim["job_revision"],
+        "run_id": claim["run_id"],
+        "terminal_state": "failed",
+        "implementation_hash": claim["implementation_hash"],
+        "checkpoint_invariant_hash": "sha256:" + "5" * 64,
+        "delivery_receipt_hash": "sha256:" + "7" * 64,
+    }
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler.save_job_output", side_effect=RuntimeError("disk unavailable")), \
+         patch("cron.scheduler._cron_run_outcome_receipt", return_value=receipt) as receipt_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    receipt_mock.assert_called_once_with(
+        job,
+        success=False,
+        run_outcome_claim=claim,
+        delivery_receipt=None,
+    )
+    mark_mock.assert_called_once_with(
+        "run-proof-failed",
+        False,
+        "disk unavailable",
+        run_outcome_receipt=receipt,
+        run_outcome_claim=claim,
+    )
+
+
+def test_run_one_job_clears_stale_receipt_when_exception_has_no_signed_revision():
+    from cron.scheduler import run_one_job
+
+    job = {"id": "legacy-run-failed", "name": "Legacy run", "deliver": "local"}
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.run_job", side_effect=RuntimeError("model unavailable")), \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert run_one_job(job) is False
+
+    mark_mock.assert_called_once_with("legacy-run-failed", False, "model unavailable")
+
+
+def test_run_one_job_keeps_admission_denial_distinct_from_failed_run_receipt():
+    import cron.scheduler as scheduler
+
+    job = {"id": "run-proof-blocked", "name": "Run proof", "deliver": "local"}
+    admission = {
+        "schema_version": "cron-runtime-admission/v1",
+        "receipt_id": "cron-runtime-admission:" + "a" * 32,
+        "stage": "pre_cron_job_run",
+        "status": "blocked",
+        "reason_code": "job_paused",
+        "state": "paused",
+        "exception_class": "runtime_admission_blocked",
+        "retryable": False,
+        "job_fingerprint": "sha256:" + "b" * 64,
+    }
+    claim = {
+        "schema_version": "cron-run-claim/v1",
+        "profile_id": "profile-custom",
+        "job_id": "run-proof-blocked",
+        "job_revision": "sha256:" + "1" * 64,
+        "run_id": "cron-run:" + "2" * 32,
+        "implementation_hash": "sha256:" + "3" * 64,
+        "checkpoint_policy_hash": "sha256:" + "4" * 64,
+    }
+
+    def denied_run(*_args, **_kwargs):
+        scheduler._runtime_admission_receipt.set(admission)
+        return False, "# denied", "", "Cron job was not run: job_paused."
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", side_effect=denied_run), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+         patch("cron.scheduler._deliver_result", return_value=None), \
+         patch("cron.scheduler._cron_run_outcome_receipt") as outcome_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is True
+
+    outcome_mock.assert_not_called()
+    mark_mock.assert_called_once_with(
+        "run-proof-blocked",
+        False,
+        "Cron job was not run: job_paused.",
+        runtime_admission_receipt=admission,
+        delivery_error=None,
+        run_outcome_claim=claim,
+    )
+
+
+def test_run_one_job_exception_preserves_admission_fact_without_run_receipt():
+    import cron.scheduler as scheduler
+
+    job = {"id": "run-proof-admission-exception", "name": "Run proof", "deliver": "local"}
+    admission = {
+        "schema_version": "cron-runtime-admission/v1",
+        "receipt_id": "cron-runtime-admission:" + "a" * 32,
+        "stage": "pre_cron_job_run",
+        "status": "blocked",
+        "reason_code": "runtime_governance_unavailable",
+        "state": "review_required",
+        "exception_class": "OSError",
+        "retryable": True,
+        "job_fingerprint": "sha256:" + "b" * 64,
+    }
+    claim = {
+        "schema_version": "cron-run-claim/v1",
+        "profile_id": "profile-custom",
+        "job_id": job["id"],
+        "job_revision": "sha256:" + "1" * 64,
+        "run_id": "cron-run:" + "2" * 32,
+        "implementation_hash": "sha256:" + "3" * 64,
+        "checkpoint_policy_hash": "sha256:" + "4" * 64,
+    }
+
+    def raise_after_admission(*_args, **_kwargs):
+        scheduler._runtime_admission_receipt.set(admission)
+        raise RuntimeError("admission pipeline failed")
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
+         patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
+         patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
+         patch("cron.scheduler.run_job", side_effect=raise_after_admission), \
+         patch("cron.scheduler._cron_run_outcome_receipt") as outcome_mock, \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is False
+
+    outcome_mock.assert_not_called()
+    mark_mock.assert_called_once_with(
+        job["id"],
+        False,
+        "admission pipeline failed",
+        runtime_admission_receipt=admission,
+        run_outcome_claim=claim,
+    )
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_run_one_job_interrupted_attempt_never_writes_terminal_outcome(raises):
+    import cron.scheduler as scheduler
+
+    job = {"id": f"interrupted-{raises}", "name": "Interrupted", "deliver": "local"}
+    run_result = RuntimeError("interrupted pipeline") if raises else (True, "# output", "report", None)
+    with patch("cron.scheduler.claim_dispatch", return_value=True), \
+         patch("cron.scheduler.begin_job_run_outcome", return_value=None), \
+         patch("cron.scheduler.run_job", side_effect=run_result if raises else None, return_value=None if raises else run_result), \
+         patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
+         patch("cron.scheduler._consume_interrupted_flag", return_value=True), \
+         patch("cron.scheduler.mark_job_run") as mark_mock:
+        assert scheduler.run_one_job(job) is (not raises)
+
+    mark_mock.assert_not_called()
 
 
 class TestDeliverResultLiveAdapterUnconfirmed:
@@ -4571,7 +6791,16 @@ class TestCronContinuableSurfaceInChannel:
         mock_cfg.platforms = {Platform.SLACK: pconfig}
         return mock_cfg
 
-    def _run_inchannel_delivery(self, extra, adapter, *, mirror_ok=True, origin=None):
+    def _run_inchannel_delivery(
+        self,
+        extra,
+        adapter,
+        *,
+        mirror_ok=True,
+        origin=None,
+        content="Here is today's brief.",
+        outbound_hooks=None,
+    ):
         """Drive _deliver_result down the live-adapter path for a Slack
         channel-origin job with the given ``extra`` config. Returns the
         _open_continuable_cron_thread mock and the mirror_to_session mock."""
@@ -4607,10 +6836,14 @@ class TestCronContinuableSurfaceInChannel:
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("cron.scheduler._open_continuable_cron_thread") as open_thread_mock, \
+             patch(
+                 "cron.scheduler._active_outbound_hooks",
+                 return_value=outbound_hooks or _allowing_boundary_hooks(),
+             ), \
              patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
              patch("gateway.mirror.mirror_to_session", return_value=mirror_ok) as mirror_mock:
             _deliver_result(
-                job, "Here is today's brief.",
+                job, content,
                 adapters={Platform.SLACK: adapter}, loop=loop,
             )
         return open_thread_mock, mirror_mock
@@ -4661,6 +6894,35 @@ class TestCronContinuableSurfaceInChannel:
         assert mirror_mock.call_args[0][0] == "slack"
         assert mirror_mock.call_args[0][1] == "C123"
         assert "Here is today's brief." in mirror_mock.call_args[0][2]
+
+    def test_in_channel_persists_boundary_rewrite_instead_of_raw_output(self):
+        """A projected result must also be the continuation-session truth."""
+        async def rewrite(_event_type, _context):
+            return {
+                "decision": "rewrite",
+                "reason": "safe_projection",
+                "content": "Safe business result.",
+            }
+
+        hooks = HookRegistry()
+        hooks._handlers["outbound:before_send"] = [rewrite]
+        hooks._handler_owners[id(rewrite)] = "outbound-actionable"
+        hooks._handler_capabilities[id(rewrite)] = frozenset({"output-screening"})
+        adapter = self._slack_adapter(supports_inchannel=True)
+
+        _, mirror_mock = self._run_inchannel_delivery(
+            {"cron_continuable_surface": "in_channel"},
+            adapter,
+            content="raw trace and internal path",
+            outbound_hooks=hooks,
+        )
+
+        adapter.send.assert_awaited_once()
+        assert adapter.send.call_args.args[1] == "Safe business result."
+        mirror_mock.assert_called_once()
+        mirrored = mirror_mock.call_args[0][2]
+        assert "Safe business result." in mirrored
+        assert "raw trace and internal path" not in mirrored
 
     def test_in_channel_dm_seeds_dm_session(self):
         """1:1 DM (chat_id starts with 'D'): the flat session is created with
@@ -4822,7 +7084,7 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
         with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("asyncio.run", side_effect=_run_boundary_but_force_transport_fallback), \
              patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
             mock_pool = MagicMock()
             mock_pool_cls.return_value = mock_pool
@@ -4853,7 +7115,7 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
         with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("asyncio.run", side_effect=_run_boundary_but_force_transport_fallback), \
              patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
             mock_pool = MagicMock()
             mock_pool_cls.return_value = mock_pool

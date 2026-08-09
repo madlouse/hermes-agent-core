@@ -45,6 +45,15 @@ except ImportError:  # pragma: no cover - non-POSIX
 pytestmark = pytest.mark.skipif(fcntl is None, reason="flock semantics are POSIX-only")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cron_store(tmp_path):
+    """Override import-time Core paths before any test can mutate cron state."""
+    with jobs_mod.use_cron_store(tmp_path):
+        jobs_mod.ensure_dirs()
+        assert jobs_mod._jobs_lock_file() == tmp_path / "cron" / ".jobs.lock"
+        yield
+
+
 def _hold_jobs_flock(path: Path, release: threading.Event, held: threading.Event):
     """Hold an exclusive flock on *path* from a separate fd until released.
 
@@ -107,7 +116,33 @@ class TestBoundedJobsLock:
         assert time.monotonic() - start < 5
         assert not [r for r in caplog.records if "Timed out" in r.message]
 
+    def test_persisting_path_fails_closed_when_foreign_lock_is_held(self, monkeypatch):
+        job = create_job(name="delivery recovery", schedule="0 7 * * *", prompt="x")
+        jobs_mod.mark_job_run(job["id"], success=True, delivery_error="transient")
+        before = jobs_mod.JOBS_FILE.read_bytes()
+        monkeypatch.setattr(jobs_mod, "_JOBS_LOCK_TIMEOUT_SECONDS", 0.1)
+        release = threading.Event()
+        held = threading.Event()
+        holder = threading.Thread(
+            target=_hold_jobs_flock,
+            args=(jobs_mod._jobs_lock_file(), release, held),
+            daemon=True,
+        )
+        holder.start()
+        assert held.wait(timeout=10), "test holder failed to take the flock"
+        try:
+            with pytest.raises(
+                jobs_mod.CronJobGovernanceError,
+                match="strict jobs lock unavailable",
+            ):
+                jobs_mod.mark_job_delivery_recovered(job["id"])
+            assert jobs_mod.JOBS_FILE.read_bytes() == before
+        finally:
+            release.set()
+            holder.join(timeout=10)
+
     def test_reentrant_nesting_still_works(self):
+        jobs_mod.ensure_dirs()
         with _jobs_lock():
             with _jobs_lock():  # must not deadlock or re-flock
                 pass
@@ -166,6 +201,31 @@ class TestFutureDatedClaims:
 
 
 class TestHonestRunSkipMessages:
+    def test_manual_signed_preflight_uses_refreshed_fire_claim(self):
+        from tools.cronjob_tools import _execute_job_now
+
+        job = create_job(name="signed manual run", schedule="0 7 * * *", prompt="x")
+        job["creation_governance_receipt"] = {
+            "schema_version": "cron-creation-governance/v1",
+            "profile_id": "profile-test",
+            "cron_job_id": job["id"],
+            "receipt_id": "sha256:" + "1" * 64,
+        }
+        job["verification_command"] = "python verify.py"
+        job["verification_command_mode"] = "read_only"
+        save_jobs([job])
+
+        result = _execute_job_now(get_job(job["id"]))
+
+        assert result["claimed"] is True
+        assert result["success"] is False
+        persisted = get_job(job["id"])
+        assert persisted["fire_claim"] is None
+        assert persisted["active_run_outcome_claim"] is None
+        assert persisted["last_runtime_admission_receipt"]["reason_code"] == (
+            "unsupported_verification_contract"
+        )
+
     def test_paused_job_not_reported_as_already_firing(self):
         from tools.cronjob_tools import _execute_job_now
 

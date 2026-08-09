@@ -30,7 +30,7 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
-        m_run.assert_called_once()                       # fired via the shared body
+        m_run.assert_called_once_with(ran)                # fire the claimed snapshot
 
     def test_run_skips_when_claim_lost(self):
         """If the scheduler already holds the fire claim, do NOT double-run."""
@@ -79,3 +79,16 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         assert "boom" in res["error"]
         m_mark.assert_called_once()
+
+    def test_execute_job_now_reports_disappeared_claimed_job(self):
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job") as m_run, \
+             patch("tools.cronjob_tools.get_job", return_value=None):
+            res = _execute_job_now(dict(_JOB))
+
+        assert res == {
+            "claimed": True,
+            "success": False,
+            "error": "Job disappeared after its manual fire claim was committed.",
+        }
+        m_run.assert_not_called()

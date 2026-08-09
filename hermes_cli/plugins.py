@@ -134,6 +134,13 @@ _install_plugin_debug_handler()
 
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
+    # Durable cron create/update authorization. Unlike pre_tool_call, this
+    # fires from cron.jobs inside the jobs.json mutation lock, immediately
+    # before persistence, so direct API/CLI/Blueprint callers cannot bypass it.
+    "pre_cron_job_persist",
+    # Runtime admission runs before both the no_agent script branch and the
+    # normal Agent path, so a stored job cannot bypass its durable binding.
+    "pre_cron_job_run",
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
@@ -1247,6 +1254,10 @@ class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
     def __init__(self) -> None:
+        # Discovery mutates every registry below while cron and gateway workers
+        # may begin at once. Keep publication atomic so a caller never sees a
+        # partially populated hook list.
+        self._registry_lock = threading.RLock()
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
@@ -1281,36 +1292,37 @@ class PluginManager:
         changes or newly-added bundled backends become visible in long-lived
         sessions without requiring a full agent restart.
         """
-        if self._discovered and not force:
-            return
-        if env_var_enabled("HERMES_SAFE_MODE"):
-            logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+        with self._registry_lock:
+            if self._discovered and not force:
+                return
+            if env_var_enabled("HERMES_SAFE_MODE"):
+                logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+                self._discovered = True
+                return
+            if force:
+                self._plugins.clear()
+                self._hooks.clear()
+                self._middleware.clear()
+                self._plugin_tool_names.clear()
+                self._plugin_platform_names.clear()
+                self._cli_commands.clear()
+                self._plugin_commands.clear()
+                self._plugin_skills.clear()
+                self._aux_tasks.clear()
+                self._slack_action_handlers.clear()
+                self._context_engine = None
+            # Set the flag up front as a re-entrancy guard (a plugin's register()
+            # can transitively trigger discovery again), but reset it if the sweep
+            # raises so a failed scan is NOT cached as "discovered with an empty
+            # registry" — callers swallow the exception and would otherwise be
+            # permanently stranded on the early-return above (the "No web provider
+            # configured" class of failures).
             self._discovered = True
-            return
-        if force:
-            self._plugins.clear()
-            self._hooks.clear()
-            self._middleware.clear()
-            self._plugin_tool_names.clear()
-            self._plugin_platform_names.clear()
-            self._cli_commands.clear()
-            self._plugin_commands.clear()
-            self._plugin_skills.clear()
-            self._aux_tasks.clear()
-            self._slack_action_handlers.clear()
-            self._context_engine = None
-        # Set the flag up front as a re-entrancy guard (a plugin's register()
-        # can transitively trigger discovery again), but reset it if the sweep
-        # raises so a failed scan is NOT cached as "discovered with an empty
-        # registry" — callers swallow the exception and would otherwise be
-        # permanently stranded on the early-return above (the "No web provider
-        # configured" class of failures).
-        self._discovered = True
-        try:
-            self._discover_and_load_inner()
-        except BaseException:
-            self._discovered = False
-            raise
+            try:
+                self._discover_and_load_inner()
+            except BaseException:
+                self._discovered = False
+                raise
 
     def _discover_and_load_inner(self) -> None:
         """The actual discovery sweep — see :meth:`discover_and_load`."""
@@ -1908,7 +1920,8 @@ class PluginManager:
         persisted to session DB.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
-        callbacks = self._hooks.get(hook_name, [])
+        with self._registry_lock:
+            callbacks = tuple(self._hooks.get(hook_name, ()))
         results: List[Any] = []
         for cb in callbacks:
             try:
@@ -2025,14 +2038,16 @@ class PluginManager:
 # ---------------------------------------------------------------------------
 
 _plugin_manager: Optional[PluginManager] = None
+_plugin_manager_lock = threading.RLock()
 
 
 def get_plugin_manager() -> PluginManager:
     """Return (and lazily create) the global PluginManager singleton."""
     global _plugin_manager
-    if _plugin_manager is None:
-        _plugin_manager = PluginManager()
-    return _plugin_manager
+    with _plugin_manager_lock:
+        if _plugin_manager is None:
+            _plugin_manager = PluginManager()
+        return _plugin_manager
 
 
 def discover_plugins(force: bool = False) -> None:

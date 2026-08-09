@@ -3564,7 +3564,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled",
+        "authorized_behavior_ref", "implementation_categories", "governance_resume",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -3653,6 +3656,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if body.get("authorized_behavior_ref") is not None:
+                kwargs["authorized_behavior_ref"] = body.get("authorized_behavior_ref")
+            if body.get("implementation_categories") is not None:
+                kwargs["implementation_categories"] = body.get("implementation_categories")
+            if body.get("governance_resume") is not None:
+                kwargs["governance_resume"] = body.get("governance_resume")
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
@@ -3694,7 +3703,8 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
             # Whitelist allowed fields to prevent arbitrary key injection
             sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
-            if not sanitized:
+            governance_resume = sanitized.pop("governance_resume", None)
+            if not sanitized and governance_resume is None:
                 return web.json_response({"error": "No valid fields to update"}, status=400)
             # Validate lengths if present
             if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
@@ -3709,7 +3719,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
-            job = _cron_update(job_id, sanitized)
+            if governance_resume is None:
+                job = _cron_update(job_id, sanitized)
+            else:
+                job = _cron_update(job_id, sanitized, governance_resume=governance_resume)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()

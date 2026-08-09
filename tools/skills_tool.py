@@ -1120,6 +1120,7 @@ def skill_view(
             candidates.append((sd, smd))
 
         for search_dir in all_dirs:
+            direct_match = False
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
             # at the top of the dir).
             direct_path = search_dir / name
@@ -1129,10 +1130,12 @@ def skill_view(
                 and (direct_path / "SKILL.md").exists()
             ):
                 _record(direct_path, direct_path / "SKILL.md")
+                direct_match = True
             elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
                 direct_path.with_suffix(".md")
             ):
                 _record(None, direct_path.with_suffix(".md"))
+                direct_match = True
 
             # Strategy 1b: categorized form for plugin namespace fall-through
             # (e.g., a "myplugin:explore" name with no plugin registered also
@@ -1145,12 +1148,20 @@ def skill_view(
                     and (categorized_path / "SKILL.md").exists()
                 ):
                     _record(categorized_path, categorized_path / "SKILL.md")
+                    direct_match = True
                 elif categorized_path.with_suffix(
                     ".md"
                 ).exists() and not _is_skill_support_path(
                     categorized_path.with_suffix(".md")
                 ):
                     _record(None, categorized_path.with_suffix(".md"))
+                    direct_match = True
+
+            # Fully-qualified Job references are exact paths. Once one is
+            # found, avoid recursively walking the entire skills tree (which
+            # can include large symlinked archives) just to rediscover it.
+            if direct_match and ("/" in name or local_category_name):
+                continue
 
             # Strategy 2: recursive by directory name (catches nested skills
             # like "foundations/runtime/explore-codebase" called by bare name),
@@ -1239,6 +1250,16 @@ def skill_view(
         except Exception:
             pass
         for _td in _trusted_dirs:
+            try:
+                # A Skill may be exposed through a symlink inside the local
+                # skills directory. Trust the visible path before resolving
+                # the link, otherwise project-owned shared Skills are warned
+                # as external even though the Job referenced a local path.
+                skill_md.relative_to(_td)
+                _outside_skills_dir = False
+                break
+            except ValueError:
+                pass
             try:
                 skill_md.resolve().relative_to(_td)
                 _outside_skills_dir = False
@@ -1626,7 +1647,7 @@ def skill_view(
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False, default=str)
 
     except Exception as e:
         return tool_error(str(e), success=False)

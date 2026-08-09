@@ -2746,6 +2746,19 @@ class MCPServerTask:
                 raise
             except Exception as exc:
                 self.session = None
+
+                # AnyIO can surface this precise cleanup failure directly or
+                # wrapped in an ExceptionGroup after a live HTTP MCP session
+                # tears down. It is reconnect noise, not a failed transport
+                # attempt, so it must not consume the retry/parking budget.
+                if self._ready.is_set() and _is_anyio_lock_cleanup_error(exc):
+                    logger.debug(
+                        "MCP server '%s': anyio lock cleanup during reconnect; retrying: %s",
+                        self.name,
+                        exc,
+                    )
+                    continue
+
                 if self._is_recycled_stdio():
                     logger.warning(
                         "MCP server '%s': lazy reconnect after stdio recycle "
@@ -3190,6 +3203,16 @@ def _is_auth_error(exc: BaseException) -> bool:
     except ImportError:
         pass
     return True
+
+
+def _is_anyio_lock_cleanup_error(exc: BaseException) -> bool:
+    """Whether an exception tree is only the known anyio lock cleanup noise."""
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(
+            _is_anyio_lock_cleanup_error(child)
+            for child in exc.exceptions
+        )
+    return type(exc) is RuntimeError and str(exc) == "The current task is not holding this lock"
 
 
 def _handle_auth_error_and_retry(
@@ -4993,14 +5016,16 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(server_names: Optional[List[str]] = None) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
     the ``mcp`` package is not installed (returns empty list).
 
     Idempotent for already-connected servers. If some servers failed on a
-    previous call, only the missing ones are retried.
+    previous call, only the missing ones are retried. ``server_names`` limits
+    discovery to an explicit allowlist; ``None`` preserves legacy all-server
+    behavior for callers that cannot determine an effective dependency scope.
 
     Returns:
         List of all registered MCP tool names.
@@ -5010,8 +5035,14 @@ def discover_mcp_tools() -> List[str]:
         return []
 
     servers = _load_mcp_config()
+    if server_names is not None:
+        requested = {str(name).strip() for name in server_names if str(name).strip()}
+        servers = {name: cfg for name, cfg in servers.items() if name in requested}
     if not servers:
-        logger.debug("No MCP servers configured")
+        logger.debug(
+            "No %sMCP servers configured",
+            "requested " if server_names is not None else "",
+        )
         return []
 
     with _lock:

@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Optional
 
@@ -301,7 +303,13 @@ def cmd_send(args: argparse.Namespace) -> None:
     # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
     # gateway config loader (invoked downstream by send_message_tool and by
     # the channel directory) can see platform credentials and home channels.
+    owner_context = {
+        key: os.environ[key]
+        for key in ("HERMES_HOME", "HERMES_PROFILE_ID")
+        if key in os.environ
+    }
     _load_hermes_env()
+    os.environ.update(owner_context)
 
     # --list short-circuits everything else.
     if getattr(args, "list_targets", False):
@@ -356,7 +364,12 @@ def cmd_send(args: argparse.Namespace) -> None:
         "message": message,
     }
 
-    result = send_message_tool(tool_args)
+    from gateway.hooks import HookRegistry
+
+    outbound_hooks = HookRegistry()
+    with redirect_stdout(sys.stderr):
+        outbound_hooks.discover_and_load()
+    result = send_message_tool(tool_args, outbound_hooks=outbound_hooks)
     exit_code = _emit_result(
         result,
         json_mode=getattr(args, "json", False),
