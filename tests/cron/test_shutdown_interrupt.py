@@ -267,7 +267,9 @@ class TestMarkRunningJobsInterrupted:
             }
 
             assert sched.mark_running_jobs_interrupted("shutdown") == [after["id"]]
-            assert jobs.get_job(after["id"]) is None
+            persisted = jobs.get_job(after["id"])
+            assert persisted["state"] == "completed"
+            assert persisted["active_run_outcome_claim"] is None
 
 
 class TestIsInterrupted:
@@ -534,7 +536,9 @@ class TestRunOneJobHonoursInterruptedFlag:
             assert not run_thread.is_alive()
             assert shutdown_result["value"] == [job["id"]]
             assert run_result["value"] is False
-            assert jobs.get_job(job["id"]) is None
+            persisted = jobs.get_job(job["id"])
+            assert persisted["state"] == "completed"
+            assert persisted["active_run_outcome_claim"] is None
             run_job.assert_not_called()
 
     def test_dispatch_transition_does_not_invert_jobs_and_running_locks(

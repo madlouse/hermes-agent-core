@@ -694,7 +694,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             _heartbeat_thread.start()
 
         try:
-            processed = run_one_job(job)
+            processed = run_one_job(claimed_job)
         finally:
             _heartbeat_stop.set()
             if _heartbeat_thread is not None:

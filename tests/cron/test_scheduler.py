@@ -365,12 +365,6 @@ class TestDeliverResultWrapping:
         adapter = MagicMock()
         loop = MagicMock()
         loop.is_running.return_value = True
-        boundary_decision = MagicMock(
-            transmit=True,
-            decision="allow",
-            content="business result",
-            raw={"decision": "allow"},
-        )
         heartbeat_count = 0
 
         def lose_before_send():
@@ -379,8 +373,7 @@ class TestDeliverResultWrapping:
             if heartbeat_count == 2:
                 raise scheduler.CronRunOutcomeOwnershipLost("ownership lost")
 
-        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision):
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg):
             with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
                 _deliver_result(
                     {
@@ -403,12 +396,6 @@ class TestDeliverResultWrapping:
         pconfig = MagicMock(enabled=True)
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-        boundary_decision = MagicMock(
-            transmit=True,
-            decision="allow",
-            content="business result",
-            raw={"decision": "allow"},
-        )
         heartbeat_count = 0
 
         def lose_during_wait():
@@ -421,7 +408,6 @@ class TestDeliverResultWrapping:
             await asyncio.sleep(3600)
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
              patch("tools.send_message_tool._send_to_platform", side_effect=slow_send), \
              patch("cron.scheduler.asyncio.wait", new=AsyncMock(return_value=(set(), set()))):
             with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
@@ -443,12 +429,6 @@ class TestDeliverResultWrapping:
         pconfig = MagicMock(enabled=True)
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-        boundary_decision = MagicMock(
-            transmit=True,
-            decision="allow",
-            content="business result",
-            raw={"decision": "allow"},
-        )
         wait_count = 0
         heartbeats = []
 
@@ -462,7 +442,6 @@ class TestDeliverResultWrapping:
             return set(tasks), set()
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
              patch("cron.scheduler.asyncio.wait", side_effect=wait_once_then_finish):
             assert _deliver_result(
@@ -485,21 +464,13 @@ class TestDeliverResultWrapping:
         pconfig = MagicMock(enabled=True)
         mock_cfg = MagicMock()
         mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
-        boundary_decision = MagicMock(
-            transmit=True,
-            decision="allow",
-            content="business result",
-            raw={"decision": "allow"},
-        )
-
         def lose_in_fresh_loop(coro):
             coro.close()
             raise scheduler.CronRunOutcomeOwnershipLost("ownership lost")
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
-             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
              patch("cron.scheduler.asyncio.run", side_effect=RuntimeError("running loop")), \
-             patch("gateway.outbound_boundary._run_coro_in_new_loop", side_effect=lose_in_fresh_loop):
+             patch("cron.scheduler._run_coro_in_new_loop", side_effect=lose_in_fresh_loop):
             with pytest.raises(scheduler.CronRunOutcomeOwnershipLost):
                 _deliver_result(
                     {
@@ -3413,12 +3384,13 @@ def test_run_job_routes_no_agent_script_through_optional_snapshot():
     with patch("cron.jobs._apply_cron_runtime_governance"), \
          patch("cron.scheduler._run_job_script", return_value=(True, "payload")) as script_mock:
         assert scheduler.run_job(job)[0] is True
-        script_mock.assert_called_once_with("task.py")
+        script_mock.assert_called_once_with("task.py", workdir=None)
 
         script_mock.reset_mock()
         assert scheduler.run_job(job, script_snapshot=b"claimed")[0] is True
         script_mock.assert_called_once_with(
             "task.py",
+            workdir=None,
             script_snapshot=b"claimed",
         )
 

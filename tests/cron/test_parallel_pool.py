@@ -107,7 +107,7 @@ class TestRunningJobGuard:
         sched._running_job_states.clear()
         sched._interrupted_job_ids.clear()
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(sched, "advance_next_runs", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(sched, "_get_parallel_pool", lambda *_args: RejectingPool())
         monkeypatch.setattr(
             sched,

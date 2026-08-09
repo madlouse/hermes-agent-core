@@ -894,8 +894,11 @@ def test_runtime_governance_precedes_script_and_agent_paths(
     if no_agent:
         job["script"] = "never.py"
 
-    with pytest.raises(CronRuntimeAdmissionError, match="denied before execution"):
-        run_job(job)
+    success, document, response, error = run_job(job)
+    assert success is False
+    assert response == ""
+    assert error == "denied before execution"
+    assert "reason: runtime_denied" in document
 
 
 def test_runtime_mandatory_callback_failure_keeps_provenance(
