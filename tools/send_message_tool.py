@@ -148,6 +148,32 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
+def _is_registered_plugin_platform(platform_name: str) -> bool:
+    """Return whether a non-built-in platform is registered by a plugin."""
+    name = str(platform_name or "").strip().lower()
+    if not name:
+        return False
+    try:
+        from gateway.config import _BUILTIN_PLATFORM_VALUES
+
+        if name in _BUILTIN_PLATFORM_VALUES:
+            return False
+    except Exception:
+        return False
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        pass
+    try:
+        from gateway.platform_registry import platform_registry
+
+        return platform_registry.is_registered(name)
+    except Exception:
+        return False
+
+
 def _display_chat_id(platform_name: str, chat_id: str) -> str:
     """Return a result-safe chat identifier for tool transcripts/log consumers."""
     if platform_name == "signal" and str(chat_id).startswith("group:"):
@@ -796,6 +822,8 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     # XMPP JIDs (user@server or room@conference.server) are explicit
     if platform_name == "xmpp" and "@" in target_ref:
         return target_ref, None, True
+    if _is_registered_plugin_platform(platform_name) and stripped_target:
+        return stripped_target, None, True
     return None, None, False
 
 
