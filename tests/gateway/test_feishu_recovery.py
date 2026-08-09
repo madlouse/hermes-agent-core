@@ -536,6 +536,53 @@ def test_recovered_turn_send_failure_never_completes_history(monkeypatch):
     assert completed == []
 
 
+def test_recovered_text_success_cannot_mask_none_multi_image_receipt(monkeypatch):
+    async def allow(_hooks, context):
+        return SimpleNamespace(
+            transmit=True,
+            content=context["content"],
+            raw={"decision": "allow"},
+            decision="allow",
+            reason="test_output_safe",
+        )
+
+    monkeypatch.setattr("gateway.outbound_boundary.outbound_before_send", allow)
+    adapter = feishu.FeishuAdapter(PlatformConfig())
+    adapter.config.typing_indicator = False
+    adapter.set_message_handler(
+        lambda _event: asyncio.sleep(
+            0,
+            result="business result\n![chart](https://example.test/chart.png)",
+        )
+    )
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="om_text")
+    )
+    adapter.send_multiple_images = AsyncMock(return_value=None)
+    source = SessionSource(
+        platform=Platform.FEISHU, chat_id="oc_chat", user_id="ou_user"
+    )
+    event = MessageEvent(
+        text="recover me", source=source, message_id="om_recovered"
+    )
+
+    async def scenario():
+        event.recovery_delivery = RecoveryDeliveryContext(
+            complete=lambda: pytest.fail("None image receipt completed recovery"),
+            idempotency_key="stable-key",
+            future=asyncio.get_running_loop().create_future(),
+        )
+        await adapter._process_message_background(event, build_session_key(source))
+        return event.recovery_delivery.future.result()
+
+    assert asyncio.run(scenario()) == {
+        "status": "blocked",
+        "reason": "recovered_delivery_failed",
+    }
+    assert adapter.send.await_count == 1
+    assert adapter.send_multiple_images.await_count == 1
+
+
 def test_recovered_turn_blocks_when_durable_completion_fails(monkeypatch):
     async def allow(_hooks, context):
         return SimpleNamespace(
@@ -786,6 +833,70 @@ def test_recovered_final_parts_use_the_reconnected_adapter_owner(
     original.send_document.assert_not_awaited()
     replacement.send.assert_awaited_once()
     replacement.send_document.assert_awaited_once()
+
+
+def test_media_failure_notice_uses_frozen_delivery_adapter_and_stable_part(
+    monkeypatch, tmp_path
+):
+    async def allow(_hooks, context):
+        return SimpleNamespace(
+            transmit=True,
+            content=context["content"],
+            raw={"decision": "allow"},
+            decision="allow",
+            reason="test_output_safe",
+        )
+
+    monkeypatch.setattr("gateway.outbound_boundary.outbound_before_send", allow)
+    media = tmp_path / "failed.ogg"
+    media.write_bytes(b"audio")
+    original = feishu.FeishuAdapter(PlatformConfig())
+    replacement = feishu.FeishuAdapter(PlatformConfig())
+    original.config.typing_indicator = False
+    original.set_message_handler(
+        lambda _event: asyncio.sleep(0, result=f"Done\nMEDIA:{media}")
+    )
+    original.send = AsyncMock(side_effect=AssertionError("stale adapter used"))
+    original._notify_media_delivery_failure = AsyncMock(
+        side_effect=AssertionError("stale adapter notified")
+    )
+    replacement.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="om_text")
+    )
+    replacement.send_voice = AsyncMock(
+        return_value=SendResult(success=False, error="upload rejected")
+    )
+    replacement._notify_media_delivery_failure = AsyncMock(return_value=None)
+    original.gateway_runner = SimpleNamespace(
+        _adapter_for_source=lambda _source: replacement
+    )
+    source = SessionSource(
+        platform=Platform.FEISHU, chat_id="oc_chat", user_id="ou_user"
+    )
+    event = MessageEvent(
+        text="recover me", source=source, message_id="om_recovered"
+    )
+
+    async def scenario():
+        event.recovery_delivery = RecoveryDeliveryContext(
+            complete=lambda: pytest.fail("failed media completed recovery"),
+            idempotency_key="stable-key",
+            future=asyncio.get_running_loop().create_future(),
+        )
+        await original._process_message_background(event, build_session_key(source))
+        return event.recovery_delivery.future.result()
+
+    assert asyncio.run(scenario()) == {
+        "status": "blocked",
+        "reason": "recovered_delivery_failed",
+    }
+    original._notify_media_delivery_failure.assert_not_awaited()
+    notice_kwargs = replacement._notify_media_delivery_failure.await_args.kwargs
+    assert notice_kwargs["metadata"] == {
+        "notify": True,
+        "hermes_delivery_idempotency_key": "stable-key",
+        "hermes_delivery_part": "media:0:failure-notice",
+    }
 
 
 def test_gateway_startup_recovery_hook_awaits_results_and_contains_failure(monkeypatch):

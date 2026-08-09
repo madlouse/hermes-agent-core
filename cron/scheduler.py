@@ -287,6 +287,13 @@ def _resolve_cron_run_timeout_seconds(job: dict, cfg: dict) -> Optional[float]:
     return None
 
 
+def _cron_timeout_cleanup_grace(run_timeout: Optional[float]) -> float:
+    """Reserve a bounded tail of the total deadline for cancellation cleanup."""
+    if run_timeout is None:
+        return 5.0
+    return min(5.0, max(0.05, float(run_timeout) * 0.1))
+
+
 _CRON_ENTRY_TIMEOUT_UNSET = object()
 _CRON_ENTRY_CONFIG_MAX_BYTES = 1024 * 1024
 
@@ -422,6 +429,30 @@ class _CronRunControl:
             if not self._configured or self._timeout is None:
                 return None
             return self._timeout - (time.monotonic() - self.started_at)
+
+    def cleanup_grace(self) -> float:
+        with self._condition:
+            return _cron_timeout_cleanup_grace(
+                self._timeout if self._configured else None
+            )
+
+    def hard_deadline(self) -> Optional[float]:
+        with self._condition:
+            if not self._configured or self._timeout is None:
+                return None
+            return self.started_at + self._timeout
+
+    def provider_deadline(self) -> Optional[float]:
+        hard_deadline = self.hard_deadline()
+        if hard_deadline is None:
+            return None
+        return hard_deadline - self.cleanup_grace()
+
+    def execution_remaining(self) -> Optional[float]:
+        provider_deadline = self.provider_deadline()
+        if provider_deadline is None:
+            return None
+        return provider_deadline - time.monotonic()
 
     def timeout(self) -> Optional[float]:
         with self._condition:
@@ -4450,6 +4481,7 @@ def _run_job_body(
     )
     claim_heartbeat_seconds = _RUN_CLAIM_HEARTBEAT_SECONDS
     last_claim_heartbeat = time.monotonic()
+    request_budget_token = None
 
     def _heartbeat_claims_if_due() -> None:
         nonlocal last_claim_heartbeat
@@ -4962,6 +4994,14 @@ def _run_job_body(
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
         finally:
             _run_control.configure(_resolve_cron_run_timeout_seconds(job, _cfg))
+        provider_deadline = _run_control.hard_deadline()
+        if provider_deadline is not None:
+            from agent.request_budget import set_provider_request_budget
+
+            request_budget_token = set_provider_request_budget(
+                deadline_monotonic=provider_deadline,
+                cleanup_grace_seconds=_run_control.cleanup_grace(),
+            )
         _run_control.raise_if_expired("config loading")
 
         # Fail fast if no model resolved from job / env / config.yaml: an empty
@@ -5277,6 +5317,20 @@ def _run_job_body(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if provider_deadline is not None:
+            configure_budget = getattr(
+                agent, "configure_request_timeout_budget", None
+            )
+            if callable(configure_budget):
+                configure_budget(
+                    deadline_monotonic=provider_deadline,
+                    cleanup_grace_seconds=_run_control.cleanup_grace(),
+                )
+            else:
+                agent._request_timeout_deadline_monotonic = provider_deadline
+                agent._request_timeout_cleanup_grace_seconds = (
+                    _run_control.cleanup_grace()
+                )
         _run_control.set_agent(agent)
         _run_control.raise_if_expired("agent initialization")
         
@@ -5334,7 +5388,11 @@ def _run_job_body(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        _cron_pool = DaemonThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cron-conversation"
+        )
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
@@ -5553,6 +5611,10 @@ def _run_job_body(
         return False, output, "", error_msg
 
     finally:
+        if request_budget_token is not None:
+            from agent.request_budget import reset_provider_request_budget
+
+            reset_provider_request_budget(request_budget_token)
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.
@@ -5726,7 +5788,7 @@ def _run_job_result(
 
     try:
         while True:
-            remaining = control.remaining()
+            remaining = control.execution_remaining()
             if remaining is not None and remaining <= 0:
                 timeout = control.timeout() or 0.0
                 reason = (
@@ -5737,6 +5799,19 @@ def _run_job_result(
                 if collector is not None:
                     collector.revoke()
                 future.cancel()
+                hard_deadline = control.hard_deadline()
+                cleanup_remaining = (
+                    max(0.0, hard_deadline - time.monotonic())
+                    if hard_deadline is not None
+                    else 0.0
+                )
+                if cleanup_remaining > 0.0:
+                    try:
+                        future.result(timeout=cleanup_remaining)
+                    except concurrent.futures.TimeoutError:
+                        pass
+                    except BaseException:
+                        pass
                 logger.error("Job '%s': %s", job_id, reason)
                 output = (
                     f"# Cron Job: {job_name} (FAILED)\n\n"
