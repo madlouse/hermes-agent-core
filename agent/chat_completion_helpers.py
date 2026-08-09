@@ -3060,16 +3060,31 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
 
+        def _stream_timeout_for_attempt() -> _httpx.Timeout:
+            """Build the physical attempt timeout under the caller's budget."""
+            attempt_base_timeout = _base_timeout
+            attempt_read_timeout = _stream_read_timeout
+            attempt_conn_cap = _conn_cap
+            if getattr(agent, "_request_timeout_deadline_monotonic", None) is not None:
+                remaining = agent._remaining_request_timeout_budget()
+                attempt_base_timeout = min(attempt_base_timeout, remaining)
+                attempt_read_timeout = min(attempt_read_timeout, remaining)
+                attempt_conn_cap = min(attempt_conn_cap, remaining)
+            return _httpx.Timeout(
+                connect=attempt_conn_cap,
+                read=attempt_read_timeout,
+                write=attempt_base_timeout,
+                pool=attempt_conn_cap,
+            )
+
         def _open_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
-                "timeout": _httpx.Timeout(
-                    connect=_conn_cap,
-                    read=_stream_read_timeout,
-                    write=_base_timeout,
-                    pool=_conn_cap,
-                ),
+                # Relay invokes this callback once for every physical retry.
+                # Resolve the Cron-owned budget here, not when the logical
+                # stream begins, so a retry cannot restart a stale full timeout.
+                "timeout": _stream_timeout_for_attempt(),
             }
             # Native Gemini rejects OpenAI's usage-streaming extension.
             if not is_native_gemini_base_url(agent.base_url):

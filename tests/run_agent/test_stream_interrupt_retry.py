@@ -161,6 +161,130 @@ class TestStreamInterruptBeforeRetry:
         assert result is not None
         assert attempts[0] == 3
 
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_cron_stream_builder_recaps_every_physical_retry(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        """Real stream timeout construction shrinks all four retry budgets."""
+        import httpx
+
+        monkeypatch.setenv("HERMES_API_TIMEOUT", "1800")
+        monkeypatch.setenv("HERMES_STREAM_READ_TIMEOUT", "120")
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        observed_timeouts = []
+
+        def fail_once_then_succeed(*args, **kwargs):
+            observed_timeouts.append(kwargs["timeout"])
+            if len(observed_timeouts) == 1:
+                raise httpx.ConnectError("retry me")
+            chunks = [
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=0,
+                            delta=SimpleNamespace(
+                                content="ok",
+                                tool_calls=None,
+                                reasoning_content=None,
+                                reasoning=None,
+                            ),
+                            finish_reason="stop",
+                        )
+                    ],
+                    model="test/model",
+                    usage=None,
+                )
+            ]
+            class Stream:
+                response = SimpleNamespace(headers={})
+
+                def __iter__(self):
+                    return iter(chunks)
+
+                def close(self):
+                    return None
+
+            return Stream()
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = fail_once_then_succeed
+        mock_create.return_value = mock_client
+        agent = _make_agent()
+        agent.configure_request_timeout_budget(
+            deadline_monotonic=110.0,
+            cleanup_grace_seconds=0.0,
+        )
+
+        with patch(
+            "agent.request_budget.time.monotonic", side_effect=[108.0, 109.0]
+        ):
+            result = agent._interruptible_streaming_api_call({})
+
+        assert result.choices[0].message.content == "ok"
+        assert len(observed_timeouts) == 2
+        assert [
+            (timeout.connect, timeout.read, timeout.write, timeout.pool)
+            for timeout in observed_timeouts
+        ] == [(2.0, 2.0, 2.0, 2.0), (1.0, 1.0, 1.0, 1.0)]
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_non_cron_stream_builder_keeps_legacy_timeout_components(
+        self, mock_close, mock_create, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_API_TIMEOUT", "1800")
+        monkeypatch.setenv("HERMES_STREAM_READ_TIMEOUT", "120")
+        observed = []
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        index=0,
+                        delta=SimpleNamespace(
+                            content="ok",
+                            tool_calls=None,
+                            reasoning_content=None,
+                            reasoning=None,
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                model="test/model",
+                usage=None,
+            )
+        ]
+
+        def create(*args, **kwargs):
+            observed.append(kwargs["timeout"])
+
+            class Stream:
+                response = SimpleNamespace(headers={})
+
+                def __iter__(self):
+                    return iter(chunks)
+
+                def close(self):
+                    return None
+
+            return Stream()
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = create
+        mock_create.return_value = mock_client
+        agent = _make_agent()
+
+        result = agent._interruptible_streaming_api_call({})
+
+        assert result.choices[0].message.content == "ok"
+        timeout = observed[0]
+        assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (
+            30.0,
+            180.0,
+            1800.0,
+            30.0,
+        )
+
     @pytest.mark.filterwarnings(
         "ignore::pytest.PytestUnhandledThreadExceptionWarning"
     )
