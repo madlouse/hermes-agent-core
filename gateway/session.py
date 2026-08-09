@@ -216,6 +216,11 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Internal and deliberately excluded from to_dict/from_dict. Recovered
+    # history turns must produce one receipt-bearing final delivery instead of
+    # token/interim sends outside the completion boundary.
+    force_final_delivery: bool = False
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other

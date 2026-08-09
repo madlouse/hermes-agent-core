@@ -2050,6 +2050,25 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+@dataclass(frozen=True)
+class RecoveryDeliveryContext:
+    """Transport-neutral completion contract for one recovered inbound turn.
+
+    Core binds the owner and deterministic idempotency namespace before the
+    event enters the ordinary gateway pipeline.  Adapters consume only the
+    delivery key/part metadata and return their normal ``SendResult``.
+    """
+
+    complete: Callable[[], Any]
+    idempotency_key: str
+    future: asyncio.Future
+    profile_id: str = ""
+    profile_home_sha256: str = ""
+    transport_id: str = ""
+    channel_id: str = ""
+    inbound_id: str = ""
+
+
 @dataclass
 class MessageEvent:
     """
@@ -2067,6 +2086,7 @@ class MessageEvent:
     # Original platform data
     raw_message: Any = None
     message_id: Optional[str] = None
+    recovery_delivery: Optional[RecoveryDeliveryContext] = None
 
     # Platform-specific update identifier.  For Telegram this is the
     # ``update_id`` from the PTB Update wrapper; other platforms currently
@@ -3918,7 +3938,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -3933,7 +3953,15 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
-        for image_url, alt_text in images:
+        results: list[SendResult] = []
+        for image_index, (image_url, alt_text) in enumerate(images):
+            image_metadata = metadata
+            if (metadata or {}).get("hermes_delivery_idempotency_key"):
+                image_metadata = dict(metadata or {})
+                base_part = str(image_metadata.get("hermes_delivery_part") or "image")
+                image_metadata["hermes_delivery_part"] = (
+                    f"{base_part}:{image_index}"
+                )
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
             try:
@@ -3948,26 +3976,33 @@ class BasePlatformAdapter(ABC):
                         chat_id=chat_id,
                         image_path=_unquote(image_url[7:]),
                         caption=alt_text if alt_text else None,
-                        metadata=metadata,
+                        metadata=image_metadata,
                     )
                 elif self._is_animation_url(image_url):
                     img_result = await self.send_animation(
                         chat_id=chat_id,
                         animation_url=image_url,
                         caption=alt_text if alt_text else None,
-                        metadata=metadata,
+                        metadata=image_metadata,
                     )
                 else:
                     img_result = await self.send_image(
                         chat_id=chat_id,
                         image_url=image_url,
                         caption=alt_text if alt_text else None,
-                        metadata=metadata,
+                        metadata=image_metadata,
                     )
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                results.append(img_result)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                results.append(SendResult(success=False, error=str(img_err)))
+        failed = next((result for result in results if not result.success), None)
+        if failed is not None:
+            return failed
+        last = results[-1] if results else None
+        return SendResult(success=True, message_id=last.message_id if last else None)
 
     async def send_image(
         self,
@@ -5790,8 +5825,31 @@ class BasePlatformAdapter(ABC):
         delivery_succeeded = False
         last_delivery_result = None
         confirmed_delivery_result = None
+        recovery_delivery_results: list[SendResult] = []
 
-        def _record_delivery(result):
+        async def _settle_recovery_delivery(*, delivered: bool, reason: str) -> None:
+            recovery = event.recovery_delivery
+            if recovery is None or recovery.future.done():
+                return
+            if not delivered:
+                recovery.future.set_result({"status": "blocked", "reason": reason})
+                return
+            try:
+                completed = recovery.complete()
+                if inspect.isawaitable(completed):
+                    await completed
+            except Exception as exc:
+                recovery.future.set_result(
+                    {
+                        "status": "blocked",
+                        "reason": "history_delivery_completion_failed",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                return
+            recovery.future.set_result({"status": "completed"})
+
+        def _record_delivery(result, *, recovery_part: bool = True):
             nonlocal delivery_attempted, delivery_succeeded, last_delivery_result
             nonlocal confirmed_delivery_result
             if result is None:
@@ -5801,6 +5859,16 @@ class BasePlatformAdapter(ABC):
             if getattr(result, "success", False):
                 delivery_succeeded = True
                 confirmed_delivery_result = result
+            if recovery_part and event.recovery_delivery is not None:
+                if isinstance(result, SendResult):
+                    recovery_delivery_results.append(result)
+                else:
+                    recovery_delivery_results.append(
+                        SendResult(
+                            success=bool(getattr(result, "success", False)),
+                            error=str(getattr(result, "error", "") or ""),
+                        )
+                    )
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6034,6 +6102,21 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                recovery = event.recovery_delivery
+                recovery_key = recovery.idempotency_key if recovery is not None else ""
+                if recovery_key:
+                    _final_thread_metadata["hermes_delivery_idempotency_key"] = recovery_key
+
+                def _delivery_metadata(part: str) -> Dict[str, Any]:
+                    if not recovery_key:
+                        return _final_thread_metadata
+                    metadata = dict(_final_thread_metadata)
+                    metadata["hermes_delivery_part"] = part
+                    return metadata
+
+                # Reconnects may replace the adapter while the recovered turn is
+                # running. Resolve one final owner and use it for every part.
+                delivery_adapter = self._final_delivery_adapter(event.source)
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -6097,11 +6180,11 @@ class BasePlatformAdapter(ABC):
                             and text_content[:1024] == text_content
                         ):
                             telegram_tts_caption = text_content
-                        tts_result = await self.play_tts(
+                        tts_result = await delivery_adapter.play_tts(
                             chat_id=event.source.chat_id,
                             audio_path=_tts_path,
                             caption=telegram_tts_caption,
-                            metadata=_final_thread_metadata,
+                            metadata=_delivery_metadata("tts"),
                         )
                         _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
@@ -6125,7 +6208,6 @@ class BasePlatformAdapter(ABC):
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
                 if text_content and not _tts_caption_delivered:
-                    delivery_adapter = self._final_delivery_adapter(event.source)
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
                         delivery_adapter.name,
@@ -6179,7 +6261,7 @@ class BasePlatformAdapter(ABC):
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
+                        metadata=_delivery_metadata("text"),
                     )
                     _record_delivery(result)
                     if _obligation_id is not None:
@@ -6223,14 +6305,16 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        batch_result = await delivery_adapter.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
-                            metadata=_final_thread_metadata,
+                            metadata=_delivery_metadata("remote-image-batch"),
                             human_delay=human_delay,
                         )
+                        _record_delivery(batch_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
 
 
                 # Send extracted media files — route by file type
@@ -6265,14 +6349,16 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        batch_result = await delivery_adapter.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
-                            metadata=_final_thread_metadata,
+                            metadata=_delivery_metadata("local-image-batch"),
                             human_delay=human_delay,
                         )
+                        _record_delivery(batch_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
 
                 if _non_image_media:
                     logger.info(
@@ -6280,16 +6366,16 @@ class BasePlatformAdapter(ABC):
                         self.name,
                         len(_non_image_media),
                     )
-                for media_path, is_voice in _non_image_media:
+                for media_index, (media_path, is_voice) in enumerate(_non_image_media):
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(media_path).suffix.lower()
                         if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            media_result = await self.send_voice(
+                            media_result = await delivery_adapter.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_delivery_metadata(f"media:{media_index}"),
                             )
                         elif ext in _VIDEO_EXTS:
                             logger.info(
@@ -6298,16 +6384,16 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 event.source.chat_id,
                             )
-                            media_result = await self.send_video(
+                            media_result = await delivery_adapter.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_delivery_metadata(f"media:{media_index}"),
                             )
                         else:
-                            media_result = await self.send_document(
+                            media_result = await delivery_adapter.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_delivery_metadata(f"media:{media_index}"),
                             )
 
                         _record_delivery(media_result)
@@ -6321,24 +6407,25 @@ class BasePlatformAdapter(ABC):
                             )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        _record_delivery(SendResult(success=False, error=str(media_err)))
 
                 # Send auto-detected local non-image files as native attachments
-                for file_path in _non_image_local:
+                for file_index, file_path in enumerate(_non_image_local):
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            file_result = await self.send_video(
+                            file_result = await delivery_adapter.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_delivery_metadata(f"local-file:{file_index}"),
                             )
                         else:
-                            file_result = await self.send_document(
+                            file_result = await delivery_adapter.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_delivery_metadata(f"local-file:{file_index}"),
                             )
                         _record_delivery(file_result)
                         if not file_result.success:
@@ -6355,6 +6442,7 @@ class BasePlatformAdapter(ABC):
                             )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        _record_delivery(SendResult(success=False, error=str(file_err)))
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
@@ -6414,6 +6502,18 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            recovery_confirmed = bool(
+                recovery_delivery_results
+                and all(result.success for result in recovery_delivery_results)
+            )
+            await _settle_recovery_delivery(
+                delivered=recovery_confirmed,
+                reason=(
+                    "recovered_delivery_failed"
+                    if recovery_delivery_results
+                    else "recovered_delivery_missing"
+                ),
+            )
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(
@@ -6474,6 +6574,9 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            await _settle_recovery_delivery(
+                delivered=False, reason="recovered_delivery_cancelled"
+            )
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6481,6 +6584,9 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            await _settle_recovery_delivery(
+                delivered=False, reason="recovered_delivery_failed"
+            )
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -6503,6 +6609,9 @@ class BasePlatformAdapter(ABC):
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
         finally:
+            await _settle_recovery_delivery(
+                delivered=False, reason="recovered_delivery_not_confirmed"
+            )
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.
