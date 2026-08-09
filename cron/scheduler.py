@@ -44,7 +44,11 @@ from typing import Any, Callable, List, Optional
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     _expand_env_vars,
@@ -659,6 +663,7 @@ from cron.jobs import (
     CronCreationProfileBindingError,
     cron_creation_profile_identity,
     get_due_jobs,
+    get_cron_profile_home,
     heartbeat_operational_notice_delivery,
     heartbeat_job_run_outcome,
     heartbeat_run_claim,
@@ -666,6 +671,7 @@ from cron.jobs import (
     mark_operational_notice_delivery,
     record_job_run_preflight_denial,
     save_job_output,
+    use_cron_store,
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
@@ -700,10 +706,11 @@ _OPERATIONAL_NOTICE_FIELDS = {
 class _OperationalNoticeHeartbeat:
     """Keep one notice owner alive across screening, outbox, and transport."""
 
-    def __init__(self, job_id: str, key: str, owner: str):
+    def __init__(self, job_id: str, key: str, owner: str, profile_home: Path):
         self.job_id = job_id
         self.key = key
         self.owner = owner
+        self.profile_home = profile_home
         self.request_id = ""
         self._stop = threading.Event()
         self._lost = threading.Event()
@@ -714,13 +721,14 @@ class _OperationalNoticeHeartbeat:
         )
 
     def _pulse(self) -> None:
-        result = heartbeat_operational_notice_delivery(
-            self.job_id,
-            self.key,
-            claim_owner=self.owner,
-            transport_request_id=self.request_id,
-            lease_seconds=_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
-        )
+        with _operational_notice_profile_scope(self.profile_home):
+            result = heartbeat_operational_notice_delivery(
+                self.job_id,
+                self.key,
+                claim_owner=self.owner,
+                transport_request_id=self.request_id,
+                lease_seconds=_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
+            )
         if result.get("status") != "claimed":
             self._lost.set()
 
@@ -750,6 +758,17 @@ class _OperationalNoticeHeartbeat:
             self._thread.join(timeout=max(_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS * 2, 1.0))
 
 
+@contextlib.contextmanager
+def _operational_notice_profile_scope(profile_home: Path):
+    """Pin notice state and profile-scoped dependencies to one owning home."""
+    token = set_hermes_home_override(profile_home)
+    try:
+        with use_cron_store(profile_home):
+            yield
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _ready_operational_notice(raw: Any) -> dict | None:
     """Return a strictly shaped, safe plan from an already denied decision."""
     notice = raw.get("operational_notice") if isinstance(raw, dict) else None
@@ -775,6 +794,31 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
     notice = _ready_operational_notice(raw_decision)
     if notice is None:
         return "not_available"
+    try:
+        owning_profile_home = get_cron_profile_home().resolve(strict=True)
+        if not owning_profile_home.is_dir():
+            return "profile_unverified"
+    except (OSError, RuntimeError):
+        return "profile_unverified"
+    with _operational_notice_profile_scope(owning_profile_home):
+        return _deliver_operational_notice_in_profile(
+            job,
+            notice,
+            owning_profile_home=owning_profile_home,
+            adapters=adapters,
+            loop=loop,
+        )
+
+
+def _deliver_operational_notice_in_profile(
+    job: dict,
+    notice: dict,
+    *,
+    owning_profile_home: Path,
+    adapters=None,
+    loop=None,
+) -> str:
+    """Deliver with every stateful operation pinned to ``owning_profile_home``."""
     try:
         profile_id = cron_creation_profile_identity(job)["profile_id"]
     except CronCreationProfileBindingError as exc:
@@ -806,6 +850,7 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
         str(job.get("id") or ""),
         notice["idempotency_key"],
         claim_owner,
+        owning_profile_home,
     )
     try:
         heartbeat.start()
@@ -831,7 +876,7 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
             platform=route["transport_id"],
             chat_id=route["channel_id"],
             profile_id=profile_id,
-            profile_path=str(_get_hermes_home()),
+            profile_path=str(owning_profile_home),
             producer_id="cron-operational-notice",
             job_id=str(job.get("id") or ""),
             target=target,
@@ -913,7 +958,7 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
 
             verification = verify_transport_receipt(
                 transport_request,
-                home=_get_hermes_home(),
+                home=owning_profile_home,
             )
         else:
             verification = {"verified": False, "status": "not_bound"}

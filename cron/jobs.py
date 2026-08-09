@@ -191,6 +191,11 @@ def get_cron_output_dir() -> Path:
     return _current_cron_store().output_dir
 
 
+def get_cron_profile_home() -> Path:
+    """Return the canonical profile home owning the active cron store."""
+    return _current_cron_store().cron_dir.parent.expanduser().resolve(strict=False)
+
+
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
 # the cron inactivity timeout is disabled (HERMES_CRON_TIMEOUT=0 → unlimited),
 # in which case no finite run bound exists to derive from. Also acts as the

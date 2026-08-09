@@ -294,6 +294,106 @@ def test_cross_original_lease_two_thread_probe_converges_confirmed_sent(
     assert json.loads(payload)["status"] == "confirmed"
 
 
+def test_notice_freezes_scoped_store_across_heartbeat_and_reconciliation(
+    tmp_path, monkeypatch
+):
+    process_home = tmp_path / "process-home-a"
+    owning_profile = tmp_path / "scoped-store-b"
+    process_home.mkdir()
+    owning_profile.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
+    monkeypatch.delenv("HERMES_PROFILE_ID", raising=False)
+    monkeypatch.setattr(scheduler, "_active_outbound_hooks", lambda: object())
+
+    def allow(_hooks, context):
+        assert Path(context["profile_path"]) == owning_profile.resolve()
+        return BoundaryDecision(
+            transmit=True,
+            decision="allow",
+            content=str(context["content"]),
+            reason="operational_notice_revalidated",
+            raw={"decision": "allow", "reason": "operational_notice_revalidated"},
+        )
+
+    monkeypatch.setattr("gateway.outbound_boundary.outbound_before_send_sync", allow)
+    pconfig = SimpleNamespace(enabled=True, token="test-token", extra={})
+    config = SimpleNamespace(
+        platforms={Platform.FEISHU: pconfig},
+        get_home_channel=lambda _platform: None,
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+    monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+    monkeypatch.setattr(
+        "gateway.mirror.mirror_to_session", lambda *_args, **_kwargs: False
+    )
+
+    epoch = [1000]
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+    provider_calls = []
+    monkeypatch.setattr(jobs.time, "time", lambda: epoch[0])
+    monkeypatch.setattr(scheduler, "_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS", 10)
+    monkeypatch.setattr(scheduler, "_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS", 0.01)
+
+    async def provider_send(*args, **kwargs):
+        provider_calls.append((args, kwargs))
+        provider_started.set()
+        while not release_provider.is_set():
+            await asyncio.sleep(0.005)
+        return {"success": True, "message_id": "om-scoped-store-b"}
+
+    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    with jobs.use_cron_store(owning_profile):
+        jobs.save_jobs([_job(profile_home=owning_profile)])
+
+    results = []
+
+    def deliver():
+        with jobs.use_cron_store(owning_profile):
+            results.append(
+                scheduler._deliver_operational_notice(
+                    _job(profile_home=owning_profile),
+                    {"operational_notice": _notice()},
+                )
+            )
+
+    first = threading.Thread(target=deliver)
+    first.start()
+    assert provider_started.wait(timeout=5)
+    epoch[0] = 1011
+
+    heartbeat_advanced = False
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with jobs.use_cron_store(owning_profile):
+            receipt = jobs.get_job("job-1")["operational_notice_receipts"][
+                _notice()["idempotency_key"]
+            ]
+        if receipt["claim_heartbeat_at_epoch"] >= 1011:
+            heartbeat_advanced = True
+            break
+        time.sleep(0.01)
+    assert heartbeat_advanced is True
+
+    second = threading.Thread(target=deliver)
+    second.start()
+    second.join(timeout=5)
+    release_provider.set()
+    first.join(timeout=5)
+
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert sorted(results) == ["claimed", "sent"]
+    assert len(provider_calls) == 1
+    with jobs.use_cron_store(owning_profile):
+        stored = jobs.get_job("job-1")["operational_notice_receipts"]
+    assert stored[_notice()["idempotency_key"]]["status"] == "sent"
+    assert not (process_home / "cron").exists()
+    assert not (process_home / "transport-outbox.sqlite3").exists()
+    assert (owning_profile / "transport-outbox.sqlite3").is_file()
+
+
 def test_operational_notice_claims_are_not_capacity_evicted(operational_profile):
     with jobs.use_cron_store(operational_profile):
         for index in range(1000):
