@@ -415,7 +415,8 @@ _CRON_RESUME_SCHEMA = "cron-persist-resume/v1"
 _CRON_RESUME_SCHEMA_V2 = "cron-persist-resume/v2"
 _CRON_RECOVERY_SCHEMA = "cron-persist-recovery/v1"
 _CRON_RECOVERY_REGISTRATION_SCHEMA = "cron-persist-recovery-registration/v1"
-_CRON_RECOVERY_DISPATCH_ACK_SCHEMA = "cron-persist-recovery-dispatch-ack/v1"
+_CRON_RECOVERY_DISPATCH_ACK_SCHEMA = "cron-persist-recovery-dispatch-ack/v2"
+_CRON_RECOVERY_DURABLE_CAS_SCHEMA = "cron-persist-recovery-durable-cas/v1"
 _CRON_RESUME_RECEIPT_FIELD = "cron_persist_resume_receipt"
 _CRON_RESUME_PACKAGE_FIELDS = frozenset({
     "schema_version",
@@ -611,6 +612,29 @@ def _cron_candidate_definition_hash(candidate: Dict[str, Any]) -> str:
     return _cron_stable_hash(_cron_governance_material(candidate))
 
 
+def cron_persist_recovery_dispatch_key(
+    recovery_id: str,
+    issuer: Dict[str, Any],
+    notification_effect: Dict[str, Any],
+) -> str:
+    """Bind one stable HAK/outbox idempotency key to recovery issuer and effect."""
+    if (
+        not str(recovery_id or "").strip()
+        or not isinstance(issuer, dict)
+        or set(issuer) != {"id", "version"}
+        or not str(issuer.get("id") or "").strip()
+        or not str(issuer.get("version") or "").strip()
+        or not isinstance(notification_effect, dict)
+    ):
+        raise ValueError("invalid Cron recovery dispatch key material")
+    return _cron_stable_hash({
+        "schema_version": _CRON_RECOVERY_REGISTRATION_SCHEMA,
+        "recovery_id": recovery_id,
+        "issuer": copy.deepcopy(issuer),
+        "effect_hash": _cron_stable_hash(notification_effect),
+    })
+
+
 def _active_cron_profile_identity() -> Dict[str, str]:
     """Derive profile name and canonical-home digest from the Cron store path."""
     home = _active_profile_home()
@@ -798,6 +822,7 @@ def _validated_recovery_blocker(
         "pending_id",
         "frame_id",
         "effect_hash",
+        "dispatch_key",
     }
     valid = (
         isinstance(registration, dict)
@@ -815,6 +840,12 @@ def _validated_recovery_blocker(
         and registration.get("frame_id") == frame.get("frame_id")
         and isinstance(effect, dict)
         and registration.get("effect_hash") == _cron_stable_hash(effect)
+        and registration.get("dispatch_key")
+        == cron_persist_recovery_dispatch_key(
+            str(recovery_context.get("recovery_id") or ""),
+            issuer,
+            effect,
+        )
         and "post_persist_effects" not in blocked
     )
     if not valid:
@@ -1583,15 +1614,31 @@ def _valid_recovery_dispatch_ack(
 ) -> bool:
     registration = claim.get("registration")
     issuer = registration.get("issuer") if isinstance(registration, dict) else None
+    durable_cas = result.get("durable_cas") if isinstance(result, dict) else None
     return bool(
         isinstance(result, dict)
         and set(result)
-        == {"schema_version", "issuer", "recovery_id", "claim_id", "disposition"}
+        == {
+            "schema_version",
+            "issuer",
+            "recovery_id",
+            "dispatch_key",
+            "disposition",
+            "durable_cas",
+        }
         and result.get("schema_version") == _CRON_RECOVERY_DISPATCH_ACK_SCHEMA
         and result.get("issuer") == issuer
         and result.get("recovery_id") == claim.get("recovery_id")
-        and result.get("claim_id") == claim.get("claim_id")
-        and result.get("disposition") == "accepted"
+        and result.get("dispatch_key") == claim.get("dispatch_key")
+        and result.get("disposition") == "durably_accepted"
+        and isinstance(durable_cas, dict)
+        and set(durable_cas)
+        == {"schema_version", "dispatch_key", "owner_id", "cas_version"}
+        and durable_cas.get("schema_version") == _CRON_RECOVERY_DURABLE_CAS_SCHEMA
+        and durable_cas.get("dispatch_key") == claim.get("dispatch_key")
+        and bool(str(durable_cas.get("owner_id") or "").strip())
+        and isinstance(durable_cas.get("cas_version"), int)
+        and durable_cas.get("cas_version") >= 1
     )
 
 
@@ -1605,25 +1652,71 @@ def _dispatch_claimed_cron_recovery_effects(
     from cron.persist_recovery import (
         CronPersistRecoveryStoreError,
         complete_recovery_dispatch,
+        heartbeat_recovery_dispatch,
         release_recovery_dispatch,
     )
 
     for claim in claims:
         acknowledged = False
+        heartbeat_stop = threading.Event()
+        heartbeat_lost = threading.Event()
+        heartbeat_interval = max(
+            min(float(claim.get("lease_seconds") or 30.0) / 3.0, 5.0),
+            0.05,
+        )
+
+        def maintain_claim() -> None:
+            while not heartbeat_stop.wait(heartbeat_interval):
+                try:
+                    alive = heartbeat_recovery_dispatch(
+                        _current_cron_store().cron_dir,
+                        str(claim["recovery_id"]),
+                        str(claim["claim_id"]),
+                        int(claim["fence_token"]),
+                        profile_home=_active_profile_home(),
+                        lease_seconds=float(claim["lease_seconds"]),
+                    )
+                except CronPersistRecoveryStoreError:
+                    logger.warning(
+                        "Cron resume recovery dispatch heartbeat failed",
+                        exc_info=True,
+                    )
+                    alive = False
+                if not alive:
+                    heartbeat_lost.set()
+                    return
+
+        heartbeat_thread: Optional[threading.Thread] = None
         try:
             from hermes_cli.plugins import discover_plugins, invoke_hook
 
             discover_plugins()
+            if not heartbeat_recovery_dispatch(
+                _current_cron_store().cron_dir,
+                str(claim["recovery_id"]),
+                str(claim["claim_id"]),
+                int(claim["fence_token"]),
+                profile_home=_active_profile_home(),
+                lease_seconds=float(claim["lease_seconds"]),
+            ):
+                heartbeat_lost.set()
+                raise CronPersistRecoveryStoreError(
+                    "Cron resume recovery dispatch claim was fenced before observer entry."
+                )
+            heartbeat_thread = threading.Thread(
+                target=maintain_claim,
+                name="cron-recovery-dispatch-heartbeat",
+                daemon=True,
+            )
+            heartbeat_thread.start()
             results = invoke_hook(
                 "post_cron_job_persist",
                 operation=operation,
                 notification_effect=copy.deepcopy(claim["notification_effect"]),
                 recovery_registration=copy.deepcopy(claim["registration"]),
-                recovery_dispatch_claim={
+                recovery_dispatch={
                     "recovery_id": claim["recovery_id"],
-                    "claim_id": claim["claim_id"],
-                    "claimed_at": claim["claimed_at"],
-                    "claim_expires_at": claim["claim_expires_at"],
+                    "dispatch_key": claim["dispatch_key"],
                 },
             )
             acknowledgements = [
@@ -1631,19 +1724,24 @@ def _dispatch_claimed_cron_recovery_effects(
                 for result in results
                 if _valid_recovery_dispatch_ack(result, claim)
             ]
-            acknowledged = len(acknowledgements) == 1
+            acknowledged = len(acknowledgements) == 1 and not heartbeat_lost.is_set()
         except Exception:
             logger.warning(
                 "post_cron_job_persist recovery observer failed after rejected %s",
                 operation,
                 exc_info=True,
             )
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=max(heartbeat_interval * 2.0, 0.2))
         try:
             if acknowledged:
                 complete_recovery_dispatch(
                     _current_cron_store().cron_dir,
                     str(claim["recovery_id"]),
                     str(claim["claim_id"]),
+                    int(claim["fence_token"]),
                     profile_home=_active_profile_home(),
                 )
             else:
@@ -1651,6 +1749,7 @@ def _dispatch_claimed_cron_recovery_effects(
                     _current_cron_store().cron_dir,
                     str(claim["recovery_id"]),
                     str(claim["claim_id"]),
+                    int(claim["fence_token"]),
                     profile_home=_active_profile_home(),
                 )
         except CronPersistRecoveryStoreError:
