@@ -14,6 +14,7 @@ import time
 
 from agent.redact import redact_sensitive_text
 from agent.secret_scope import get_secret
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -507,16 +508,6 @@ def _handle_send(args, *, after_send=None):
 
     from gateway.platforms.base import BasePlatformAdapter
 
-    # Capture [[as_document]] directive before extract_media strips it.
-    # Image-extension files in this batch will route through send_document
-    # instead of send_photo so the original bytes survive (e.g. info-graph
-    # JPGs where Telegram's sendPhoto recompresses to 1280px).
-    force_document_attachments = "[[as_document]]" in message
-
-    media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
-
     used_home_channel = False
     if not chat_id:
         home = config.get_home_channel(platform)
@@ -560,6 +551,83 @@ def _handle_send(args, *, after_send=None):
             chat_id = _resolved
 
     trusted_request = args.get("transport_request")
+    try:
+        from gateway.outbound_boundary import (
+            build_outbound_context,
+            outbound_after_send_sync,
+            outbound_before_send_sync,
+            send_result_payload,
+        )
+
+        # A trusted transport request is the ownership handoff from an external
+        # policy owner such as HAK. Core must not reload that owner's hooks in a
+        # standalone CLI process; it binds the exact screened content to the
+        # durable request/receipt instead. Ordinary model-tool sends require a
+        # capable in-process screening hook and fail closed when it is absent.
+        externally_screened = trusted_request is not None
+        outbound_hooks = None
+        if not externally_screened:
+            try:
+                from gateway.run import _gateway_runner_ref
+
+                runner = _gateway_runner_ref()
+                outbound_hooks = (
+                    getattr(runner, "hooks", None) if runner is not None else None
+                )
+            except Exception:
+                outbound_hooks = None
+
+        boundary_context = build_outbound_context(
+            source_kind="send_message",
+            content=message,
+            platform=platform_name,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            profile_id=str(args.get("profile_id") or ""),
+            profile_path=str(get_hermes_home()),
+            producer_id="send_message",
+            target={
+                "transport_id": platform_name,
+                "channel_id": chat_id,
+                "thread_id": thread_id or "",
+            },
+            action_spec=args.get("action_spec"),
+            action_specs=args.get("action_specs"),
+            actionability=args.get("actionability"),
+            gate_mode=args.get("actionable_gate_mode"),
+            decision_route=args.get("decision_route"),
+            result_route=args.get("result_route"),
+            boundary_enabled_value=not externally_screened,
+            output_screening_required=not externally_screened,
+            externally_screened=externally_screened,
+            looks_actionable=False if externally_screened else None,
+        )
+        boundary_decision = outbound_before_send_sync(
+            outbound_hooks,
+            boundary_context,
+        )
+        boundary_context["before_send_decision"] = boundary_decision.raw
+        if not boundary_decision.transmit:
+            return json.dumps({
+                "success": False,
+                "error": (
+                    f"outbound boundary {boundary_decision.decision}: "
+                    f"{boundary_decision.reason}"
+                ),
+                "boundary_decision": boundary_decision.raw,
+            })
+
+        screened_message = boundary_decision.content
+        force_document_attachments = "[[as_document]]" in screened_message
+        media_files, cleaned_message = BasePlatformAdapter.extract_media(
+            screened_message
+        )
+        media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+        boundary_context["content"] = cleaned_message
+        mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
+    except Exception as exc:
+        return json.dumps(_error(f"Outbound boundary failed: {exc}"))
+
     trusted_commit = None
     if trusted_request is not None:
         try:
@@ -669,6 +737,27 @@ def _handle_send(args, *, after_send=None):
                         warnings = list(result.get("warnings", []))
                         warnings.append(f"after-send callback failed: {exc}")
                         result["warnings"] = warnings
+        if isinstance(result, dict) and result.get("success"):
+            try:
+                boundary_send_payload = send_result_payload(result)
+                outbound_after_send_sync(
+                    outbound_hooks,
+                    {
+                        **boundary_context,
+                        "send_result": boundary_send_payload,
+                        "source_outbox_id": (
+                            boundary_send_payload.get("outbox_id")
+                            or boundary_send_payload.get("message_id")
+                            or boundary_send_payload.get("id")
+                            or ""
+                        ),
+                        "success": True,
+                    },
+                )
+            except Exception as exc:
+                warnings = list(result.get("warnings", []))
+                warnings.append(f"outbound after-send audit failed: {exc}")
+                result["warnings"] = warnings
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
