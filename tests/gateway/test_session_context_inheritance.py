@@ -32,11 +32,13 @@ import pytest
 
 import gateway.session_context as sc
 from gateway.session_context import (
+    _CRON_AUTH_VAR_MAP,
     _SESSION_ASYNC_DELIVERY,
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
     reset_session_vars,
+    scoped_cron_authorization,
     set_session_vars,
 )
 from tools.environments.local import _make_run_env
@@ -200,3 +202,33 @@ def test_reset_session_vars_closes_async_delivery_leak():
     )
 
 
+def test_cron_authorization_is_in_process_only_and_stack_safe(monkeypatch):
+    """Process env cannot forge authority and subprocesses never inherit it."""
+    from gateway.session_context import get_session_env
+
+    auth_name = "HERMES_CRON_JOB_ID"
+    monkeypatch.setenv(auth_name, "forged-process-job")
+    _CRON_AUTH_VAR_MAP[auth_name].set(_UNSET)
+
+    assert get_session_env(auth_name) == ""
+    assert auth_name not in _make_run_env({})
+
+    with scoped_cron_authorization({auth_name: "outer-job"}):
+        assert get_session_env(auth_name) == "outer-job"
+        with scoped_cron_authorization({auth_name: "inner-job"}):
+            assert get_session_env(auth_name) == "inner-job"
+            assert auth_name not in _make_run_env({})
+        assert get_session_env(auth_name) == "outer-job"
+
+    assert get_session_env(auth_name) == ""
+
+
+def test_completed_cron_scope_revokes_already_copied_context():
+    """A timed-out worker cannot keep using an authorization snapshot."""
+    from gateway.session_context import get_session_env
+
+    with scoped_cron_authorization({"HERMES_CRON_JOB_ID": "bounded-job"}):
+        copied = copy_context()
+        assert copied.run(get_session_env, "HERMES_CRON_JOB_ID") == "bounded-job"
+
+    assert copied.run(get_session_env, "HERMES_CRON_JOB_ID") == ""

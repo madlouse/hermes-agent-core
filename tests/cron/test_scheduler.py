@@ -9,7 +9,19 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import (
+    SILENT_MARKER,
+    _build_job_prompt,
+    _deliver_result,
+    _merge_mcp_into_per_job_toolsets,
+    _resolve_cron_enabled_toolsets,
+    _resolve_cron_max_iterations,
+    _resolve_cron_run_timeout_seconds,
+    _resolve_delivery_target,
+    _resolve_origin,
+    _send_media_via_adapter,
+    run_job,
+)
 from gateway.hooks import HookRegistry
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
@@ -85,6 +97,31 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestCronExecutionBudget:
+    def test_turn_budget_precedence_and_validation(self):
+        cfg = {"cron": {"max_turns": 16}, "agent": {"max_turns": 90}}
+        assert _resolve_cron_max_iterations({"max_turns": 8}, cfg) == 8
+        assert _resolve_cron_max_iterations({}, cfg) == 16
+        assert _resolve_cron_max_iterations({}, {"agent": {"max_turns": 45}}) == 45
+        assert _resolve_cron_max_iterations({}, {}) == 90
+        assert _resolve_cron_max_iterations(
+            {"max_turns": True}, {"cron": {"max_turns": -1}}
+        ) == 90
+
+    def test_total_runtime_budget_precedence_and_opt_out(self):
+        cfg = {"cron": {"run_timeout_seconds": 180}}
+        assert _resolve_cron_run_timeout_seconds(
+            {"run_timeout_seconds": 30}, cfg
+        ) == 30
+        assert _resolve_cron_run_timeout_seconds({}, cfg) == 180
+        assert _resolve_cron_run_timeout_seconds(
+            {"run_timeout_seconds": 0}, cfg
+        ) is None
+        assert _resolve_cron_run_timeout_seconds(
+            {"run_timeout_seconds": True}, {}
+        ) is None
 
 
 class TestResolveOrigin:
@@ -505,6 +542,53 @@ class TestDeliverResultWrapping:
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""
 
+    def test_confirmed_delivery_survives_after_send_audit_failure(self):
+        """An after-send audit fault cannot trigger a duplicate fallback send."""
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        future = MagicMock()
+        future.result.return_value = MagicMock(success=True, message_id="sent-1")
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return future
+
+        platform_config = MagicMock(enabled=True)
+        gateway_config = MagicMock()
+        gateway_config.platforms = {Platform.TELEGRAM: platform_config}
+        standalone_send = AsyncMock(return_value={"success": True})
+        job = {
+            "id": "after-send-audit-job",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch(
+            "gateway.config.load_gateway_config", return_value=gateway_config
+        ), patch(
+            "cron.scheduler.load_config",
+            return_value={"cron": {"wrap_response": False}},
+        ), patch(
+            "asyncio.run_coroutine_threadsafe", side_effect=fake_schedule
+        ), patch(
+            "gateway.outbound_boundary.outbound_after_send_sync",
+            side_effect=RuntimeError("audit unavailable"),
+        ), patch(
+            "tools.send_message_tool._send_to_platform", new=standalone_send
+        ):
+            result = _deliver_result(
+                job,
+                "confirmed report",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        standalone_send.assert_not_awaited()
+
     def test_returns_error_when_platform_disabled(self):
         from gateway.config import Platform
 
@@ -572,6 +656,181 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+
+    def test_parallel_jobs_isolate_and_cleanup_authorization_context(
+        self, tmp_path, monkeypatch
+    ):
+        import concurrent.futures
+        import threading
+
+        from gateway.session_context import _CRON_AUTH_VAR_MAP, get_session_env
+        from tools.environments.local import _make_run_env
+
+        auth_names = tuple(_CRON_AUTH_VAR_MAP)
+        barrier = threading.Barrier(2, timeout=5)
+        seen = {}
+        caller_after = {}
+        monkeypatch.setenv("HERMES_MODEL", "test-model")
+        for name in auth_names:
+            monkeypatch.setenv(name, f"forged-{name}")
+
+        class FakeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, prompt):
+                job_id = get_session_env("HERMES_CRON_JOB_ID")
+                seen[job_id] = {
+                    "context": {name: get_session_env(name) for name in auth_names},
+                    "exported": {name: _make_run_env({}).get(name) for name in auth_names},
+                }
+                barrier.wait()
+                if job_id == "failed-job":
+                    raise RuntimeError("expected failure")
+                return {"final_response": "ok"}
+
+            def close(self):
+                pass
+
+        jobs = [
+            {
+                "id": "bound-job",
+                "name": "bound",
+                "prompt": "hello",
+                "authorized_behavior_ref": "behavior.cron.bound-job",
+                "process_charter_ref": "process-charter.cron.bound-job",
+                "risk_tier": "high",
+                "implementation_categories": ["cron", "browser_cdp"],
+                "implementation_path_evidence_ref": "evidence.impl.bound-job",
+                "observed_scope_evidence_ref": "evidence.scope.bound-job",
+                "join_keys": {"candidate_hash": "sha256:bound-job"},
+            },
+            {"id": "failed-job", "name": "failed", "prompt": "fail"},
+        ]
+
+        def invoke(job):
+            result = run_job(job)
+            caller_after[job["id"]] = {
+                name: get_session_env(name) for name in auth_names
+            }
+            return result
+
+        with patch("cron.scheduler._hermes_home", tmp_path), patch(
+            "cron.scheduler._resolve_origin", return_value=None
+        ), patch(
+            "cron.jobs._apply_cron_runtime_governance", return_value=None
+        ), patch("hermes_cli.env_loader.load_hermes_dotenv"), patch(
+            "hermes_cli.env_loader.reset_secret_source_cache"
+        ), patch("hermes_state.SessionDB", side_effect=lambda: MagicMock()), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        ), patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), patch(
+            "run_agent.AIAgent", FakeAgent
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(invoke, jobs))
+
+        assert results[0][0] is True
+        assert results[1][0] is False
+        assert seen["bound-job"]["context"] == {
+            "HERMES_CRON_JOB_ID": "bound-job",
+            "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": "behavior.cron.bound-job",
+            "HERMES_CRON_PROCESS_CHARTER_REF": "process-charter.cron.bound-job",
+            "HERMES_CRON_RISK_TIER": "high",
+            "HERMES_CRON_IMPLEMENTATION_CATEGORIES": '["cron", "browser_cdp"]',
+            "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": "evidence.impl.bound-job",
+            "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": "evidence.scope.bound-job",
+            "HERMES_CRON_CANDIDATE_HASH": "sha256:bound-job",
+        }
+        assert seen["failed-job"]["context"] == {
+            "HERMES_CRON_JOB_ID": "failed-job",
+            **{name: "" for name in auth_names if name != "HERMES_CRON_JOB_ID"},
+        }
+        assert all(
+            value is None for run in seen.values() for value in run["exported"].values()
+        )
+        assert all(value == "" for run in caller_after.values() for value in run.values())
+
+    def test_run_job_enforces_turn_mcp_and_total_runtime_budgets(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+
+        interrupted = threading.Event()
+        created_agents = []
+        monkeypatch.setenv("HERMES_MODEL", "test-model")
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+        (tmp_path / "config.yaml").write_text(
+            "cron:\n"
+            "  max_turns: 17\n"
+            "mcp_servers:\n"
+            "  needed:\n"
+            "    enabled: true\n"
+            "  unrelated:\n"
+            "    enabled: true\n"
+            "platform_toolsets:\n"
+            "  cron: [terminal, needed]\n",
+            encoding="utf-8",
+        )
+
+        class BlockingAgent:
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+                created_agents.append(self)
+
+            def run_conversation(self, prompt):
+                interrupted.wait(timeout=2)
+                return {"final_response": "late"}
+
+            def interrupt(self, message=None):
+                interrupted.set()
+
+            def close(self):
+                pass
+
+        with patch("cron.scheduler._hermes_home", tmp_path), patch(
+            "cron.scheduler._resolve_origin", return_value=None
+        ), patch("hermes_cli.env_loader.load_hermes_dotenv"), patch(
+            "hermes_cli.env_loader.reset_secret_source_cache"
+        ), patch("hermes_state.SessionDB", return_value=MagicMock()), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        ), patch("tools.mcp_tool.discover_mcp_tools", return_value=[]) as discover, patch(
+            "run_agent.AIAgent", BlockingAgent
+        ):
+            success, _output, _final_response, error = run_job(
+                {
+                    "id": "bounded-job",
+                    "name": "bounded",
+                    "prompt": "wait",
+                    "max_turns": 7,
+                    "run_timeout_seconds": 0.05,
+                }
+            )
+
+        assert success is False
+        assert "total runtime limit" in (error or "")
+        assert interrupted.wait(timeout=1)
+        assert created_agents[0].kwargs["max_iterations"] == 7
+        assert {"needed", "terminal"}.issubset(
+            created_agents[0].kwargs["enabled_toolsets"]
+        )
+        assert "unrelated" not in created_agents[0].kwargs["enabled_toolsets"]
+        discover.assert_called_once_with(server_names=["needed"])
+        from gateway.session_context import get_session_env
+
+        assert get_session_env("HERMES_CRON_JOB_ID") == ""
 
 
     @contextlib.contextmanager
