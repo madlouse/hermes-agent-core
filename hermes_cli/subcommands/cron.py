@@ -196,6 +196,21 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_runs.add_argument("job_id", nargs="?", help="Optional job ID filter")
     cron_runs.add_argument("--limit", type=int, default=20, help="Rows to show (1-500)")
 
+    cron_migrate = cron_subparsers.add_parser(
+        "migrate-skill-bindings",
+        help="Plan or apply canonical skill bindings for existing jobs",
+    )
+    cron_migrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply an error-free plan after backing up jobs.json",
+    )
+    cron_migrate.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the complete migration result as JSON",
+    )
+
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)

@@ -17,7 +17,10 @@ was filed for. These tests pin per-profile isolation so a stale-branch merge or
 a re-anchor "fix" can't silently flip it back.
 """
 import importlib
+import json
 from pathlib import Path
+
+import pytest
 
 
 def _set_profile_env(monkeypatch, root: Path, profile_home: Path) -> None:
@@ -66,4 +69,38 @@ def test_cron_storage_anchors_at_profile_home(tmp_path, monkeypatch):
         monkeypatch.undo()
         importlib.reload(jobs)
 
+
+def test_skill_binding_resolution_never_borrows_another_profile(tmp_path):
+    from agent.skill_resolution import SkillResolutionError
+    from cron import jobs
+
+    atlas = tmp_path / "profiles" / "atlas"
+    yuange = tmp_path / "profiles" / "yuange"
+    skill_dir = atlas / "skills" / "work" / "cron-task-force"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: cron-task-force\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+    (yuange / "skills").mkdir(parents=True)
+
+    with jobs.use_cron_store(atlas):
+        created = jobs.create_job(
+            prompt="Atlas task",
+            schedule="every 1h",
+            skills=["cron-task-force"],
+        )
+
+    with jobs.use_cron_store(yuange):
+        with pytest.raises(SkillResolutionError) as excinfo:
+            jobs.create_job(
+                prompt="Yuange task",
+                schedule="every 1h",
+                skills=["cron-task-force"],
+            )
+
+    assert excinfo.value.code == "skill_unavailable_in_active_profile"
+    atlas_jobs = json.loads((atlas / "cron" / "jobs.json").read_text())["jobs"]
+    assert [job["id"] for job in atlas_jobs] == [created["id"]]
+    assert not (yuange / "cron" / "jobs.json").exists()
 

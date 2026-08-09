@@ -404,7 +404,11 @@ _CRON_GOVERNANCE_HOOK_OWNED_FIELDS = frozenset({
     "join_keys",
     "creation_governance_receipt",
 })
-_IMMUTABLE_JOB_FIELDS = frozenset({"id", *_CRON_GOVERNANCE_HOOK_OWNED_FIELDS})
+_IMMUTABLE_JOB_FIELDS = frozenset({
+    "id",
+    "skill_bindings",
+    *_CRON_GOVERNANCE_HOOK_OWNED_FIELDS,
+})
 _CRON_GOVERNANCE_ENV = "HERMES_CRON_CREATION_GOVERNANCE_REQUIRED"
 _CRON_GOVERNANCE_PLUGIN = "hck-tool-boundary"
 _CRON_RESUME_SCHEMA = "cron-persist-resume/v1"
@@ -1006,6 +1010,57 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
         if text and text not in normalized:
             normalized.append(text)
     return normalized
+
+
+def _active_profile_home() -> Path:
+    """Return the profile that owns the active Cron store."""
+    return _current_cron_store().cron_dir.parent.resolve(strict=False)
+
+
+def _registered_plugin_skill_paths(
+    selectors: List[str], profile_home: Path
+) -> Dict[str, Path]:
+    qualified = [selector for selector in selectors if ":" in selector]
+    if not qualified:
+        return {}
+    if profile_home.resolve(strict=False) != get_hermes_home().resolve(strict=False):
+        return {}
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()
+        manager = get_plugin_manager()
+        return {
+            selector: path
+            for selector in qualified
+            if (path := manager.find_plugin_skill(selector)) is not None
+        }
+    except Exception as exc:
+        from agent.skill_resolution import SkillResolutionError
+
+        raise SkillResolutionError(
+            "skill_plugin_resolution_failed",
+            qualified[0],
+            "Plugin skill discovery failed before Cron persistence.",
+        ) from exc
+
+
+def _resolve_skill_fields(
+    selectors: List[str],
+    *,
+    profile_home: Optional[Path] = None,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    if not selectors:
+        return [], []
+    from agent.skill_resolution import resolve_skill_refs
+
+    profile = (profile_home or _active_profile_home()).resolve(strict=False)
+    bindings = resolve_skill_refs(
+        profile,
+        selectors,
+        plugin_skill_paths=_registered_plugin_skill_paths(selectors, profile),
+    )
+    return [str(binding["canonical_name"]) for binding in bindings], bindings
 
 
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -1976,7 +2031,8 @@ def create_job(
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
 
-    normalized_skills = _normalize_skill_list(skill, skills)
+    requested_skills = _normalize_skill_list(skill, skills)
+    normalized_skills, skill_bindings = _resolve_skill_fields(requested_skills)
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
@@ -2044,6 +2100,7 @@ def create_job(
         "prompt": prompt_text,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,
+        "skill_bindings": skill_bindings,
         "model": normalized_model,
         "provider": normalized_provider,
         # Provider/model resolution captured at creation for unpinned jobs
@@ -2333,14 +2390,14 @@ def update_job(
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
-            normalize_skills = "skills" in updates or "skill" in updates
+            skill_fields_changed = "skills" in updates or "skill" in updates
             previous_inference_axes = _normalized_inference_axes(job)
             if special_operation:
                 updated = copy.deepcopy(job)
             else:
                 updated = (
                     _apply_skill_fields({**job, **updates})
-                    if normalize_skills
+                    if skill_fields_changed
                     else {**job, **updates}
                 )
             if deprecated_verification_retirement is not None:
@@ -2351,10 +2408,17 @@ def update_job(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
 
-            if normalize_skills:
-                normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
+            if skill_fields_changed:
+                requested_skills = _normalize_skill_list(
+                    updates.get("skill") if "skill" in updates else None,
+                    updates.get("skills") if "skills" in updates else None,
+                )
+                normalized_skills, skill_bindings = _resolve_skill_fields(
+                    requested_skills
+                )
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+                updated["skill_bindings"] = skill_bindings
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]
@@ -3565,15 +3629,17 @@ def rewrite_skill_refs(
             if not mapped and not dropped:
                 continue
 
-            job["skills"] = new_skills
-            job["skill"] = new_skills[0] if new_skills else None
+            canonical_skills, skill_bindings = _resolve_skill_fields(new_skills)
+            job["skills"] = canonical_skills
+            job["skill"] = canonical_skills[0] if canonical_skills else None
+            job["skill_bindings"] = skill_bindings
             changed = True
 
             rewrites.append({
                 "job_id": job.get("id"),
                 "job_name": job.get("name") or job.get("id"),
                 "before": list(skills_before),
-                "after": list(new_skills),
+                "after": list(canonical_skills),
                 "mapped": mapped,
                 "dropped": dropped,
             })
@@ -3588,4 +3654,222 @@ def rewrite_skill_refs(
             "rewrites": rewrites,
             "jobs_updated": len(rewrites),
             "jobs_scanned": len(jobs),
+        }
+
+
+_SKILL_BINDING_MIGRATION_SCHEMA = "cron-skill-binding-migration/v1"
+
+
+def _read_jobs_document(path: Path) -> Tuple[bytes, Dict[str, Any]]:
+    if not path.exists():
+        return b"", {"jobs": []}
+    raw = path.read_bytes()
+    try:
+        document = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cron database corrupted: {path} is not valid JSON") from exc
+    if isinstance(document, list):
+        document = {"jobs": document}
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), list):
+        raise RuntimeError(
+            "Cron database corrupted: expected {'jobs': [...] } for skill migration"
+        )
+    return raw, document
+
+
+def _skill_binding_state(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "skill": copy.deepcopy(job.get("skill")),
+        "skills": copy.deepcopy(job.get("skills")),
+        "skill_bindings": copy.deepcopy(job.get("skill_bindings")),
+    }
+
+
+def _resolved_skill_binding_state(
+    job: Dict[str, Any], profile_home: Path
+) -> Dict[str, Any]:
+    selectors = _normalize_skill_list(job.get("skill"), job.get("skills"))
+    canonical, bindings = _resolve_skill_fields(
+        selectors,
+        profile_home=profile_home,
+    )
+    return {
+        "skill": canonical[0] if canonical else None,
+        "skills": canonical,
+        "skill_bindings": bindings,
+    }
+
+
+def plan_skill_binding_migration(
+    profile_home: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Build a read-only canonical-binding migration plan for one profile."""
+    profile = Path(profile_home or _active_profile_home()).expanduser().resolve(
+        strict=False
+    )
+    jobs_file = profile / "cron" / "jobs.json"
+    raw, document = _read_jobs_document(jobs_file)
+    changes: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    for job in document["jobs"]:
+        if not isinstance(job, dict):
+            errors.append({"job_id": "", "reason": "job_record_invalid"})
+            continue
+        before = _skill_binding_state(job)
+        selectors = _normalize_skill_list(job.get("skill"), job.get("skills"))
+        if not selectors and "skill_bindings" not in job:
+            continue
+        try:
+            after = _resolved_skill_binding_state(job, profile)
+        except Exception as exc:
+            errors.append(
+                {
+                    "job_id": str(job.get("id") or ""),
+                    "reason": getattr(exc, "code", type(exc).__name__),
+                    "detail": str(exc),
+                }
+            )
+            continue
+        if before != after:
+            changes.append(
+                {
+                    "job_id": str(job.get("id") or ""),
+                    "before": before,
+                    "after": after,
+                }
+            )
+
+    return {
+        "schema_version": _SKILL_BINDING_MIGRATION_SCHEMA,
+        "profile_home": str(profile),
+        "jobs_file": str(jobs_file),
+        "store_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        "jobs_scanned": len(document["jobs"]),
+        "changes": changes,
+        "errors": errors,
+        "applicable": bool(changes) and not errors,
+    }
+
+
+def _migration_already_applied(
+    jobs: List[Dict[str, Any]], changes: List[Dict[str, Any]]
+) -> bool:
+    by_id = {
+        str(job.get("id") or ""): job for job in jobs if isinstance(job, dict)
+    }
+    return bool(changes) and all(
+        change.get("job_id") in by_id
+        and _skill_binding_state(by_id[change["job_id"]]) == change.get("after")
+        for change in changes
+    )
+
+
+def apply_skill_binding_migration(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply one unchanged, error-free plan after a durable store backup."""
+    if not isinstance(plan, dict) or plan.get("schema_version") != _SKILL_BINDING_MIGRATION_SCHEMA:
+        raise ValueError("invalid skill binding migration plan")
+    if plan.get("errors"):
+        raise ValueError("skill binding migration plan contains resolution errors")
+
+    profile = Path(str(plan.get("profile_home") or "")).expanduser().resolve(
+        strict=False
+    )
+    jobs_file = profile / "cron" / "jobs.json"
+    if str(jobs_file) != str(plan.get("jobs_file") or ""):
+        raise ValueError("skill binding migration plan path mismatch")
+    changes = plan.get("changes")
+    if not isinstance(changes, list):
+        raise ValueError("skill binding migration plan changes are invalid")
+    if not changes:
+        return {
+            "status": "noop",
+            "jobs_updated": 0,
+            "backup_path": None,
+        }
+
+    with use_cron_store(profile), _jobs_lock():
+        raw, document = _read_jobs_document(jobs_file)
+        jobs = document["jobs"]
+        if _migration_already_applied(jobs, changes):
+            return {
+                "status": "already_applied",
+                "jobs_updated": 0,
+                "backup_path": None,
+            }
+
+        current_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if current_digest != plan.get("store_digest"):
+            raise RuntimeError("cron jobs changed after the skill binding migration plan")
+
+        changes_by_id = {change["job_id"]: change for change in changes}
+        seen: set[str] = set()
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("id") or "")
+            change = changes_by_id.get(job_id)
+            if change is None:
+                continue
+            if _skill_binding_state(job) != change.get("before"):
+                raise RuntimeError(f"cron job {job_id} changed after migration planning")
+            if _resolved_skill_binding_state(job, profile) != change.get("after"):
+                raise RuntimeError(
+                    f"cron job {job_id} skill resolution changed after migration planning"
+                )
+            job.update(copy.deepcopy(change["after"]))
+            seen.add(job_id)
+        if seen != set(changes_by_id):
+            raise RuntimeError("one or more planned cron jobs are missing")
+
+        digest_token = str(plan["store_digest"]).split(":", 1)[-1][:16]
+        backup_path = jobs_file.with_name(
+            f"{jobs_file.name}.skill-bindings.{digest_token}.bak"
+        )
+        if backup_path.exists():
+            if backup_path.read_bytes() != raw:
+                raise RuntimeError("existing skill binding migration backup does not match")
+        else:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as backup:
+                    backup.write(raw)
+                    backup.flush()
+                    os.fsync(backup.fileno())
+            except BaseException:
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
+                raise
+
+        original_stat = os.stat(jobs_file)
+        try:
+            _save_jobs_unlocked(jobs)
+        except BaseException as save_exc:
+            fd, restore_tmp = tempfile.mkstemp(
+                dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_restore_"
+            )
+            try:
+                with os.fdopen(fd, "wb") as restored:
+                    restored.write(raw)
+                    restored.flush()
+                    os.fsync(restored.fileno())
+                atomic_replace(restore_tmp, jobs_file)
+                _secure_file(jobs_file)
+                _preserve_file_ownership(jobs_file, original_stat)
+            except BaseException as restore_exc:
+                try:
+                    os.unlink(restore_tmp)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    "skill binding migration failed and rollback could not restore jobs.json"
+                ) from restore_exc
+            raise save_exc
+        return {
+            "status": "applied",
+            "jobs_updated": len(changes),
+            "backup_path": str(backup_path),
         }
