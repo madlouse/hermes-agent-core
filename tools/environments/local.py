@@ -437,6 +437,7 @@ def _inject_session_context_env(env: dict) -> None:
             _CRON_AUTH_VAR_MAP,
             _UNSET,
             _VAR_MAP,
+            get_session_env,
             session_context_engaged,
         )
     except Exception:
@@ -450,6 +451,13 @@ def _inject_session_context_env(env: dict) -> None:
 
     _engaged = session_context_engaged()
     for var_name, var in _VAR_MAP.items():
+        if var_name == "HERMES_CRON_SESSION":
+            value = get_session_env(var_name, "")
+            if value:
+                env[var_name] = value
+            else:
+                env.pop(var_name, None)
+            continue
         value = var.get()
         if value is not _UNSET:
             # Explicitly bound (including "") — authoritative for this task.

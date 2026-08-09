@@ -94,6 +94,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import hashlib
 import inspect
 import json
 import logging
@@ -3532,6 +3533,11 @@ class MCPServerTask:
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
+# A process-global MCP task owns credentials and transport state. Bind each raw
+# server name to the canonical Profile and the complete effective config that
+# created it; name-only reuse across Profiles would otherwise send Profile B's
+# calls through Profile A's already-connected credentials.
+_server_owners: Dict[str, Tuple[str, str]] = {}
 # Lazy MCP startup (#56832): servers whose tools were registered from the
 # on-disk schema cache without spawning/connecting. Keyed by server name;
 # entries are popped once a real connection is established on first use.
@@ -3544,6 +3550,56 @@ _lazy_server_tool_names: Dict[str, List[str]] = {}
 _connect_server_claim: contextvars.ContextVar[
     Optional[Callable[[MCPServerTask], None]]
 ] = contextvars.ContextVar("mcp_connect_server_claim", default=None)
+
+
+class MCPServerOwnershipError(RuntimeError):
+    """An MCP name is already owned by another Profile/config identity."""
+
+
+def _mcp_server_owner(config: dict) -> Tuple[str, str]:
+    """Return canonical Profile path and a secret-sensitive config digest."""
+    from hermes_constants import get_hermes_home
+
+    profile = str(get_hermes_home().expanduser().resolve(strict=False))
+
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, set):
+            return sorted(value, key=str)
+        return repr(value)
+
+    encoded = json.dumps(
+        config,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=_json_default,
+    ).encode("utf-8")
+    return profile, hashlib.sha256(encoded).hexdigest()
+
+
+def _claim_mcp_server_owners(servers: Dict[str, dict]) -> None:
+    """Atomically claim every enabled name or fail without partial mutation."""
+    requested = {
+        name: _mcp_server_owner(config)
+        for name, config in servers.items()
+        if isinstance(config, dict)
+        and _parse_boolish(config.get("enabled", True), default=True)
+    }
+    with _lock:
+        conflicts = []
+        for name, owner in requested.items():
+            existing = _server_owners.get(name)
+            if existing is not None and existing != owner:
+                conflicts.append((name, existing, owner))
+        if conflicts:
+            names = ", ".join(sorted(name for name, _, _ in conflicts))
+            raise MCPServerOwnershipError(
+                "MCP server name ownership conflict for "
+                f"{names}: an existing process-global connection belongs to a "
+                "different canonical Profile or effective config"
+            )
+        for name, owner in requested.items():
+            _server_owners.setdefault(name, owner)
 
 # Connection-retry cooldown (per-server isolation against restart storms).
 #
@@ -6239,6 +6295,11 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
 
+    # Claim ownership before consulting name-keyed connection caches. A second
+    # Profile/config must never silently accept the first caller's live task,
+    # tool handlers, or credentials merely because the display name matches.
+    _claim_mcp_server_owners(servers)
+
     # Only attempt servers that aren't already connected (or currently
     # connecting) and are enabled.  Checking ``_server_connecting`` prevents
     # duplicate subprocess spawns when ``discover_mcp_tools()`` is called
@@ -6936,6 +6997,7 @@ def shutdown_mcp_servers():
     # configured server immediately.
     if not servers_snapshot:
         with _lock:
+            _server_owners.clear()
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
         _stop_mcp_loop()
@@ -6953,6 +7015,7 @@ def shutdown_mcp_servers():
                 )
         with _lock:
             _servers.clear()
+            _server_owners.clear()
             # Drop connect-retry cooldowns too: a full shutdown/restart
             # should re-attempt every server immediately, not honour a
             # stale per-server backoff from before the restart (#50394).
@@ -6979,6 +7042,7 @@ def shutdown_mcp_servers():
     # shutdown must leave no stale connect-cooldown state behind — the
     # next start should re-attempt every server immediately (#50394).
     with _lock:
+        _server_owners.clear()
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
 

@@ -16,6 +16,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_mcp_server_owners():
+    """Profile/config ownership is process-global; isolate it per test."""
+    import tools.mcp_tool as mcp_tool
+
+    with mcp_tool._lock:
+        saved = dict(mcp_tool._server_owners)
+        mcp_tool._server_owners.clear()
+    try:
+        yield
+    finally:
+        with mcp_tool._lock:
+            mcp_tool._server_owners.clear()
+            mcp_tool._server_owners.update(saved)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -902,6 +918,55 @@ class TestDiscoveryAllowlist:
             assert mcp_tool.discover_mcp_tools(server_names=[]) == []
 
         register.assert_not_called()
+
+
+class TestMCPProfileOwnership:
+    def test_same_name_across_profiles_with_distinct_credentials_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.mcp_tool as mcp_tool
+
+        server = SimpleNamespace(session=object(), _registered_tool_names=[])
+        profile_a = tmp_path / "profiles" / "atlas"
+        profile_b = tmp_path / "profiles" / "yuange"
+        config_a = {
+            "command": "shared-mcp",
+            "env": {"TOKEN": "atlas-secret"},
+        }
+        config_b = {
+            "command": "shared-mcp",
+            "env": {"TOKEN": "yuange-secret"},
+        }
+        with mcp_tool._lock:
+            saved_servers = dict(mcp_tool._servers)
+            mcp_tool._servers.clear()
+            mcp_tool._servers["shared"] = server
+
+        try:
+            monkeypatch.setenv("HERMES_HOME", str(profile_a))
+            with patch.object(mcp_tool, "_MCP_AVAILABLE", True), patch.object(
+                mcp_tool, "_filter_suspicious_mcp_servers", side_effect=lambda value: value
+            ):
+                mcp_tool.register_mcp_servers({"shared": config_a})
+
+                with pytest.raises(mcp_tool.MCPServerOwnershipError, match="shared"):
+                    mcp_tool.register_mcp_servers({"shared": config_b})
+
+                monkeypatch.setenv("HERMES_HOME", str(profile_b))
+                with pytest.raises(mcp_tool.MCPServerOwnershipError, match="shared"):
+                    mcp_tool.register_mcp_servers({"shared": config_a})
+                with pytest.raises(mcp_tool.MCPServerOwnershipError, match="shared"):
+                    mcp_tool.register_mcp_servers({"shared": config_b})
+
+            with mcp_tool._lock:
+                owner_profile, owner_fingerprint = mcp_tool._server_owners["shared"]
+            assert owner_profile == str(profile_a.resolve())
+            assert owner_fingerprint == mcp_tool._mcp_server_owner(config_a)[1]
+            assert mcp_tool._servers["shared"] is server
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.clear()
+                mcp_tool._servers.update(saved_servers)
 
 
 # ---------------------------------------------------------------------------
