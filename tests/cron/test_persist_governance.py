@@ -355,6 +355,37 @@ def test_resume_package_candidate_overrides_parallel_caller_fields(
     assert len(load_jobs()) == 1
 
 
+def test_v1_exact_update_preserves_empty_prior_hash_compatibility(
+    governed_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_mandatory_hook",
+        lambda _name, **_kwargs: _mandatory_report([_allow_decision()]),
+    )
+    original = create_job(prompt="original", schedule="every 1h")
+    package = _resume_package({**original, "prompt": "v1 resumed"}, "update")
+    package["receipt"]["prior_job_hash"] = ""
+    package["receipt"]["receipt_id"] = _cron_stable_hash({
+        field: copy.deepcopy(package["receipt"].get(field))
+        for field in package["receipt"]
+        if field != "receipt_id"
+    })
+    resume_id = package["receipt"]["receipt_id"]
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_mandatory_hook",
+        lambda _name, **_kwargs: _mandatory_report([
+            _allow_decision(resume_id=resume_id)
+        ]),
+    )
+
+    updated = update_job(original["id"], {}, governance_resume=package)
+
+    assert updated is not None
+    assert updated["prompt"] == "v1 resumed"
+    assert updated["state"] == "paused"
+
+
 def test_generic_non_hak_plugin_can_block_persistence(
     governed_store: Path,
     monkeypatch: pytest.MonkeyPatch,

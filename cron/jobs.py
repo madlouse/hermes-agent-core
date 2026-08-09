@@ -414,6 +414,8 @@ _CRON_GOVERNANCE_PLUGIN = "hck-tool-boundary"
 _CRON_RESUME_SCHEMA = "cron-persist-resume/v1"
 _CRON_RESUME_SCHEMA_V2 = "cron-persist-resume/v2"
 _CRON_RECOVERY_SCHEMA = "cron-persist-recovery/v1"
+_CRON_RECOVERY_REGISTRATION_SCHEMA = "cron-persist-recovery-registration/v1"
+_CRON_RECOVERY_DISPATCH_ACK_SCHEMA = "cron-persist-recovery-dispatch-ack/v1"
 _CRON_RESUME_RECEIPT_FIELD = "cron_persist_resume_receipt"
 _CRON_RESUME_PACKAGE_FIELDS = frozenset({
     "schema_version",
@@ -450,6 +452,7 @@ _CRON_RESUME_RECEIPT_V2_CORE_FIELDS = (
     "request_id",
     "request_hash",
     "source_route_hash",
+    "profile_home_sha256",
 )
 _CRON_GOVERNANCE_PATCH_FIELDS = frozenset({
     "operation",
@@ -608,8 +611,8 @@ def _cron_candidate_definition_hash(candidate: Dict[str, Any]) -> str:
     return _cron_stable_hash(_cron_governance_material(candidate))
 
 
-def _active_cron_profile_id() -> str:
-    """Derive the immutable profile identity from the active Cron store path."""
+def _active_cron_profile_identity() -> Dict[str, str]:
+    """Derive profile name and canonical-home digest from the Cron store path."""
     home = _active_profile_home()
     try:
         resolved = home.resolve(strict=True)
@@ -635,7 +638,14 @@ def _active_cron_profile_id() -> str:
             "Cron job persistence needs administrator review "
             "(active profile identity mismatch)."
         )
-    return profile_id
+    return {
+        "profile_id": profile_id,
+        "profile_home_sha256": _cron_stable_hash(str(resolved)),
+    }
+
+
+def _active_cron_profile_id() -> str:
+    return _active_cron_profile_identity()["profile_id"]
 
 
 def cron_persist_resume_identity(
@@ -646,17 +656,21 @@ def cron_persist_resume_identity(
     op = str(operation or "").strip().lower()
     if op not in {"create", "update"} or not isinstance(candidate, dict):
         raise ValueError("Cron persist resume identity requires create/update candidate")
-    profile_id = _active_cron_profile_id()
+    profile_identity = _active_cron_profile_identity()
+    profile_id = profile_identity["profile_id"]
+    profile_home_sha256 = profile_identity["profile_home_sha256"]
     request_hash = _cron_request_hash(candidate)
     source_route_hash = _cron_source_route_hash(candidate)
     request_id = _cron_stable_hash({
         "profile_id": profile_id,
+        "profile_home_sha256": profile_home_sha256,
         "operation": op,
         "job_id": str(candidate.get("id") or "").strip(),
         "request_hash": request_hash,
     })
     return {
         "profile_id": profile_id,
+        "profile_home_sha256": profile_home_sha256,
         "request_id": request_id,
         "request_hash": request_hash,
         "source_route_hash": source_route_hash,
@@ -756,6 +770,67 @@ def _cron_persist_governance_active(
         return expected
 
 
+def _validated_recovery_blocker(
+    blocked_decisions: List[Dict[str, Any]],
+    recovery_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Require one generic issuer-bound registration and one sealed effect."""
+    if len(blocked_decisions) != 1:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(ambiguous resume recovery registration).",
+            decision={
+                "action": "block",
+                "reason": "resume_recovery_registration_ambiguous",
+                "state": "resume_review_required",
+            },
+        )
+    blocked = copy.deepcopy(blocked_decisions[0])
+    registration = blocked.get("recovery_registration")
+    effect = blocked.get("notification_effect")
+    pending = blocked.get("pending_action")
+    frame = pending.get("frame") if isinstance(pending, dict) else None
+    issuer = registration.get("issuer") if isinstance(registration, dict) else None
+    expected_registration_fields = {
+        "schema_version",
+        "issuer",
+        "recovery_id",
+        "pending_id",
+        "frame_id",
+        "effect_hash",
+    }
+    valid = (
+        isinstance(registration, dict)
+        and set(registration) == expected_registration_fields
+        and registration.get("schema_version")
+        == _CRON_RECOVERY_REGISTRATION_SCHEMA
+        and isinstance(issuer, dict)
+        and set(issuer) == {"id", "version"}
+        and bool(str(issuer.get("id") or "").strip())
+        and bool(str(issuer.get("version") or "").strip())
+        and registration.get("recovery_id") == recovery_context.get("recovery_id")
+        and isinstance(pending, dict)
+        and registration.get("pending_id") == pending.get("pending_id")
+        and isinstance(frame, dict)
+        and registration.get("frame_id") == frame.get("frame_id")
+        and isinstance(effect, dict)
+        and registration.get("effect_hash") == _cron_stable_hash(effect)
+        and "post_persist_effects" not in blocked
+    )
+    if not valid:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(invalid resume recovery registration).",
+            decision={
+                "action": "block",
+                "reason": "resume_recovery_registration_invalid",
+                "state": "resume_review_required",
+            },
+        )
+    blocked["post_persist_effects"] = [copy.deepcopy(effect)]
+    return blocked
+
+
 def _apply_cron_persist_governance(
     operation: str,
     candidate: Dict[str, Any],
@@ -810,6 +885,24 @@ def _apply_cron_persist_governance(
         if isinstance(item, dict) and item.get("action") in {"allow", "block"}
     ]
     blocked_decisions = [item for item in decisions if item.get("action") == "block"]
+    if recovery_context is not None and failures:
+        raise CronJobGovernanceError(
+            "Cron job was not saved: governance_callback_failed (review_required).",
+            decision={
+                "action": "block",
+                "reason": "governance_callback_failed",
+                "state": "review_required",
+                "callback_failures": copy.deepcopy(failures),
+            },
+        )
+    if recovery_context is not None and blocked_decisions:
+        blocked = _validated_recovery_blocker(blocked_decisions, recovery_context)
+        reason = str(blocked.get("reason") or "review_required")
+        state = str(blocked.get("state") or "review_required")
+        raise CronJobGovernanceError(
+            f"Cron job was not saved: {reason} ({state}).",
+            decision=blocked,
+        )
     post_effects: List[Dict[str, Any]] = []
     for blocked_decision in blocked_decisions:
         effect = blocked_decision.get("notification_effect")
@@ -1121,7 +1214,11 @@ def _parse_resume_package(
     )
     if not valid:
         raise _invalid_resume("resume_package_integrity_mismatch")
-    if operation == "update" and not str(receipt.get("prior_job_hash") or "").strip():
+    if (
+        schema == _CRON_RESUME_SCHEMA_V2
+        and operation == "update"
+        and not str(receipt.get("prior_job_hash") or "").strip()
+    ):
         raise _invalid_resume("resume_update_precondition_missing")
     if schema == _CRON_RESUME_SCHEMA_V2:
         identity = cron_persist_resume_identity(operation, job)
@@ -1184,6 +1281,7 @@ def _recovery_context(
         "disposition": disposition,
         "reason": reason,
         "profile_id": str(receipt.get("profile_id") or ""),
+        "profile_home_sha256": str(receipt.get("profile_home_sha256") or ""),
         "operation": parsed.operation,
         "job_id": str(parsed.job.get("id") or ""),
         "request_id": str(receipt.get("request_id") or ""),
@@ -1271,7 +1369,13 @@ def _resolve_resume(
     fresh_identity = cron_persist_resume_identity(parsed.operation, fresh)
     if any(
         fresh_identity[field] != str(receipt.get(field) or "")
-        for field in ("profile_id", "request_id", "request_hash", "source_route_hash")
+        for field in (
+            "profile_id",
+            "profile_home_sha256",
+            "request_id",
+            "request_hash",
+            "source_route_hash",
+        )
     ):
         raise _invalid_resume("resume_fresh_request_or_route_mismatch")
     fresh_spec_hash = _cron_persist_spec_hash(parsed.operation, fresh)
@@ -1308,7 +1412,15 @@ def get_cron_persist_recovery(
         if profile_home is not None
         else _current_cron_store().cron_dir
     )
-    return get_recovery(cron_dir, str(recovery_id or "").strip())
+    return get_recovery(
+        cron_dir,
+        str(recovery_id or "").strip(),
+        profile_home=(
+            Path(profile_home).expanduser().resolve(strict=False)
+            if profile_home is not None
+            else _active_profile_home()
+        ),
+    )
 
 
 def _recovery_store_failure(exc: Exception) -> CronJobGovernanceError:
@@ -1339,6 +1451,7 @@ def _load_recovery_replay(
         stored = load_by_rejected_receipt(
             _current_cron_store().cron_dir,
             str(context["rejected_receipt_id"]),
+            profile_home=_active_profile_home(),
         )
     except CronPersistRecoveryStoreError as exc:
         raise _recovery_store_failure(exc) from exc
@@ -1349,6 +1462,7 @@ def _load_recovery_replay(
         "disposition",
         "reason",
         "profile_id",
+        "profile_home_sha256",
         "operation",
         "job_id",
         "request_id",
@@ -1390,37 +1504,29 @@ def _record_recovery_error(
     )
 
     context = copy.deepcopy(resolution.recovery_context or {})
-    pending = decision.get("pending_action")
     if resolution.disposition == "recoverable_spec_drift":
-        frame = pending.get("frame") if isinstance(pending, dict) else None
-        pending_id = (
-            str(pending.get("pending_id") or "").strip()
-            if isinstance(pending, dict)
-            else ""
-        )
-        frame_id = (
-            str(frame.get("frame_id") or "").strip()
-            if isinstance(frame, dict)
-            else ""
-        )
-        if (
-            decision.get("action") != "block"
-            or str(decision.get("reason") or "") != "group_source_requires_admin_dm"
-            or not pending_id
-            or not frame_id
+        registration = decision.get("recovery_registration")
+        effects = decision.get("post_persist_effects")
+        if not isinstance(registration, dict) or not (
+            isinstance(effects, list)
+            and len(effects) == 1
+            and isinstance(effects[0], dict)
         ):
             raise CronJobGovernanceError(
                 "Cron job persistence needs administrator review "
                 "(invalid resume recovery governance result)."
             )
-        context["pending_id"] = pending_id
-        context["frame_id"] = frame_id
+        context["pending_id"] = str(registration.get("pending_id") or "")
+        context["frame_id"] = str(registration.get("frame_id") or "")
+        context["registration"] = copy.deepcopy(registration)
+        context["notification_effect"] = copy.deepcopy(effects[0])
     public_recovery = {
         key: copy.deepcopy(value)
         for key, value in context.items()
         if key not in {"rejected_receipt_hash"}
     }
     stored_decision = copy.deepcopy(decision)
+    stored_decision.pop("post_persist_effects", None)
     stored_decision["recovery"] = public_recovery
     record = {
         **context,
@@ -1429,7 +1535,11 @@ def _record_recovery_error(
         "created_at": _hermes_now().isoformat(),
     }
     try:
-        record_recovery(_current_cron_store().cron_dir, record)
+        record_recovery(
+            _current_cron_store().cron_dir,
+            record,
+            profile_home=_active_profile_home(),
+        )
     except CronPersistRecoveryStoreError as exc:
         raise _recovery_store_failure(exc) from exc
     reason = str(stored_decision.get("reason") or resolution.reason)
@@ -1449,6 +1559,105 @@ def _unreconstructable_recovery_error(
         "state": "resume_recovery_unreconstructable",
     }
     return _record_recovery_error(resolution, decision)
+
+
+def _claim_cron_recovery_dispatch(recovery_id: str) -> Optional[Dict[str, Any]]:
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        claim_recovery_dispatch,
+    )
+
+    try:
+        return claim_recovery_dispatch(
+            _current_cron_store().cron_dir,
+            recovery_id,
+            profile_home=_active_profile_home(),
+        )
+    except CronPersistRecoveryStoreError as exc:
+        raise _recovery_store_failure(exc) from exc
+
+
+def _valid_recovery_dispatch_ack(
+    result: Any,
+    claim: Dict[str, Any],
+) -> bool:
+    registration = claim.get("registration")
+    issuer = registration.get("issuer") if isinstance(registration, dict) else None
+    return bool(
+        isinstance(result, dict)
+        and set(result)
+        == {"schema_version", "issuer", "recovery_id", "claim_id", "disposition"}
+        and result.get("schema_version") == _CRON_RECOVERY_DISPATCH_ACK_SCHEMA
+        and result.get("issuer") == issuer
+        and result.get("recovery_id") == claim.get("recovery_id")
+        and result.get("claim_id") == claim.get("claim_id")
+        and result.get("disposition") == "accepted"
+    )
+
+
+def _dispatch_claimed_cron_recovery_effects(
+    operation: str,
+    claims: List[Dict[str, Any]],
+) -> None:
+    """Deliver durable recovery effects after the jobs lock is released."""
+    if not claims:
+        return
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        complete_recovery_dispatch,
+        release_recovery_dispatch,
+    )
+
+    for claim in claims:
+        acknowledged = False
+        try:
+            from hermes_cli.plugins import discover_plugins, invoke_hook
+
+            discover_plugins()
+            results = invoke_hook(
+                "post_cron_job_persist",
+                operation=operation,
+                notification_effect=copy.deepcopy(claim["notification_effect"]),
+                recovery_registration=copy.deepcopy(claim["registration"]),
+                recovery_dispatch_claim={
+                    "recovery_id": claim["recovery_id"],
+                    "claim_id": claim["claim_id"],
+                    "claimed_at": claim["claimed_at"],
+                    "claim_expires_at": claim["claim_expires_at"],
+                },
+            )
+            acknowledgements = [
+                result
+                for result in results
+                if _valid_recovery_dispatch_ack(result, claim)
+            ]
+            acknowledged = len(acknowledgements) == 1
+        except Exception:
+            logger.warning(
+                "post_cron_job_persist recovery observer failed after rejected %s",
+                operation,
+                exc_info=True,
+            )
+        try:
+            if acknowledged:
+                complete_recovery_dispatch(
+                    _current_cron_store().cron_dir,
+                    str(claim["recovery_id"]),
+                    str(claim["claim_id"]),
+                    profile_home=_active_profile_home(),
+                )
+            else:
+                release_recovery_dispatch(
+                    _current_cron_store().cron_dir,
+                    str(claim["recovery_id"]),
+                    str(claim["claim_id"]),
+                    profile_home=_active_profile_home(),
+                )
+        except CronPersistRecoveryStoreError:
+            logger.warning(
+                "Cron resume recovery dispatch disposition update failed",
+                exc_info=True,
+            )
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -2457,11 +2666,17 @@ def create_job(
     if governance_resume is not None:
         parsed_resume = _parse_resume_package(governance_resume, operation="create")
         post_effects: List[Dict[str, Any]] = []
+        recovery_claims: List[Dict[str, Any]] = []
         with contextlib.ExitStack() as stack:
             stack.callback(
                 _dispatch_post_cron_persist_effects,
                 "create",
                 post_effects,
+            )
+            stack.callback(
+                _dispatch_claimed_cron_recovery_effects,
+                "create",
+                recovery_claims,
             )
             stack.enter_context(_jobs_lock(require_cross_process=True))
             jobs = load_jobs(repair_recoverable=False)
@@ -2473,6 +2688,11 @@ def create_job(
                     resolution.candidate,
                 )
                 if replay is not None:
+                    claim = _claim_cron_recovery_dispatch(
+                        str(resolution.recovery_context["recovery_id"])
+                    )
+                    if claim is not None:
+                        recovery_claims.append(claim)
                     raise replay
             if resolution.disposition == "blocked_unreconstructable":
                 raise _unreconstructable_recovery_error(resolution)
@@ -2484,9 +2704,16 @@ def create_job(
                     recovery_context=resolution.recovery_context,
                 )
             except CronJobGovernanceError as exc:
-                if resolution.disposition == "recoverable_spec_drift":
+                if (
+                    resolution.disposition == "recoverable_spec_drift"
+                    and isinstance(exc.decision.get("recovery_registration"), dict)
+                ):
                     recovery_error = _record_recovery_error(resolution, exc.decision)
-                    post_effects.extend(_post_cron_persist_effects(recovery_error))
+                    claim = _claim_cron_recovery_dispatch(
+                        str(resolution.recovery_context["recovery_id"])
+                    )
+                    if claim is not None:
+                        recovery_claims.append(claim)
                     raise recovery_error from exc
                 post_effects.extend(_post_cron_persist_effects(exc))
                 raise
@@ -2771,11 +2998,17 @@ def update_job(
                 "(resume job id mismatch)."
             )
         post_effects: List[Dict[str, Any]] = []
+        recovery_claims: List[Dict[str, Any]] = []
         with contextlib.ExitStack() as stack:
             stack.callback(
                 _dispatch_post_cron_persist_effects,
                 "update",
                 post_effects,
+            )
+            stack.callback(
+                _dispatch_claimed_cron_recovery_effects,
+                "update",
+                recovery_claims,
             )
             stack.enter_context(_jobs_lock(require_cross_process=True))
             jobs = load_jobs(repair_recoverable=False)
@@ -2787,6 +3020,11 @@ def update_job(
                     resolution.candidate,
                 )
                 if replay is not None:
+                    claim = _claim_cron_recovery_dispatch(
+                        str(resolution.recovery_context["recovery_id"])
+                    )
+                    if claim is not None:
+                        recovery_claims.append(claim)
                     raise replay
             if resolution.disposition == "blocked_unreconstructable":
                 raise _unreconstructable_recovery_error(resolution)
@@ -2808,9 +3046,16 @@ def update_job(
                     recovery_context=resolution.recovery_context,
                 )
             except CronJobGovernanceError as exc:
-                if resolution.disposition == "recoverable_spec_drift":
+                if (
+                    resolution.disposition == "recoverable_spec_drift"
+                    and isinstance(exc.decision.get("recovery_registration"), dict)
+                ):
                     recovery_error = _record_recovery_error(resolution, exc.decision)
-                    post_effects.extend(_post_cron_persist_effects(recovery_error))
+                    claim = _claim_cron_recovery_dispatch(
+                        str(resolution.recovery_context["recovery_id"])
+                    )
+                    if claim is not None:
+                        recovery_claims.append(claim)
                     raise recovery_error from exc
                 post_effects.extend(_post_cron_persist_effects(exc))
                 raise
