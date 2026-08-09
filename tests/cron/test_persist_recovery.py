@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import os
+import shutil
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -23,6 +25,7 @@ from cron.jobs import (
     get_cron_persist_recovery,
     load_jobs,
     update_job,
+    use_cron_store,
 )
 
 
@@ -115,6 +118,7 @@ def _resume_package(
         "request_id": identity["request_id"],
         "request_hash": identity["request_hash"],
         "source_route_hash": identity["source_route_hash"],
+        "profile_home_sha256": identity["profile_home_sha256"],
     }
     receipt["receipt_id"] = _cron_stable_hash(receipt)
     return {
@@ -156,6 +160,18 @@ def _fresh_block(context: dict[str, Any]) -> dict[str, Any]:
     suffix = str(context["recovery_id"]).split(":", 1)[1][:24]
     frame_id = f"cpf_{suffix}"
     pending_id = f"cpa_{suffix}"
+    effect = {
+        "kind": "cron-admin-pending-notification/v1",
+        "frame_id": frame_id,
+    }
+    registration = {
+        "schema_version": "cron-persist-recovery-registration/v1",
+        "issuer": {"id": "test-governance", "version": "1"},
+        "recovery_id": context["recovery_id"],
+        "pending_id": pending_id,
+        "frame_id": frame_id,
+        "effect_hash": _cron_stable_hash(effect),
+    }
     return {
         "action": "block",
         "reason": "group_source_requires_admin_dm",
@@ -166,10 +182,20 @@ def _fresh_block(context: dict[str, Any]) -> dict[str, Any]:
             "pending_id": pending_id,
             "frame": {"frame_id": frame_id, "state": "created"},
         },
-        "notification_effect": {
-            "kind": "cron-admin-pending-notification/v1",
-            "frame_id": frame_id,
-        },
+        "recovery_registration": registration,
+        "notification_effect": effect,
+    }
+
+
+def _dispatch_ack(kwargs: dict[str, Any]) -> dict[str, Any]:
+    registration = kwargs["recovery_registration"]
+    claim = kwargs["recovery_dispatch_claim"]
+    return {
+        "schema_version": "cron-persist-recovery-dispatch-ack/v1",
+        "issuer": registration["issuer"],
+        "recovery_id": registration["recovery_id"],
+        "claim_id": claim["claim_id"],
+        "disposition": "accepted",
     }
 
 
@@ -211,7 +237,7 @@ def test_real_create_stale_v2_derives_one_blocked_recovery_and_replays_once(
             == 0
         )
         post_calls.append(copy.deepcopy(kwargs))
-        return []
+        return [_dispatch_ack(kwargs)]
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_mandatory_hook", invoke_mandatory)
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_post)
@@ -233,6 +259,7 @@ def test_real_create_stale_v2_derives_one_blocked_recovery_and_replays_once(
     assert stored is not None
     assert stored["pending_id"] == recovery["pending_id"]
     assert stored["frame_id"] == recovery["frame_id"]
+    assert stored["dispatch"]["disposition"] == "dispatched"
     with sqlite3.connect(recovery_store / "cron" / "persist-recovery.sqlite3") as conn:
         assert (
             conn.execute("SELECT count(*) FROM cron_persist_recoveries").fetchone()[0]
@@ -258,7 +285,7 @@ def test_concurrent_stale_create_registers_one_recovery_frame_and_effect(
     def invoke_post(_name: str, **_kwargs: Any) -> list[Any]:
         with count_lock:
             counts["post"] += 1
-        return []
+        return [_dispatch_ack(_kwargs)]
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_mandatory_hook", invoke_mandatory)
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_post)
@@ -544,3 +571,272 @@ def test_recovery_record_failure_does_not_dispatch_registered_effect(
         create_job(prompt=None, schedule="", governance_resume=package)
 
     assert exc_info.value.decision["reason"] == "resume_recovery_store_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("mutate_report", "reason"),
+    [
+        (
+            lambda block: _report(
+                block,
+                {"action": "block", "reason": "second_policy_block"},
+            ),
+            "resume_recovery_registration_ambiguous",
+        ),
+        (
+            lambda block: _report({
+                **block,
+                "post_persist_effects": [
+                    {"kind": "second-effect", "frame_id": "other"}
+                ],
+            }),
+            "resume_recovery_registration_invalid",
+        ),
+        (
+            lambda block: _report({
+                **block,
+                "recovery_registration": {
+                    **block["recovery_registration"],
+                    "recovery_id": f"sha256:{'f' * 64}",
+                },
+            }),
+            "resume_recovery_registration_invalid",
+        ),
+        (
+            lambda block: _report({
+                **block,
+                "recovery_registration": {
+                    **block["recovery_registration"],
+                    "issuer": {"id": "unversioned"},
+                },
+            }),
+            "resume_recovery_registration_invalid",
+        ),
+    ],
+)
+def test_recovery_registration_counterexamples_fail_closed(
+    recovery_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_report,
+    reason: str,
+) -> None:
+    skill = _write_skill(recovery_store)
+    package = _resume_package(_candidate(recovery_store), "create")
+    skill.write_text(skill.read_text(encoding="utf-8") + "Drift.\n", encoding="utf-8")
+
+    def invalid_registration(_name: str, **kwargs: Any) -> dict[str, Any]:
+        return mutate_report(_fresh_block(kwargs["recovery_context"]))
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_mandatory_hook", invalid_registration
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *_args, **_kwargs: pytest.fail("invalid registration dispatched"),
+    )
+
+    with pytest.raises(CronJobGovernanceError) as exc_info:
+        create_job(prompt=None, schedule="", governance_resume=package)
+
+    assert exc_info.value.decision["reason"] == reason
+    assert not (recovery_store / "cron" / "persist-recovery.sqlite3").exists()
+
+
+def test_recovery_dispatch_survives_both_crash_windows_with_stable_outbox_key(
+    recovery_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cron.persist_recovery as recovery_store_module
+
+    CronPersistRecoveryStoreError = recovery_store_module.CronPersistRecoveryStoreError
+
+    skill = _write_skill(recovery_store)
+    package = _resume_package(_candidate(recovery_store), "create")
+    skill.write_text(skill.read_text(encoding="utf-8") + "Drift.\n", encoding="utf-8")
+    pre_calls = 0
+    observer_calls = 0
+    transport_keys: set[tuple[str, str]] = set()
+    transport_calls = 0
+
+    def block(_name: str, **kwargs: Any) -> dict[str, Any]:
+        nonlocal pre_calls
+        pre_calls += 1
+        return _report(_fresh_block(kwargs["recovery_context"]))
+
+    def observer(_name: str, **kwargs: Any) -> list[Any]:
+        nonlocal observer_calls, transport_calls
+        observer_calls += 1
+        key = (
+            kwargs["recovery_registration"]["recovery_id"],
+            kwargs["notification_effect"]["frame_id"],
+        )
+        if key not in transport_keys:
+            transport_keys.add(key)
+            transport_calls += 1
+        return [_dispatch_ack(kwargs)]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_mandatory_hook", block)
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", observer)
+    real_dispatch = __import__(
+        "cron.jobs", fromlist=["_dispatch_claimed_cron_recovery_effects"]
+    )._dispatch_claimed_cron_recovery_effects
+    monkeypatch.setattr(
+        "cron.jobs._dispatch_claimed_cron_recovery_effects",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(CronJobGovernanceError) as first_error:
+        create_job(prompt=None, schedule="", governance_resume=package)
+    recovery_id = first_error.value.payload()["recovery"]["recovery_id"]
+    database = recovery_store / "cron" / "persist-recovery.sqlite3"
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            "UPDATE cron_persist_recovery_dispatches SET claim_expires_at = 0 "
+            "WHERE recovery_id = ?",
+            (recovery_id,),
+        )
+    monkeypatch.setattr(
+        "cron.jobs._dispatch_claimed_cron_recovery_effects", real_dispatch
+    )
+
+    def fail_complete(*_args: Any, **_kwargs: Any) -> None:
+        raise CronPersistRecoveryStoreError("simulated crash after transport")
+
+    real_complete = recovery_store_module.complete_recovery_dispatch
+    monkeypatch.setattr(
+        "cron.persist_recovery.complete_recovery_dispatch", fail_complete
+    )
+    with pytest.raises(CronJobGovernanceError):
+        create_job(prompt=None, schedule="", governance_resume=package)
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            "UPDATE cron_persist_recovery_dispatches SET claim_expires_at = 0 "
+            "WHERE recovery_id = ?",
+            (recovery_id,),
+        )
+    monkeypatch.setattr(
+        "cron.persist_recovery.complete_recovery_dispatch", real_complete
+    )
+    with pytest.raises(CronJobGovernanceError):
+        create_job(prompt=None, schedule="", governance_resume=package)
+
+    stored = get_cron_persist_recovery(recovery_id, profile_home=recovery_store)
+    assert stored is not None
+    assert stored["dispatch"]["disposition"] == "dispatched"
+    assert pre_calls == 1
+    assert observer_calls == 2
+    assert transport_calls == 1
+
+
+def test_distinct_root_profiles_have_distinct_canonical_home_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = [tmp_path / "root-a", tmp_path / "root-b"]
+    for root in roots:
+        root.mkdir()
+    candidate = {
+        "id": "same-job-id",
+        "prompt": "same request",
+        "deliver": "local",
+    }
+    identities = []
+    monkeypatch.setenv("HERMES_PROFILE_ID", "default")
+    for root in roots:
+        with use_cron_store(root):
+            identities.append(cron_persist_resume_identity("create", candidate))
+
+    assert {identity["profile_id"] for identity in identities} == {"default"}
+    assert identities[0]["profile_home_sha256"] != identities[1]["profile_home_sha256"]
+    assert identities[0]["request_id"] != identities[1]["request_id"]
+
+
+def _minimal_recovery_record() -> dict[str, Any]:
+    return {
+        "schema_version": "cron-persist-recovery/v1",
+        "recovery_id": f"sha256:{'1' * 64}",
+        "rejected_receipt_id": f"sha256:{'2' * 64}",
+        "request_id": f"sha256:{'3' * 64}",
+        "profile_id": "default",
+        "operation": "create",
+        "candidate": {},
+        "decision": {"action": "block"},
+    }
+
+
+def test_recovery_store_rejects_out_of_profile_cron_directory(tmp_path: Path) -> None:
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        record_recovery,
+    )
+
+    profile = tmp_path / "profile"
+    outside = tmp_path / "outside"
+    profile.mkdir()
+    outside.mkdir()
+
+    with pytest.raises(CronPersistRecoveryStoreError, match="outside the profile"):
+        record_recovery(
+            outside / "cron",
+            _minimal_recovery_record(),
+            profile_home=profile,
+        )
+
+
+def test_recovery_store_rejects_symlinked_profile_ancestor(tmp_path: Path) -> None:
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        record_recovery,
+    )
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    linked = tmp_path / "linked-profile"
+    linked.symlink_to(profile, target_is_directory=True)
+
+    with pytest.raises(CronPersistRecoveryStoreError, match="symbolic link"):
+        record_recovery(
+            linked / "cron",
+            _minimal_recovery_record(),
+            profile_home=linked,
+        )
+
+
+def test_recovery_store_detects_final_file_swap_during_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cron.persist_recovery as recovery_store_module
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    cron_dir = profile / "cron"
+    stored = recovery_store_module.record_recovery(
+        cron_dir,
+        _minimal_recovery_record(),
+        profile_home=profile,
+    )
+    database = cron_dir / "persist-recovery.sqlite3"
+    replacement = cron_dir / "replacement.sqlite3"
+    shutil.copy2(database, replacement)
+    real_connect = recovery_store_module.sqlite3.connect
+    swapped = False
+
+    def swapping_connect(*args: Any, **kwargs: Any):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            os.replace(replacement, database)
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(recovery_store_module.sqlite3, "connect", swapping_connect)
+
+    with pytest.raises(
+        recovery_store_module.CronPersistRecoveryStoreError,
+        match="changed while opening",
+    ):
+        recovery_store_module.get_recovery(
+            cron_dir,
+            stored["recovery_id"],
+            profile_home=profile,
+        )
