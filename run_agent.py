@@ -1378,9 +1378,46 @@ class AIAgent:
         timeout the AIAgent.__init__ path configured.
         """
         cfg = get_provider_request_timeout(self.provider, self.model)
-        if cfg is not None:
-            return cfg
-        return env_float("HERMES_API_TIMEOUT", 1800.0)
+        configured = cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
+        deadline = getattr(self, "_request_timeout_deadline_monotonic", None)
+        if deadline is None:
+            return configured
+        return min(configured, self._remaining_request_timeout_budget())
+
+    def _remaining_request_timeout_budget(self) -> float:
+        """Return the caller-owned provider budget before cleanup grace."""
+        deadline = getattr(self, "_request_timeout_deadline_monotonic", None)
+        if deadline is None:
+            raise RuntimeError("Provider request deadline is not configured")
+        from agent.request_budget import ProviderRequestBudget
+
+        return ProviderRequestBudget(
+            deadline_monotonic=float(deadline),
+            cleanup_grace_seconds=max(
+                0.0,
+                float(
+                    getattr(
+                        self, "_request_timeout_cleanup_grace_seconds", 0.0
+                    )
+                    or 0.0
+                ),
+            ),
+        ).remaining()
+
+    def configure_request_timeout_budget(
+        self,
+        *,
+        deadline_monotonic: float,
+        cleanup_grace_seconds: float,
+    ) -> None:
+        """Bind this agent and its helper clients to the Cron run budget."""
+        self._request_timeout_deadline_monotonic = float(deadline_monotonic)
+        self._request_timeout_cleanup_grace_seconds = max(
+            0.0, float(cleanup_grace_seconds)
+        )
+        compressor = getattr(self, "context_compressor", None)
+        if compressor is not None and hasattr(compressor, "request_timeout_resolver"):
+            compressor.request_timeout_resolver = self._remaining_request_timeout_budget
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
@@ -5148,7 +5185,14 @@ class AIAgent:
             client = build_anthropic_client(
                 self._anthropic_api_key,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=(
+                    self._resolved_api_call_timeout()
+                    if getattr(
+                        self, "_request_timeout_deadline_monotonic", None
+                    )
+                    is not None
+                    else get_provider_request_timeout(self.provider, self.model)
+                ),
                 drop_context_1m_beta=_drop_1m,
             )
         logger.debug(

@@ -3932,6 +3932,30 @@ class BasePlatformAdapter(ABC):
                 return
         await self.stop_typing(chat_id)
 
+    @staticmethod
+    def normalize_delivery_result(result: Any, *, operation: str) -> SendResult:
+        """Normalize adapter delivery results and fail closed on no evidence.
+
+        Platform overrides must return ``SendResult``.  Older adapters that
+        accidentally return ``None`` are treated as failed delivery, never as
+        an omitted recovery part that a later successful text send can mask.
+        """
+        if isinstance(result, SendResult):
+            return result
+        if result is None:
+            return SendResult(
+                success=False,
+                error=f"{operation} returned no SendResult delivery evidence",
+            )
+        return SendResult(
+            success=bool(getattr(result, "success", False)),
+            message_id=(
+                str(getattr(result, "message_id", "") or "") or None
+            ),
+            error=str(getattr(result, "error", "") or ""),
+            retryable=bool(getattr(result, "retryable", False)),
+        )
+
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -3992,6 +4016,9 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=image_metadata,
                     )
+                img_result = self.normalize_delivery_result(
+                    img_result, operation="send_multiple_images item"
+                )
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                 results.append(img_result)
@@ -5849,11 +5876,15 @@ class BasePlatformAdapter(ABC):
                 return
             recovery.future.set_result({"status": "completed"})
 
-        def _record_delivery(result, *, recovery_part: bool = True):
+        def _record_delivery(
+            result,
+            *,
+            recovery_part: bool = True,
+            operation: str = "delivery",
+        ):
             nonlocal delivery_attempted, delivery_succeeded, last_delivery_result
             nonlocal confirmed_delivery_result
-            if result is None:
-                return
+            result = self.normalize_delivery_result(result, operation=operation)
             last_delivery_result = result
             delivery_attempted = True
             if getattr(result, "success", False):
@@ -6311,7 +6342,9 @@ class BasePlatformAdapter(ABC):
                             metadata=_delivery_metadata("remote-image-batch"),
                             human_delay=human_delay,
                         )
-                        _record_delivery(batch_result)
+                        _record_delivery(
+                            batch_result, operation="send_multiple_images remote batch"
+                        )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
                         _record_delivery(SendResult(success=False, error=str(batch_err)))
@@ -6355,7 +6388,9 @@ class BasePlatformAdapter(ABC):
                             metadata=_delivery_metadata("local-image-batch"),
                             human_delay=human_delay,
                         )
-                        _record_delivery(batch_result)
+                        _record_delivery(
+                            batch_result, operation="send_multiple_images local batch"
+                        )
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
                         _record_delivery(SendResult(success=False, error=str(batch_err)))
@@ -6399,11 +6434,13 @@ class BasePlatformAdapter(ABC):
                         _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
-                            await self._notify_media_delivery_failure(
+                            await delivery_adapter._notify_media_delivery_failure(
                                 event.source.chat_id,
                                 media_path,
                                 is_voice=is_voice,
-                                metadata=_final_thread_metadata,
+                                metadata=_delivery_metadata(
+                                    f"media:{media_index}:failure-notice"
+                                ),
                             )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
@@ -6435,10 +6472,12 @@ class BasePlatformAdapter(ABC):
                                 ext,
                                 file_result.error,
                             )
-                            await self._notify_media_delivery_failure(
+                            await delivery_adapter._notify_media_delivery_failure(
                                 event.source.chat_id,
                                 file_path,
-                                metadata=_final_thread_metadata,
+                                metadata=_delivery_metadata(
+                                    f"local-file:{file_index}:failure-notice"
+                                ),
                             )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)

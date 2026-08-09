@@ -2931,21 +2931,29 @@ def _relay_sync_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
+    from agent.request_budget import cap_provider_request_timeout
+
+    request_kwargs = dict(kwargs)
+    configured_timeout = request_kwargs.get("timeout")
+    if isinstance(configured_timeout, (int, float)) and not isinstance(
+        configured_timeout, bool
+    ):
+        request_kwargs["timeout"] = cap_provider_request_timeout(configured_timeout)
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
     if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
+        return _run_protected_sync_provider_call(callback, request_kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.execute_current(
-        kwargs,
+        request_kwargs,
         lambda request: _run_protected_sync_provider_call(callback, request),
         name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model),
+        model_name=str(request_kwargs.get("model") or fallback_model),
         metadata=metadata,
         defer_logical_completion=True,
     )
@@ -2959,18 +2967,26 @@ async def _relay_async_completion(
     api_mode: str | None = None,
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
+    from agent.request_budget import cap_provider_request_timeout
+
+    request_kwargs = dict(kwargs)
+    configured_timeout = request_kwargs.get("timeout")
+    if isinstance(configured_timeout, (int, float)) and not isinstance(
+        configured_timeout, bool
+    ):
+        request_kwargs["timeout"] = cap_provider_request_timeout(configured_timeout)
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return await callback(kwargs)
+        return await callback(request_kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return await relay_llm.execute_current_async(
-        kwargs,
+        request_kwargs,
         callback,
         name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model),
+        model_name=str(request_kwargs.get("model") or fallback_model),
         metadata=metadata,
         defer_logical_completion=True,
     )
@@ -2983,17 +2999,25 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
+    from agent.request_budget import cap_provider_request_timeout
+
+    request_kwargs = dict(kwargs)
+    configured_timeout = request_kwargs.get("timeout")
+    if isinstance(configured_timeout, (int, float)) and not isinstance(
+        configured_timeout, bool
+    ):
+        request_kwargs["timeout"] = cap_provider_request_timeout(configured_timeout)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return client.chat.completions.create(**request_kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.stream_current(
-        kwargs,
+        request_kwargs,
         lambda request: client.chat.completions.create(**request),
         name=provider_name,
-        model_name=str(kwargs.get("model") or fallback_model),
+        model_name=str(request_kwargs.get("model") or fallback_model),
         finalizer=dict,
         metadata=metadata,
         completed_response_predicate=lambda value: hasattr(value, "choices"),

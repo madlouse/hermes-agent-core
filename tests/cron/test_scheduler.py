@@ -1056,6 +1056,7 @@ class TestRunJobSessionPersistence:
         self, tmp_path, monkeypatch
     ):
         import threading
+        import time
 
         release_worker = threading.Event()
         worker_started = threading.Event()
@@ -1069,6 +1070,12 @@ class TestRunJobSessionPersistence:
                 pass
 
             def run_conversation(self, prompt):
+                observed["request_deadline"] = (
+                    self._request_timeout_deadline_monotonic
+                )
+                observed["cleanup_grace"] = (
+                    self._request_timeout_cleanup_grace_seconds
+                )
                 worker_started.set()
                 release_worker.wait(timeout=2)
                 from gateway.session_context import get_cron_runtime_context
@@ -1106,6 +1113,7 @@ class TestRunJobSessionPersistence:
             import concurrent.futures
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                started = time.monotonic()
                 future = executor.submit(
                     run_job,
                     {
@@ -1117,12 +1125,17 @@ class TestRunJobSessionPersistence:
                 )
                 assert worker_started.wait(timeout=2)
                 success, _output, _response, error = future.result(timeout=2)
+                elapsed = time.monotonic() - started
             assert success is False
             assert "total runtime limit" in (error or "")
+            assert elapsed < 1.5
+            assert observed["request_deadline"] > started
+            assert observed["cleanup_grace"] == pytest.approx(0.1)
             release_worker.set()
             assert late_check_done.wait(timeout=1)
 
-        assert observed == {"approval": False, "runtime": None}
+        assert observed["approval"] is False
+        assert observed["runtime"] is None
 
 
     @pytest.mark.parametrize("blocked_stage", ["mcp_discovery", "agent_init"])
