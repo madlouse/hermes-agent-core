@@ -271,6 +271,13 @@ class TestRunJobScript:
         class FakeChild:
             pid = 54322
 
+            def suspend(self):
+                calls["child_suspend"] = calls.get("child_suspend", 0) + 1
+
+            def children(self, recursive=False):
+                assert recursive is False
+                return []
+
             def kill(self):
                 calls["child_kill"] = calls.get("child_kill", 0) + 1
 
@@ -279,9 +286,13 @@ class TestRunJobScript:
         class FakePsutilParent:
             def __init__(self, pid):
                 assert pid == 54321
+                self.pid = pid
+
+            def suspend(self):
+                calls["parent_suspend"] = calls.get("parent_suspend", 0) + 1
 
             def children(self, recursive=False):
-                assert recursive is True
+                assert recursive is False
                 return [child]
 
         class FakeProcess:
@@ -313,7 +324,14 @@ class TestRunJobScript:
 
         sched_mod._kill_cron_process_group(FakeProcess())
 
-        assert calls == {"poll": 1, "kill": 1, "wait": 1, "child_kill": 1}
+        assert calls == {
+            "poll": 1,
+            "kill": 1,
+            "wait": 1,
+            "parent_suspend": 1,
+            "child_suspend": 1,
+            "child_kill": 1,
+        }
 
     def test_windows_cleanup_fails_closed_when_a_descendant_survives(
         self, monkeypatch
@@ -323,6 +341,13 @@ class TestRunJobScript:
         class FakeChild:
             pid = 65432
 
+            def suspend(self):
+                pass
+
+            def children(self, recursive=False):
+                assert recursive is False
+                return []
+
             def kill(self):
                 pass
 
@@ -331,9 +356,13 @@ class TestRunJobScript:
         class FakePsutilParent:
             def __init__(self, pid):
                 assert pid == 65431
+                self.pid = pid
+
+            def suspend(self):
+                pass
 
             def children(self, recursive=False):
-                assert recursive is True
+                assert recursive is False
                 return [child]
 
         class FakeProcess:
@@ -369,6 +398,92 @@ class TestRunJobScript:
 
         assert cleanup.completed is False
         assert isinstance(cleanup.error, RuntimeError)
+
+    def test_windows_cleanup_freezes_each_generation_before_kill(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        calls = []
+
+        class FakeLateChild:
+            pid = 76543
+
+            def suspend(self):
+                calls.append("late:suspend")
+
+            def children(self, recursive=False):
+                return []
+
+            def kill(self):
+                calls.append("late:kill")
+
+        late_child = FakeLateChild()
+
+        class FakeChild:
+            pid = 76542
+
+            def suspend(self):
+                calls.append("child:suspend")
+
+            def children(self, recursive=False):
+                return [late_child]
+
+            def kill(self):
+                calls.append("child:kill")
+
+        child = FakeChild()
+
+        class FakePsutilParent:
+            pid = 76541
+
+            def __init__(self, pid):
+                assert pid == self.pid
+
+            def suspend(self):
+                calls.append("parent:suspend")
+
+            def children(self, recursive=False):
+                return [child]
+
+        class FakeProcess:
+            pid = 76541
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                calls.append("parent:kill")
+
+            def wait(self):
+                calls.append("parent:wait")
+
+        monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            sched_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr="denied"),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                Process=FakePsutilParent,
+                wait_procs=lambda processes, timeout: (processes, []),
+            ),
+        )
+
+        sched_mod._kill_cron_process_group(FakeProcess())
+
+        assert calls == [
+            "parent:suspend",
+            "child:suspend",
+            "late:suspend",
+            "late:kill",
+            "child:kill",
+            "parent:kill",
+            "parent:wait",
+        ]
 
 
 class TestBuildJobPromptWithScript:

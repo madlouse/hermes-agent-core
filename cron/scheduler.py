@@ -3733,11 +3733,21 @@ def _kill_cron_process_group(process: subprocess.Popen) -> None:
                 import psutil
 
                 parent = psutil.Process(process.pid)
-                descendants = parent.children(recursive=True)
-                for child in descendants:
+                frozen_tree = [parent]
+                known_pids = {parent.pid}
+                cursor = 0
+                while cursor < len(frozen_tree):
+                    current = frozen_tree[cursor]
+                    cursor += 1
+                    current.suspend()
+                    for child in current.children(recursive=False):
+                        if child.pid not in known_pids:
+                            known_pids.add(child.pid)
+                            frozen_tree.append(child)
+                for child in reversed(frozen_tree[1:]):
                     child.kill()
                 process.kill()
-                _, alive = psutil.wait_procs(descendants, timeout=5)
+                _, alive = psutil.wait_procs(frozen_tree, timeout=5)
                 if alive:
                     raise RuntimeError(
                         "psutil could not terminate every cron descendant: "
