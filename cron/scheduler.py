@@ -3467,6 +3467,7 @@ def _run_job_script(
                 )
             else:
                 popen_kwargs["start_new_session"] = True
+            python_env_overlay: dict[str, str] = {}
             if suffix in {".sh", ".bash"}:
                 trusted_bash = (
                     _trusted_snapshot_shell_interpreter(script_snapshot)
@@ -3494,11 +3495,15 @@ def _run_job_script(
                 if snapshot_bash:
                     popen_kwargs["executable"] = bash_path
             else:
-                python_path = (
-                    str(captured_interpreter)
-                    if captured_interpreter
-                    else _windows_cron_python_invocation(sys.executable)[0]
-                )
+                if captured_interpreter:
+                    python_path = str(captured_interpreter)
+                elif sys.platform == "win32":
+                    python_path, python_env_overlay = _windows_cron_python_invocation(
+                        sys.executable
+                    )
+                else:
+                    python_path = sys.executable
+                    python_env_overlay = {}
                 argv = (
                     [
                         python_path,
@@ -3529,6 +3534,7 @@ def _run_job_script(
                     if key in _CRON_SNAPSHOT_ENV_ALLOWLIST
                 }
             sanitized_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            sanitized_env.update(python_env_overlay)
             if isinstance(script_snapshot, dict):
                 sanitized_env["PATH"] = _CRON_SNAPSHOT_EXECUTION_PATH
                 runtime_home = Path(script_snapshot["interpreter_path"]).parent.parent
