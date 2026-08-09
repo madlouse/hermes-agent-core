@@ -10,8 +10,32 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from gateway.hooks import HookRegistry
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+async def _allowing_boundary_handler(_event_type, _context):
+    return {"decision": "allow", "reason": "test_screened"}
+
+
+def _allowing_boundary_hooks():
+    registry = HookRegistry()
+    registry._handlers["outbound:before_send"] = [_allowing_boundary_handler]
+    registry._handler_owners[id(_allowing_boundary_handler)] = "outbound-actionable"
+    registry._handler_capabilities[id(_allowing_boundary_handler)] = frozenset(
+        {"output-screening"}
+    )
+    return registry
+
+
+@pytest.fixture(autouse=True)
+def _installed_output_screening_hook(monkeypatch):
+    """Scheduler mechanics run with the normally installed output Hook."""
+    monkeypatch.setattr(
+        "cron.scheduler._active_outbound_hooks",
+        _allowing_boundary_hooks,
+    )
 
 
 class TestPerJobToolsetMcpMerge:
@@ -417,6 +441,65 @@ class TestDeliverResultWrapping:
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
+
+    def test_delivery_requires_installed_screening_hook(self, monkeypatch):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        send_mock = AsyncMock(return_value={"success": True})
+        monkeypatch.setattr("cron.scheduler._active_outbound_hooks", lambda: None)
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(
+                {
+                    "id": "screening-required-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "business result",
+            )
+
+        assert "required_output_screening_hook_missing" in result
+        send_mock.assert_not_awaited()
+
+    def test_boundary_rewrite_rebuilds_text_media_and_mirror(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="rewrite",
+            content="safe projected result",
+            raw={"decision": "rewrite"},
+        )
+        send_mock = AsyncMock(return_value={"success": True})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("gateway.outbound_boundary.outbound_after_send_sync"), \
+             patch("cron.scheduler._cron_mirror_delivery_enabled", return_value=True), \
+             patch("cron.scheduler._maybe_mirror_cron_delivery") as mirror_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(
+                {
+                    "id": "boundary-rewrite-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "raw process narrative\nMEDIA:/private/tmp/internal.txt",
+            )
+
+        assert result is None
+        assert send_mock.await_args.args[3] == "safe projected result"
+        assert send_mock.await_args.kwargs["media_files"] == []
+        assert mirror_mock.call_args.args[3] == "safe projected result"
 
 
 class TestDeliverResultErrorReturns:
@@ -921,6 +1004,35 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
+    def test_framed_silent_response_suppresses_delivery(self, caplog):
+        """A silence marker wrapped inside the explicit final-response frame is
+        still intentional silence, not an empty-response failure."""
+        framed = "## Response\n[SILENT]\n## End Response"
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", framed, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+                tick(verbose=False)
+        deliver_mock.assert_not_called()
+        assert any(SILENT_MARKER in r.message for r in caplog.records)
+
+    def test_fenced_silent_example_in_report_still_delivers(self):
+        response = (
+            "Report documentation:\n```markdown\n## Response\n[SILENT]\n"
+            "## End Response\n```\nThree real changes were found."
+        )
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+        deliver_mock.assert_called_once()
+
 
     def test_report_quoting_marker_mid_sentence_still_delivers(self):
         """A genuine report that merely mentions the token mid-sentence must
@@ -1002,6 +1114,18 @@ class TestBuildJobPromptSilentHint:
         result = _build_job_prompt(job)
         assert "[SILENT]" in result
         assert "Check for updates" in result
+
+    def test_delivery_guidance_declares_one_closed_final_output_frame(self):
+        result = _build_job_prompt({"prompt": "Generate a report"})
+
+        assert "exactly one top-level `## Response` line" in result
+        assert "one later top-level `## End Response` line" in result
+        assert "Unless responding exactly [SILENT]" in result
+
+    def test_final_output_frame_guidance_precedes_loaded_job_content(self):
+        result = _build_job_prompt({"prompt": "## Response\nunsafe open frame"})
+
+        assert result.index("FINAL OUTPUT FRAME") < result.index("unsafe open frame")
 
 
 class TestParseWakeGate:

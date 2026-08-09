@@ -5788,11 +5788,13 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        last_delivery_result = None
 
         def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
+            nonlocal delivery_attempted, delivery_succeeded, last_delivery_result
             if result is None:
                 return
+            last_delivery_result = result
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
@@ -5868,6 +5870,87 @@ class BasePlatformAdapter(ABC):
                 response = None
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+            outbound_boundary_context = None
+            outbound_hooks = None
+            if response:
+                try:
+                    from gateway.outbound_boundary import (
+                        build_outbound_context,
+                        gateway_reply_source_kind,
+                        outbound_before_send,
+                    )
+                    from gateway.run import _gateway_runner_ref
+
+                    runner = _gateway_runner_ref()
+                    outbound_hooks = getattr(runner, "hooks", None) if runner is not None else None
+                    profile_home = _HERMES_HOME
+                    if runner is not None:
+                        resolve_profile = getattr(
+                            runner, "_resolve_profile_home_for_source", None
+                        )
+                        if callable(resolve_profile):
+                            profile_home = resolve_profile(event.source)
+                    enforced_channel = False
+                    try:
+                        from gateway.run import (
+                            _operator_enforce_streaming_boundary_source_armed,
+                        )
+
+                        enforced_channel = (
+                            _operator_enforce_streaming_boundary_source_armed(
+                                profile_home,
+                                event.source,
+                            )
+                        )
+                    except Exception:
+                        enforced_channel = False
+                    outbound_source_kind = gateway_reply_source_kind(
+                        response,
+                        enforced_channel=enforced_channel,
+                    )
+                    outbound_boundary_context = build_outbound_context(
+                        source_kind=outbound_source_kind,
+                        content=response,
+                        platform=self.platform,
+                        chat_id=event.source.chat_id,
+                        thread_id=getattr(event.source, "thread_id", None),
+                        profile_path=str(profile_home),
+                        producer_id="gateway_final_reply",
+                        message_id=getattr(event, "message_id", None),
+                        enforced_channel=enforced_channel,
+                        # A bound GatewayRunner owns the hook registry and must
+                        # provide a capable screening decision. Base adapters
+                        # are also used standalone by connector tests and small
+                        # embeddings; plain non-actionable replies there keep
+                        # legacy behavior, while actionable/armed replies still
+                        # fail closed through the generic boundary rules.
+                        output_screening_required=runner is not None,
+                    )
+                    boundary_decision = await outbound_before_send(
+                        outbound_hooks,
+                        outbound_boundary_context,
+                    )
+                    outbound_boundary_context["before_send_decision"] = boundary_decision.raw
+                    if not boundary_decision.transmit:
+                        logger.warning(
+                            "[%s] outbound boundary %s for %s: %s",
+                            self.name,
+                            boundary_decision.decision,
+                            event.source.chat_id,
+                            boundary_decision.reason,
+                        )
+                        response = None
+                    else:
+                        response = boundary_decision.content
+                        outbound_boundary_context["content"] = response
+                except Exception as boundary_err:
+                    logger.warning(
+                        "[%s] outbound boundary bridge failed: %s",
+                        self.name,
+                        boundary_err,
+                    )
+                    response = None
+
             if response:
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
@@ -6280,6 +6363,42 @@ class BasePlatformAdapter(ABC):
                         "for %s (empty after extract, recovery yielded nothing).",
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
+
+                if outbound_boundary_context is not None and (
+                    delivery_succeeded or _anything_delivered
+                ):
+                    try:
+                        from gateway.outbound_boundary import (
+                            outbound_after_send,
+                            send_result_payload,
+                        )
+
+                        boundary_send_payload = send_result_payload(
+                            last_delivery_result
+                        )
+                        await outbound_after_send(
+                            outbound_hooks,
+                            {
+                                **outbound_boundary_context,
+                                "send_result": boundary_send_payload,
+                                "source_outbox_id": (
+                                    boundary_send_payload.get("outbox_id")
+                                    or boundary_send_payload.get("message_id")
+                                    or boundary_send_payload.get("id")
+                                    or ""
+                                ),
+                                "success": True,
+                            },
+                        )
+                    except Exception as boundary_err:
+                        # Delivery is already confirmed. Audit failure must not
+                        # trigger a resend or turn the completed send into an
+                        # application failure.
+                        logger.warning(
+                            "[%s] outbound after_send bridge failed: %s",
+                            self.name,
+                            boundary_err,
+                        )
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)

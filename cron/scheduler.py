@@ -318,6 +318,13 @@ def _is_cron_silence_response(text: str) -> bool:
 
     return is_autonomous_silence_response(text)
 
+
+def _extract_cron_final_response(text: str) -> str:
+    """Unwrap the canonical explicit frame used by autonomous lanes."""
+    from gateway.response_filters import extract_explicit_final_response
+
+    return extract_explicit_final_response(text)
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -1402,6 +1409,48 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _active_outbound_hooks():
+    """Return the live gateway hook registry, if cron shares its process."""
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        return getattr(runner, "hooks", None) if runner is not None else None
+    except Exception:
+        return None
+
+
+def _record_confirmed_outbound_send(hooks, context, send_result) -> None:
+    """Emit after-send evidence without changing an already confirmed send."""
+    try:
+        from gateway.outbound_boundary import (
+            outbound_after_send_sync,
+            send_result_payload,
+        )
+
+        payload = send_result_payload(send_result)
+        outbound_after_send_sync(
+            hooks,
+            {
+                **context,
+                "send_result": payload,
+                "source_outbox_id": (
+                    payload.get("outbox_id")
+                    or payload.get("message_id")
+                    or payload.get("id")
+                    or ""
+                ),
+                "success": True,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': outbound after-send audit failed after confirmed delivery: %s",
+            context.get("job_id", "?"),
+            exc,
+        )
+
+
 def _is_channel_dm_topic(
     runtime_adapter: Any,
     chat_id: Any,
@@ -1518,10 +1567,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     else:
         delivery_content = content
 
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
+    # Media is extracted only after the mandatory output boundary so the Hook
+    # screens the exact candidate that can reach the sender.
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
@@ -1531,11 +1579,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
     except Exception:
         mirror_enabled = False
-    mirror_text = ""
-    if mirror_enabled:
-        _, mirror_text = BasePlatformAdapter.extract_media(content)
-        mirror_text = (mirror_text or "").strip()
-
     try:
         config = load_gateway_config()
     except Exception as e:
@@ -1692,6 +1735,76 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         )
         inchannel_seeded = False
 
+        try:
+            from gateway.outbound_boundary import (
+                build_outbound_context,
+                outbound_before_send_sync,
+            )
+
+            outbound_hooks = _active_outbound_hooks()
+            boundary_context = build_outbound_context(
+                source_kind="cron",
+                content=delivery_content,
+                platform=platform_name,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                profile_id=str(job.get("profile_id") or ""),
+                profile_path=str(job.get("profile_path") or _get_hermes_home()),
+                producer_id="cron",
+                job_id=str(job.get("id", "")),
+                run_id=str(job.get("last_run_id") or job.get("id", "")),
+                target={
+                    "transport_id": platform_name,
+                    "channel_id": chat_id,
+                    "thread_id": thread_id or "",
+                },
+                action_spec=job.get("action_spec") or job.get("cron_action_spec"),
+                action_specs=(
+                    job.get("action_specs") or job.get("cron_action_specs")
+                ),
+                actionability=job.get("actionability"),
+                gate_mode=job.get("actionable_gate_mode"),
+                decision_route=job.get("decision_route"),
+                result_route=job.get("result_route"),
+                continuation_evidence=job.get("continuation_evidence"),
+                output_screening_required=True,
+            )
+            boundary_decision = outbound_before_send_sync(
+                outbound_hooks,
+                boundary_context,
+            )
+            boundary_context["before_send_decision"] = boundary_decision.raw
+            if not boundary_decision.transmit:
+                msg = (
+                    f"outbound boundary {boundary_decision.decision}: "
+                    f"{boundary_decision.reason}"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            boundary_media_files, boundary_delivery_content = (
+                BasePlatformAdapter.extract_media(boundary_decision.content)
+            )
+            boundary_media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                boundary_media_files
+            )
+            boundary_context["content"] = boundary_delivery_content
+            boundary_unchanged = (
+                boundary_decision.decision == "allow"
+                and boundary_decision.content == delivery_content
+            )
+            if boundary_unchanged:
+                _, boundary_mirror_text = BasePlatformAdapter.extract_media(content)
+            else:
+                boundary_mirror_text = boundary_delivery_content
+            boundary_mirror_text = (boundary_mirror_text or "").strip()
+            boundary_send_result = None
+        except Exception as exc:
+            msg = f"outbound boundary failed: {exc}"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
         # Continuable cron (thread-preferred): when mirroring is enabled for the
         # origin target and the gateway is live, try to open a DEDICATED thread
         # for this job and deliver the brief into it. On thread-capable
@@ -1791,7 +1904,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = boundary_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -1881,6 +1994,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # confirmation/thread-fallback inspection below.
                             pass
                         else:
+                            boundary_send_result = send_result
                             # _deliver_to_platform returns either a SendResult
                             # (.success attr) or, when the silence-narration
                             # filter drops the message, a plain dict
@@ -1940,7 +2054,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
-                if adapter_ok and not timed_out and media_files:
+                if adapter_ok and not timed_out and boundary_media_files:
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
@@ -1953,15 +2067,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
-                        media_files,
+                        boundary_media_files,
                         routed_media_metadata or None,
                         loop,
                         job,
                         platform=platform,
                     )
-                elif timed_out and media_files:
+                elif timed_out and boundary_media_files:
                     msg = (
-                        f"{len(media_files)} media attachment(s) not delivered to "
+                        f"{len(boundary_media_files)} media attachment(s) not delivered to "
                         f"{platform_name}:{chat_id} (live adapter confirmation timed out)"
                     )
                     logger.warning("Job '%s': %s", job["id"], msg)
@@ -1970,12 +2084,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    _record_confirmed_outbound_send(
+                        outbound_hooks,
+                        boundary_context,
+                        boundary_send_result,
+                    )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
                         _seed_cron_thread_session(
                             job, runtime_adapter, platform_name, chat_id,
-                            opened_thread_id, mirror_text,
+                            opened_thread_id, boundary_mirror_text,
                             chat_name=origin.get("chat_name"),
                         )
                         thread_seeded = True
@@ -1986,12 +2105,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     if in_channel_surface and mirror_this_target and not thread_seeded:
                         inchannel_seeded = _seed_cron_channel_session(
                             job, runtime_adapter, platform_name, chat_id,
-                            mirror_text, is_dm=is_dm_target,
+                            boundary_mirror_text, is_dm=is_dm_target,
                             user_id=origin_user_id,
                             chat_name=origin.get("chat_name"),
                         )
                     _maybe_mirror_cron_delivery(
-                        job, platform_name, chat_id, mirror_text,
+                        job, platform_name, chat_id, boundary_mirror_text,
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
@@ -2031,7 +2150,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                boundary_delivery_content,
+                thread_id=thread_id,
+                media_files=boundary_media_files,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2060,7 +2186,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                boundary_delivery_content,
+                                thread_id=thread_id,
+                                media_files=boundary_media_files,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2093,8 +2229,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            _record_confirmed_outbound_send(
+                outbound_hooks,
+                boundary_context,
+                result,
+            )
             _maybe_mirror_cron_delivery(
-                job, platform_name, chat_id, mirror_text,
+                job, platform_name, chat_id, boundary_mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
@@ -2660,7 +2801,12 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        "findings normally, or say [SILENT] and nothing more. "
+        "FINAL OUTPUT FRAME: Unless responding exactly [SILENT], put only "
+        "the complete user-visible result between exactly one top-level "
+        "`## Response` line and one later top-level `## End Response` line. "
+        "Do not use either heading in analysis, skill text, code fences, or "
+        "intermediate output.]\n\n"
     )
     prompt = cron_hint + prompt
     if not legacy_skill_names and not bindings:
@@ -3839,6 +3985,14 @@ def run_job(
             )
 
         final_response = result.get("final_response", "") or ""
+        # Frame-unwrap before the silence/empty checks.  The agent sometimes
+        # wraps the marker inside the explicit final-response frame it is told
+        # to use for business results ("## Response\n[SILENT]\n## End Response").
+        # The marker is still the entire user-visible payload, so a legitimate
+        # quiet tick must be treated as silence, not an empty-response failure.
+        _projected_final = _extract_cron_final_response(final_response)
+        if _projected_final:
+            final_response = _projected_final
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -4151,7 +4305,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            deliver_content = (
+                _extract_cron_final_response(final_response)
+                if success
+                else _summarize_cron_failure_for_delivery(job, error)
+            )
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.

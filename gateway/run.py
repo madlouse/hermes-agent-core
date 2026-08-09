@@ -330,6 +330,248 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _operator_streaming_boundary_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+    return None
+
+
+def _operator_streaming_boundary_platform(value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "", _gateway_platform_value(value))
+    return {
+        "lark": "feishu",
+        "qihu360": "qihu360teams",
+        "qihu360team": "qihu360teams",
+        "360team": "qihu360teams",
+        "360teams": "qihu360teams",
+    }.get(normalized, normalized)
+
+
+def _operator_streaming_boundary_channel_items(policy: dict[str, Any]) -> list[tuple[Any, dict[str, Any]]]:
+    channels = policy.get("channels") if isinstance(policy, dict) else None
+    if isinstance(channels, list):
+        return [(index, channel) for index, channel in enumerate(channels) if isinstance(channel, dict)]
+    if isinstance(channels, dict):
+        return [(key, channel) for key, channel in channels.items() if isinstance(channel, dict)]
+    return []
+
+
+def _operator_streaming_boundary_channel_matches(
+    channel: dict[str, Any],
+    container_key: Any,
+    *,
+    platform: Any,
+    chat_id: Any = None,
+    thread_id: Any = None,
+) -> bool:
+    if _operator_streaming_boundary_bool(channel.get("operator_enforce_enabled")) is not True:
+        return False
+
+    declared_platform = (
+        channel.get("platform")
+        or channel.get("transport_id")
+        or channel.get("adapter")
+        or ""
+    )
+    if declared_platform and (
+        _operator_streaming_boundary_platform(declared_platform)
+        != _operator_streaming_boundary_platform(platform)
+    ):
+        return False
+
+    targets = {str(value).strip() for value in (chat_id, thread_id) if str(value or "").strip()}
+    identities = {
+        str(channel.get(key) or "").strip()
+        for key in (
+            "channel_id",
+            "chat_id",
+            "group_id",
+            "thread_id",
+            "conversation_id",
+            "id",
+            "name",
+        )
+        if str(channel.get(key) or "").strip()
+    }
+    if isinstance(container_key, str) and container_key.strip():
+        identities.add(container_key.strip())
+
+    # Missing channel identity is ambiguous on an armed policy entry; buffer
+    # broadly for that platform instead of leaking a token before final gate.
+    if not targets or not identities:
+        return True
+    return bool(targets & identities)
+
+
+def _operator_enforce_streaming_boundary_source_armed(profile_path: Any, source: Any) -> bool:
+    """True when source's channel_policy arms operator-enforce for streaming."""
+    policy_path = Path(profile_path).expanduser() / "channel_policy.toml"
+    try:
+        try:
+            import tomllib as _toml
+        except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
+            import tomli as _toml  # type: ignore
+        policy = _toml.loads(policy_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "Operator-enforce streaming boundary policy load failed for %s: %s",
+            policy_path,
+            exc,
+        )
+        return False
+
+    platform = getattr(source, "platform", "")
+    chat_id = getattr(source, "chat_id", None)
+    thread_id = getattr(source, "thread_id", None)
+
+    if _operator_streaming_boundary_bool(policy.get("operator_enforce_enabled")) is True:
+        return True
+    return any(
+        _operator_streaming_boundary_channel_matches(
+            channel,
+            container_key,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        for container_key, channel in _operator_streaming_boundary_channel_items(policy)
+    )
+
+
+def _resolve_output_streaming_modes(
+    profile_path: Any,
+    source: Any,
+    *,
+    streaming_enabled: bool,
+    interim_enabled: bool = False,
+) -> tuple[bool, bool, bool]:
+    """Return ``(armed, stream_deltas, interim_messages)`` for one source.
+
+    An armed channel must not emit any user-visible model output until the
+    complete response has passed the durable outbound boundary. This decision
+    is made before consumers or callbacks are installed so no first token can
+    race ahead of screening.
+    """
+    armed = _operator_enforce_streaming_boundary_source_armed(
+        profile_path,
+        source,
+    )
+    return (
+        armed,
+        bool(streaming_enabled and not armed),
+        bool(interim_enabled and not armed),
+    )
+
+
+def _operator_enforce_outbound_boundary_for_source(
+    profile_path: Any,
+    source: Any,
+    content: str,
+    *,
+    hooks: Any = None,
+    producer_id: str = "gateway_final_reply",
+    message_id: Any = None,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Gate a complete reply before a direct platform send."""
+    if not content:
+        return True, content, None
+    enforced_channel = _operator_enforce_streaming_boundary_source_armed(
+        profile_path,
+        source,
+    )
+    try:
+        from gateway.outbound_boundary import build_outbound_context, outbound_before_send_sync
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Outbound boundary unavailable; holding complete reply: %s",
+            exc,
+        )
+        return False, "", {
+            "before_send_decision": {
+                "decision": "hold",
+                "reason": "outbound_boundary_unavailable",
+            }
+        }
+
+    context = build_outbound_context(
+        source_kind=("streaming_final_reply" if enforced_channel else "gateway_reply"),
+        content=content,
+        platform=getattr(source, "platform", ""),
+        chat_id=getattr(source, "chat_id", ""),
+        thread_id=getattr(source, "thread_id", None),
+        profile_path=str(profile_path),
+        producer_id=producer_id,
+        message_id=message_id,
+        enforced_channel=enforced_channel,
+        output_screening_required=True,
+    )
+    decision = outbound_before_send_sync(hooks, context)
+    context["before_send_decision"] = decision.raw
+    if not decision.transmit:
+        logging.getLogger(__name__).warning(
+            "Outbound boundary %s for %s: %s",
+            decision.decision,
+            getattr(source, "chat_id", ""),
+            decision.reason,
+        )
+        return False, "", context
+    return True, decision.content or content, context
+
+
+def _operator_enforce_outbound_after_send(
+    hooks: Any,
+    context: dict[str, Any] | None,
+    send_result: Any,
+) -> None:
+    if not context:
+        return
+    try:
+        from gateway.outbound_boundary import (
+            outbound_after_send_sync,
+            send_result_payload,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Operator-enforce outbound after-send boundary unavailable: %s",
+            exc,
+        )
+        return
+    payload = send_result_payload(send_result)
+    evidence = {
+        **context,
+        "send_result": payload,
+        "source_outbox_id": (
+            payload.get("outbox_id")
+            or payload.get("message_id")
+            or payload.get("id")
+            or ""
+        ),
+        "success": bool(payload.get("success")),
+        "send_attempt_id": f"gateway-{int(time.time() * 1000)}",
+        "completed_at": datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        outbound_after_send_sync(hooks, evidence)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Outbound after-send audit failed after delivery: %s",
+            exc,
+        )
+
+
 def _non_conversational_metadata(
     metadata: Optional[Dict[str, Any]] = None,
     *,
@@ -4375,8 +4617,39 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        try:
+            (
+                _operator_streaming_boundary_armed,
+                _want_stream_deltas,
+                _want_interim_messages,
+            ) = _resolve_output_streaming_modes(
+                self._runner._resolve_profile_home_for_source(ctx.source),
+                ctx.source,
+                streaming_enabled=_streaming_enabled,
+                interim_enabled=ctx.interim_assistant_messages_enabled,
+            )
+        except Exception as boundary_err:
+            logger.warning(
+                "Output streaming boundary resolution failed; buffering model output: %s",
+                boundary_err,
+            )
+            _operator_streaming_boundary_armed = True
+            _want_stream_deltas = False
+            _want_interim_messages = False
+        _streaming_boundary_buffered = bool(
+            _operator_streaming_boundary_armed
+            and (_streaming_enabled or ctx.interim_assistant_messages_enabled)
+        )
+        if _streaming_boundary_buffered:
+            logger.info(
+                "Streaming/interim buffered for output boundary: platform=%s chat=%s thread=%s",
+                _gateway_platform_value(ctx.source.platform),
+                ctx.source.chat_id,
+                getattr(ctx.source, "thread_id", None),
+            )
+            # Streaming TTS is another delta consumer and must not receive raw
+            # model output on an armed channel.
+            _stts_consumer_ref = None
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -4424,6 +4697,8 @@ class TurnRunner:
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
+                return
+            if _operator_streaming_boundary_armed:
                 return
             display_text = text
             if _stream_consumer is not None:
@@ -5056,10 +5331,72 @@ class TurnRunner:
             # the redacted value.
             cmd = _redact_approval_command(cmd)
 
+            # Build the exact user-visible fallback before choosing rich
+            # buttons. A rewrite cannot be represented safely by the structured
+            # button API, so rewritten decisions always use the screened text.
+            _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
+            approval_text = _format_exec_approval_fallback(
+                cmd,
+                desc,
+                _p,
+                allow_permanent=approval_data.get("allow_permanent", True),
+                allow_session=approval_data.get("allow_session", True),
+                smart_denied=approval_data.get("smart_denied", False),
+            )
+            try:
+                from gateway.outbound_boundary import (
+                    build_outbound_context,
+                    outbound_before_send_sync,
+                )
+
+                approval_hooks = getattr(self._runner, "hooks", None)
+                approval_context = build_outbound_context(
+                    source_kind="gateway_notice",
+                    content=approval_text,
+                    platform=ctx.source.platform,
+                    chat_id=ctx._status_chat_id,
+                    thread_id=getattr(ctx.source, "thread_id", None),
+                    profile_path=str(
+                        self._runner._resolve_profile_home_for_source(ctx.source)
+                    ),
+                    producer_id="gateway_approval",
+                    actionability={
+                        "requires_user_reply": True,
+                        "intent": "dangerous_command_approval",
+                        "risk": "high",
+                    },
+                    looks_actionable=True,
+                    output_screening_required=True,
+                )
+                approval_decision = outbound_before_send_sync(
+                    approval_hooks,
+                    approval_context,
+                )
+                approval_context["before_send_decision"] = approval_decision.raw
+                if not approval_decision.transmit:
+                    logger.warning(
+                        "Approval notice blocked by outbound boundary (%s): %s",
+                        approval_decision.decision,
+                        approval_decision.reason,
+                    )
+                    return
+                approval_context["content"] = approval_decision.content
+            except Exception as boundary_err:
+                logger.warning(
+                    "Approval notice outbound boundary failed: %s",
+                    boundary_err,
+                )
+                return
+
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
             # false positives from MagicMock auto-attribute creation in tests.
-            if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
+            if (
+                getattr(type(ctx._status_adapter), "send_exec_approval", None)
+                is not None
+                and approval_decision.decision == "allow"
+                and approval_decision.content == approval_text
+            ):
                 try:
                     _approval_fut = safe_schedule_threadsafe(
                         ctx._status_adapter.send_exec_approval(
@@ -5080,6 +5417,11 @@ class TurnRunner:
                         raise RuntimeError("send_exec_approval: loop unavailable")
                     _approval_result = _approval_fut.result(timeout=15)
                     if _approval_result.success:
+                        _operator_enforce_outbound_after_send(
+                            approval_hooks,
+                            approval_context,
+                            _approval_result,
+                        )
                         return
                     logger.warning(
                         "Button-based approval failed (send returned error), falling back to text: %s",
@@ -5094,15 +5436,7 @@ class TurnRunner:
             # typed prefix so Slack/Matrix users are told the form they
             # can actually type (`!approve`) — typed "/" is blocked in
             # Slack threads and reserved by Matrix clients.
-            _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
-            msg = _format_exec_approval_fallback(
-                cmd,
-                desc,
-                _p,
-                allow_permanent=approval_data.get("allow_permanent", True),
-                allow_session=approval_data.get("allow_session", True),
-                smart_denied=approval_data.get("smart_denied", False),
-            )
+            msg = approval_decision.content
             try:
                 _approval_send_fut = safe_schedule_threadsafe(
                     ctx._status_adapter.send(
@@ -5115,7 +5449,13 @@ class TurnRunner:
                     log_message="Approval text-send scheduling error",
                 )
                 if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
+                    _approval_result = _approval_send_fut.result(timeout=15)
+                    if getattr(_approval_result, "success", False):
+                        _operator_enforce_outbound_after_send(
+                            approval_hooks,
+                            approval_context,
+                            _approval_result,
+                        )
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
 
@@ -5628,6 +5968,7 @@ class TurnRunner:
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
+            "streaming_boundary_buffered": _streaming_boundary_buffered,
             # Pass through the agent_persisted flag so the persistence block
             # above can correctly determine whether the codex app-server path
             # self-persisted (it didn't — see codex_runtime.py).  Default
@@ -23683,6 +24024,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        _streaming_requested = _streaming_enabled
+        try:
+            (
+                _operator_streaming_boundary_armed,
+                _streaming_enabled,
+                _unused_interim_enabled,
+            ) = _resolve_output_streaming_modes(
+                self._resolve_profile_home_for_source(source),
+                source,
+                streaming_enabled=_streaming_enabled,
+            )
+        except Exception as boundary_err:
+            logger.warning(
+                "Proxy output streaming boundary resolution failed; buffering model output: %s",
+                boundary_err,
+            )
+            _operator_streaming_boundary_armed = True
+            _streaming_enabled = False
+        _streaming_boundary_buffered = bool(
+            _operator_streaming_boundary_armed and _streaming_requested
+        )
+        if _streaming_boundary_buffered:
+            logger.info(
+                "Proxy streaming buffered for output boundary: platform=%s chat=%s thread=%s",
+                _gateway_platform_value(source.platform),
+                source.chat_id,
+                getattr(source, "thread_id", None),
+            )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -23849,6 +24218,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "streaming_boundary_buffered": _streaming_boundary_buffered,
         }
 
     # ------------------------------------------------------------------
@@ -25375,15 +25745,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     elif first_response and not _already_streamed:
                         try:
-                            logger.info(
-                                "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                                session_key or "?",
-                            )
-                            await adapter.send(
-                                source.chat_id,
+                            (
+                                _boundary_allowed,
                                 first_response,
-                                metadata=_status_thread_metadata,
+                                _boundary_context,
+                            ) = _operator_enforce_outbound_boundary_for_source(
+                                self._resolve_profile_home_for_source(source),
+                                source,
+                                first_response,
+                                hooks=getattr(self, "hooks", None),
+                                producer_id="queued_followup_first_response",
+                                message_id=event_message_id,
                             )
+                            if not _boundary_allowed:
+                                logger.warning(
+                                    "Queued follow-up for session %s: first response held by operator-enforce boundary.",
+                                    session_key or "?",
+                                )
+                                first_response = ""
+                                result["final_response"] = ""
+                            else:
+                                logger.info(
+                                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                                    session_key or "?",
+                                )
+                                _first_send_result = await adapter.send(
+                                    source.chat_id,
+                                    first_response,
+                                    metadata=_status_thread_metadata,
+                                )
+                                _operator_enforce_outbound_after_send(
+                                    getattr(self, "hooks", None),
+                                    _boundary_context,
+                                    _first_send_result,
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
