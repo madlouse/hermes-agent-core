@@ -119,10 +119,24 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "state.db",
     "state.db-wal",
     "state.db-shm",
+    "transport-outbox.sqlite3",
+    "transport-outbox.sqlite3-wal",
+    "transport-outbox.sqlite3-shm",
+    ".transport-outbox.key",
     "sessions",
     "backups",
     "state-snapshots",
     "checkpoints",
+})
+
+# Core transport receipts and their integrity key are profile-local authority,
+# not portable profile content. Copying either side into another profile would
+# create unusable state at best and leak proof material at worst.
+_TRANSPORT_OUTBOX_PRIVATE_FILES: frozenset[str] = frozenset({
+    "transport-outbox.sqlite3",
+    "transport-outbox.sqlite3-wal",
+    "transport-outbox.sqlite3-shm",
+    ".transport-outbox.key",
 })
 
 # Marker file written by `hermes profile create --no-skills`.  When present in
@@ -222,7 +236,7 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "browser_screenshots", "checkpoints",
     "sandboxes",
     "logs",                 # gateway logs
-})
+}) | _TRANSPORT_OUTBOX_PRIVATE_FILES
 
 # Allow-list for ``export_profile("default")``: when HERMES_HOME equals the
 # cwd (Docker/custom deployments), the default profile home is the working
@@ -253,7 +267,7 @@ _HERMES_SUBCOMMANDS = frozenset({
     "chat", "model", "gateway", "setup", "whatsapp", "login", "logout",
     "status", "cron", "doctor", "dump", "config", "pairing", "skills", "tools",
     "mcp", "sessions", "insights", "version", "update", "uninstall",
-    "profile", "plugins", "honcho", "acp",
+    "profile", "plugins", "honcho", "acp", "transport-outbox",
 })
 
 
@@ -1933,7 +1947,7 @@ def export_profile(name: str, output_path: str) -> Path:
     # Named profiles — stage a filtered copy to exclude credentials
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
+        _CREDENTIAL_FILES = {"auth.json", ".env"} | _TRANSPORT_OUTBOX_PRIVATE_FILES
         shutil.copytree(
             profile_dir,
             staged,

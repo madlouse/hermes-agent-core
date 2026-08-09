@@ -913,6 +913,28 @@ class HermesConsoleEngine:
             mutating=True,
             confirmation="Send this message?",
         )
+        self.register(
+            ("transport-outbox", "verify"),
+            "transport-outbox verify --selector-json <json>",
+            "Verify a Core-owned transport receipt.",
+            _adder_handler(
+                "transport-outbox",
+                ("verify",),
+                "hermes_cli.transport_outbox_cmd",
+                "register_transport_outbox_subparser",
+            ),
+        )
+        self.register(
+            ("transport-outbox", "recover"),
+            "transport-outbox recover --selector-json <json>",
+            "Read Core's authoritative transport outcome for recovery.",
+            _adder_handler(
+                "transport-outbox",
+                ("recover",),
+                "hermes_cli.transport_outbox_cmd",
+                "register_transport_outbox_subparser",
+            ),
+        )
 
         portal_paths = [("info",), ("tools",)]
         _register_command_family(

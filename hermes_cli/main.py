@@ -11428,6 +11428,10 @@ def main():
     from hermes_cli.send_cmd import register_send_subparser
     register_send_subparser(subparsers)
 
+    # Core-owned, read-only transport receipt verification.
+    from hermes_cli.transport_outbox_cmd import register_transport_outbox_subparser
+    register_transport_outbox_subparser(subparsers)
+
     # =========================================================================
     # login command  (parser built in hermes_cli/subcommands/login.py)
     # =========================================================================
