@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -21,6 +22,11 @@ DISPATCH_ACK_SCHEMA_VERSION = "cron-persist-recovery-dispatch-ack/v1"
 _DB_FILENAME = "persist-recovery.sqlite3"
 _LOCK = threading.RLock()
 _DISPATCH_LEASE_SECONDS = 30.0
+_DARWIN_ROOT_ALIASES = {
+    Path("/var"): Path("/private/var"),
+    Path("/tmp"): Path("/private/tmp"),
+    Path("/etc"): Path("/private/etc"),
+}
 
 
 class CronPersistRecoveryStoreError(RuntimeError):
@@ -49,9 +55,27 @@ def _reject_symlink_components(path: Path) -> None:
             )
 
 
+def _canonicalize_trusted_root_alias(path: Path) -> Path:
+    absolute = path.expanduser().absolute()
+    if sys.platform != "darwin":
+        return absolute
+    for alias, target in _DARWIN_ROOT_ALIASES.items():
+        try:
+            relative = absolute.relative_to(alias)
+        except ValueError:
+            continue
+        try:
+            if alias.resolve(strict=True) != target.resolve(strict=True):
+                return absolute
+        except (OSError, RuntimeError):
+            return absolute
+        return target / relative
+    return absolute
+
+
 def _validated_paths(cron_dir: Path, profile_home: Path | None) -> tuple[Path, Path]:
-    raw_home = Path(profile_home or cron_dir.parent).expanduser().absolute()
-    raw_cron = Path(cron_dir).expanduser().absolute()
+    raw_home = _canonicalize_trusted_root_alias(Path(profile_home or cron_dir.parent))
+    raw_cron = _canonicalize_trusted_root_alias(Path(cron_dir))
     _reject_symlink_components(raw_home)
     _reject_symlink_components(raw_cron)
     try:
@@ -228,7 +252,9 @@ def _initialize(conn: sqlite3.Connection) -> None:
             registration_sha256 TEXT,
             effect_json TEXT,
             effect_sha256 TEXT,
+            dispatch_key TEXT,
             claim_id TEXT,
+            fence_token INTEGER NOT NULL DEFAULT 0,
             claimed_at REAL,
             claim_expires_at REAL,
             dispatched_at REAL,
@@ -248,6 +274,19 @@ def _initialize(conn: sqlite3.Connection) -> None:
         END;
         """
     )
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(cron_persist_recovery_dispatches)")
+    }
+    if "dispatch_key" not in columns:
+        conn.execute(
+            "ALTER TABLE cron_persist_recovery_dispatches ADD COLUMN dispatch_key TEXT"
+        )
+    if "fence_token" not in columns:
+        conn.execute(
+            "ALTER TABLE cron_persist_recovery_dispatches "
+            "ADD COLUMN fence_token INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _connect_write(
@@ -285,8 +324,11 @@ def _connect_read_only(
     _validate_file(path, cron_dir)
     if not path.exists():
         raise FileNotFoundError(path)
-    guard_fd, guard_info = _open_guard(path, writable=False)
-    uri = f"file:{quote(str(path))}?mode=ro&immutable=1&nofollow=1"
+    # Open read paths read-write so SQLite can acquire locks and roll back a
+    # hot DELETE journal left by a crashed writer. query_only below prevents
+    # application-level mutations after recovery completes.
+    guard_fd, guard_info = _open_guard(path, writable=True)
+    uri = f"file:{quote(str(path))}?mode=rw&nofollow=1"
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=10)
         conn.row_factory = sqlite3.Row
@@ -348,7 +390,9 @@ def _dispatch_projection(conn: sqlite3.Connection, recovery_id: str) -> dict[str
         )
     projection = {
         "disposition": str(row["disposition"]),
+        "dispatch_key": str(row["dispatch_key"] or ""),
         "claim_id": str(row["claim_id"] or ""),
+        "fence_token": int(row["fence_token"] or 0),
         "claimed_at": row["claimed_at"],
         "claim_expires_at": row["claim_expires_at"],
         "dispatched_at": row["dispatched_at"],
@@ -476,6 +520,15 @@ def record_recovery(
         _canonical_json(registration) if isinstance(registration, Mapping) else None
     )
     effect_json = _canonical_json(effect) if isinstance(effect, Mapping) else None
+    dispatch_key = (
+        str(registration.get("dispatch_key") or "").strip()
+        if isinstance(registration, Mapping)
+        else None
+    )
+    if registration_json is not None and not dispatch_key:
+        raise CronPersistRecoveryStoreError(
+            "Cron persist recovery dispatch key is missing."
+        )
     with _LOCK:
         conn = _connect_write(cron_dir, profile_home)
         try:
@@ -514,8 +567,8 @@ def record_recovery(
                 INSERT INTO cron_persist_recovery_dispatches(
                     recovery_id, disposition,
                     registration_json, registration_sha256,
-                    effect_json, effect_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    effect_json, effect_sha256, dispatch_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     normalized["recovery_id"],
@@ -524,6 +577,7 @@ def record_recovery(
                     _payload_hash(registration_json) if registration_json else None,
                     effect_json,
                     _payload_hash(effect_json) if effect_json else None,
+                    dispatch_key,
                 ),
             )
             conn.commit()
@@ -579,7 +633,8 @@ def claim_recovery_dispatch(
                 """
                 UPDATE cron_persist_recovery_dispatches
                 SET disposition = 'claimed', claim_id = ?, claimed_at = ?,
-                    claim_expires_at = ?, dispatched_at = NULL
+                    claim_expires_at = ?, dispatched_at = NULL,
+                    fence_token = fence_token + 1
                 WHERE recovery_id = ?
                 """,
                 (claim_id, claimed_at, expires_at, recovery_id),
@@ -598,24 +653,72 @@ def claim_recovery_dispatch(
             conn.close()
     registration = projection.get("registration")
     effect = projection.get("notification_effect")
-    if not isinstance(registration, dict) or not isinstance(effect, dict):
+    dispatch_key = str(projection.get("dispatch_key") or "")
+    fence_token = int(projection.get("fence_token") or 0)
+    if (
+        not isinstance(registration, dict)
+        or not isinstance(effect, dict)
+        or not dispatch_key
+        or fence_token < 1
+    ):
         raise CronPersistRecoveryStoreError(
             "Cron persist recovery claimed dispatch is incomplete."
         )
     return {
         "recovery_id": recovery_id,
+        "dispatch_key": dispatch_key,
         "claim_id": claim_id,
+        "fence_token": fence_token,
         "claimed_at": claimed_at,
         "claim_expires_at": expires_at,
+        "lease_seconds": max(float(lease_seconds), 0.001),
         "registration": registration,
         "notification_effect": effect,
     }
+
+
+def heartbeat_recovery_dispatch(
+    cron_dir: Path,
+    recovery_id: str,
+    claim_id: str,
+    fence_token: int,
+    *,
+    profile_home: Path | None = None,
+    now: float | None = None,
+    lease_seconds: float = _DISPATCH_LEASE_SECONDS,
+) -> bool:
+    """Extend one live fenced claim so a slow observer cannot be re-entered."""
+    heartbeat_at = float(time.time() if now is None else now)
+    expires_at = heartbeat_at + max(float(lease_seconds), 0.001)
+    with _LOCK:
+        conn = _connect_write(cron_dir, profile_home)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                """
+                UPDATE cron_persist_recovery_dispatches
+                SET claim_expires_at = ?
+                WHERE recovery_id = ? AND disposition = 'claimed'
+                    AND claim_id = ? AND fence_token = ?
+                """,
+                (expires_at, recovery_id, claim_id, int(fence_token)),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+        except sqlite3.DatabaseError as exc:
+            conn.rollback()
+            raise CronPersistRecoveryStoreError(
+                "Cron persist recovery dispatch heartbeat failed."
+            ) from exc
+        finally:
+            conn.close()
 
 
 def complete_recovery_dispatch(
     cron_dir: Path,
     recovery_id: str,
     claim_id: str,
+    fence_token: int,
     *,
     profile_home: Path | None = None,
     now: float | None = None,
@@ -631,9 +734,10 @@ def complete_recovery_dispatch(
                 UPDATE cron_persist_recovery_dispatches
                 SET disposition = 'dispatched', dispatched_at = ?,
                     claim_expires_at = NULL
-                WHERE recovery_id = ? AND disposition = 'claimed' AND claim_id = ?
+                WHERE recovery_id = ? AND disposition = 'claimed'
+                    AND claim_id = ? AND fence_token = ?
                 """,
-                (completed_at, recovery_id, claim_id),
+                (completed_at, recovery_id, claim_id, int(fence_token)),
             )
             if cursor.rowcount != 1:
                 raise CronPersistRecoveryStoreError(
@@ -656,6 +760,7 @@ def release_recovery_dispatch(
     cron_dir: Path,
     recovery_id: str,
     claim_id: str,
+    fence_token: int,
     *,
     profile_home: Path | None = None,
 ) -> None:
@@ -669,9 +774,10 @@ def release_recovery_dispatch(
                 UPDATE cron_persist_recovery_dispatches
                 SET disposition = 'pending', claim_id = NULL,
                     claimed_at = NULL, claim_expires_at = NULL
-                WHERE recovery_id = ? AND disposition = 'claimed' AND claim_id = ?
+                WHERE recovery_id = ? AND disposition = 'claimed'
+                    AND claim_id = ? AND fence_token = ?
                 """,
-                (recovery_id, claim_id),
+                (recovery_id, claim_id, int(fence_token)),
             )
             conn.commit()
         except sqlite3.DatabaseError as exc:

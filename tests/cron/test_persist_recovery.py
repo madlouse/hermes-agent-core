@@ -6,6 +6,8 @@ import copy
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -21,6 +23,7 @@ from cron.jobs import (
     _cron_resume_precondition_hash,
     _cron_stable_hash,
     create_job,
+    cron_persist_recovery_dispatch_key,
     cron_persist_resume_identity,
     get_cron_persist_recovery,
     load_jobs,
@@ -172,6 +175,11 @@ def _fresh_block(context: dict[str, Any]) -> dict[str, Any]:
         "frame_id": frame_id,
         "effect_hash": _cron_stable_hash(effect),
     }
+    registration["dispatch_key"] = cron_persist_recovery_dispatch_key(
+        context["recovery_id"],
+        registration["issuer"],
+        effect,
+    )
     return {
         "action": "block",
         "reason": "group_source_requires_admin_dm",
@@ -189,13 +197,19 @@ def _fresh_block(context: dict[str, Any]) -> dict[str, Any]:
 
 def _dispatch_ack(kwargs: dict[str, Any]) -> dict[str, Any]:
     registration = kwargs["recovery_registration"]
-    claim = kwargs["recovery_dispatch_claim"]
+    dispatch = kwargs["recovery_dispatch"]
     return {
-        "schema_version": "cron-persist-recovery-dispatch-ack/v1",
+        "schema_version": "cron-persist-recovery-dispatch-ack/v2",
         "issuer": registration["issuer"],
         "recovery_id": registration["recovery_id"],
-        "claim_id": claim["claim_id"],
-        "disposition": "accepted",
+        "dispatch_key": dispatch["dispatch_key"],
+        "disposition": "durably_accepted",
+        "durable_cas": {
+            "schema_version": "cron-persist-recovery-durable-cas/v1",
+            "dispatch_key": dispatch["dispatch_key"],
+            "owner_id": "test-outbox",
+            "cas_version": 1,
+        },
     }
 
 
@@ -762,6 +776,116 @@ def _minimal_recovery_record() -> dict[str, Any]:
         "candidate": {},
         "decision": {"action": "block"},
     }
+
+
+def _dispatch_recovery_record() -> dict[str, Any]:
+    record = _minimal_recovery_record()
+    effect = {"kind": "test-effect/v1", "frame_id": "frame-1"}
+    issuer = {"id": "test-governance", "version": "1"}
+    record["registration"] = {
+        "schema_version": "cron-persist-recovery-registration/v1",
+        "issuer": issuer,
+        "recovery_id": record["recovery_id"],
+        "pending_id": "pending-1",
+        "frame_id": "frame-1",
+        "effect_hash": _cron_stable_hash(effect),
+        "dispatch_key": cron_persist_recovery_dispatch_key(
+            record["recovery_id"], issuer, effect
+        ),
+    }
+    record["notification_effect"] = effect
+    return record
+
+
+def test_dispatch_heartbeat_fences_reentry_after_original_lease(
+    tmp_path: Path,
+) -> None:
+    from cron.persist_recovery import (
+        claim_recovery_dispatch,
+        heartbeat_recovery_dispatch,
+        record_recovery,
+    )
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    record = _dispatch_recovery_record()
+    cron_dir = profile / "cron"
+    record_recovery(cron_dir, record, profile_home=profile)
+    first = claim_recovery_dispatch(
+        cron_dir,
+        record["recovery_id"],
+        profile_home=profile,
+        now=10.0,
+        lease_seconds=0.03,
+    )
+    assert first is not None
+    assert heartbeat_recovery_dispatch(
+        cron_dir,
+        record["recovery_id"],
+        first["claim_id"],
+        first["fence_token"],
+        profile_home=profile,
+        now=10.02,
+        lease_seconds=0.03,
+    )
+    assert claim_recovery_dispatch(
+        cron_dir,
+        record["recovery_id"],
+        profile_home=profile,
+        now=10.04,
+        lease_seconds=0.03,
+    ) is None
+
+
+def test_read_recovers_hot_delete_journal(tmp_path: Path) -> None:
+    from cron.persist_recovery import get_recovery, record_recovery
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    cron_dir = profile / "cron"
+    record = _minimal_recovery_record()
+    record_recovery(cron_dir, record, profile_home=profile)
+    database = cron_dir / "persist-recovery.sqlite3"
+    script = """
+import os, sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.execute('PRAGMA journal_mode=DELETE')
+conn.execute('BEGIN IMMEDIATE')
+conn.execute("UPDATE cron_persist_recovery_dispatches SET disposition='claimed'")
+os._exit(0)
+"""
+    subprocess.run([sys.executable, "-c", script, str(database)], check=True)
+
+    recovered = get_recovery(
+        cron_dir,
+        record["recovery_id"],
+        profile_home=profile,
+    )
+
+    assert recovered is not None
+    assert recovered["dispatch"]["disposition"] == "not_required"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS root aliases")
+def test_darwin_var_profile_alias_is_canonicalized(tmp_path: Path) -> None:
+    from cron.persist_recovery import get_recovery, record_recovery
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    resolved = profile.resolve()
+    if not str(resolved).startswith("/private/var/"):
+        pytest.skip("pytest temp root is not under /private/var")
+    alias = Path("/var") / resolved.relative_to("/private/var")
+    record = _minimal_recovery_record()
+
+    record_recovery(alias / "cron", record, profile_home=alias)
+    recovered = get_recovery(
+        resolved / "cron",
+        record["recovery_id"],
+        profile_home=resolved,
+    )
+
+    assert recovered is not None
 
 
 def test_recovery_store_rejects_out_of_profile_cron_directory(tmp_path: Path) -> None:
