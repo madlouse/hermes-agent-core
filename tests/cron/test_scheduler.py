@@ -1026,6 +1026,9 @@ class TestRunJobSessionPersistence:
             assert elapsed < 2
             stage_release.set()
 
+    # Signals only throwaway parent/child processes created below in tmp_path.
+    # Without psutil the global guard cannot prove that isolated ancestry.
+    @pytest.mark.live_system_guard_bypass
     @pytest.mark.skipif(os.name == "nt", reason="requires POSIX process groups")
     def test_no_agent_deadline_sigkills_stubborn_process_groups_20_times(
         self, tmp_path
