@@ -11,13 +11,30 @@ from agent.request_budget import (
     reset_provider_request_budget,
     set_provider_request_budget,
 )
-from cron.scheduler import _CronRunControl, _RunJobResult, _run_job_result
+from cron.scheduler import (
+    _CRON_INTERRUPT_THREAD_PREFIX,
+    _CRON_INTERRUPT_WORKER_LIMIT,
+    _CronRunControl,
+    _RunJobResult,
+    _cron_bounded_interrupt_runner,
+    _run_job_impl,
+    _run_job_result,
+)
 from gateway.session_context import (
     get_cron_runtime_context,
     reset_cron_authorization,
     set_cron_authorization,
 )
 from run_agent import AIAgent
+
+
+def _wait_until(predicate, *, timeout=1.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
 
 
 def _bare_agent():
@@ -184,7 +201,150 @@ def test_interrupt_is_bounded_when_process_group_kill_never_returns():
         assert copied.run(get_cron_runtime_context) is None
         kill_group.assert_called_once_with(process)
     finally:
+        never_release.set()
+        assert cleanup.done.wait(timeout=1)
         reset_cron_authorization(tokens)
+
+
+def test_rejected_hard_interrupt_is_sticky_cleanup_incomplete():
+    control = _CronRunControl({"id": "proof-rejected-interrupt"})
+    control.set_agent(SimpleNamespace())
+
+    result = control.interrupt("deadline", cleanup_timeout=0.1)
+
+    assert result.cleanup_complete is True
+    assert result.agent_interrupt_complete is False
+    assert result.cleanup_incomplete is True
+    assert control.cleanup_incomplete() is True
+    assert _wait_until(
+        lambda: _cron_bounded_interrupt_runner.active_count() == 0
+    )
+
+
+def test_worker_result_preserves_rejected_interrupt_status():
+    control = _CronRunControl({"id": "proof-rejected-worker-result"})
+    control.set_agent(SimpleNamespace())
+    interrupt_result = control.interrupt("deadline", cleanup_timeout=0.1)
+    assert interrupt_result.cleanup_incomplete is True
+
+    with patch(
+        "cron.scheduler._run_job_body",
+        return_value=(True, "would-be success", "would-be success", None),
+    ):
+        result = _run_job_impl({}, _run_control=control)
+
+    assert result.success is False
+    assert result.cleanup_incomplete is True
+    assert "cleanup_incomplete" in (result.error or "")
+
+
+def test_interrupt_worker_capacity_is_fixed_nonqueued_and_reclaimed():
+    assert _wait_until(
+        lambda: _cron_bounded_interrupt_runner.active_count() == 0
+    )
+    release = threading.Event()
+    calls_lock = threading.Lock()
+    agent_calls = []
+    blocked_cleanups = []
+    rejected_cleanups = []
+
+    class BlockingAgent:
+        def __init__(self, identifier):
+            self.identifier = identifier
+
+        def hard_interrupt(self, message=None):
+            with calls_lock:
+                agent_calls.append(self.identifier)
+            release.wait(timeout=2)
+
+    def blocking_kill(candidate):
+        release.wait(timeout=2)
+
+    def live_bounded_workers():
+        return [
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith(_CRON_INTERRUPT_THREAD_PREFIX)
+        ]
+
+    kill_slots = _CRON_INTERRUPT_WORKER_LIMIT // 2
+    agent_slots = _CRON_INTERRUPT_WORKER_LIMIT - kill_slots
+    with patch(
+        "cron.scheduler._kill_cron_process_group", side_effect=blocking_kill
+    ) as kill_group:
+        try:
+            for index in range(kill_slots):
+                control = _CronRunControl({"id": f"capacity-kill-{index}"})
+                assert control.begin_script_spawn() is True
+                cleanup = control.attach_script_process(SimpleNamespace())
+                blocked_cleanups.append(cleanup)
+                result = control.interrupt("deadline", cleanup_timeout=0.01)
+                assert result.cleanup_incomplete is True
+
+            for index in range(agent_slots):
+                control = _CronRunControl({"id": f"capacity-agent-{index}"})
+                control.set_agent(BlockingAgent(f"blocked-{index}"))
+                result = control.interrupt("deadline", cleanup_timeout=0.01)
+                assert result.cleanup_incomplete is True
+
+            assert _wait_until(
+                lambda: _cron_bounded_interrupt_runner.active_count()
+                == _CRON_INTERRUPT_WORKER_LIMIT
+            )
+            assert len(live_bounded_workers()) == _CRON_INTERRUPT_WORKER_LIMIT
+
+            overflow_count = _CRON_INTERRUPT_WORKER_LIMIT * 3
+            started = time.monotonic()
+            for index in range(overflow_count):
+                control = _CronRunControl({"id": f"capacity-overflow-{index}"})
+                if index % 2:
+                    control.set_agent(BlockingAgent(f"rejected-{index}"))
+                else:
+                    assert control.begin_script_spawn() is True
+                    cleanup = control.attach_script_process(SimpleNamespace())
+                    rejected_cleanups.append(cleanup)
+                result = control.interrupt("deadline", cleanup_timeout=0.01)
+                assert result.cleanup_incomplete is True
+                assert control.cleanup_incomplete() is True
+
+            assert time.monotonic() - started < 0.2
+            time.sleep(0.02)
+            assert (
+                _cron_bounded_interrupt_runner.active_count()
+                == _CRON_INTERRUPT_WORKER_LIMIT
+            )
+            assert len(live_bounded_workers()) == _CRON_INTERRUPT_WORKER_LIMIT
+            assert kill_group.call_count == kill_slots
+            assert len(agent_calls) == agent_slots
+            assert all(cleanup.done.is_set() for cleanup in rejected_cleanups)
+            assert all(not cleanup.completed for cleanup in rejected_cleanups)
+        finally:
+            release.set()
+            assert _wait_until(
+                lambda: _cron_bounded_interrupt_runner.active_count() == 0
+            )
+            assert _wait_until(lambda: not live_bounded_workers())
+
+        assert all(cleanup.done.wait(timeout=1) for cleanup in blocked_cleanups)
+        assert kill_group.call_count == kill_slots
+        assert len(agent_calls) == agent_slots
+
+        recovered = _CronRunControl({"id": "capacity-recovered"})
+        recovered.set_agent(BlockingAgent("recovered"))
+        assert recovered.begin_script_spawn() is True
+        recovered_cleanup = recovered.attach_script_process(SimpleNamespace())
+        recovered_result = recovered.interrupt(
+            "deadline", cleanup_timeout=0.2
+        )
+
+        assert recovered_result.cleanup_incomplete is False
+        assert recovered_cleanup.completed is True
+        assert recovered.cleanup_incomplete() is False
+        assert _wait_until(
+            lambda: _cron_bounded_interrupt_runner.active_count() == 0
+        )
+        assert kill_group.call_count == kill_slots + 1
+        assert len(agent_calls) == agent_slots + 1
 
 
 def test_cleanup_owner_waiter_and_late_completion_share_one_kill():
@@ -249,6 +409,8 @@ def test_cleanup_owner_waiter_and_late_completion_share_one_kill():
         assert control._script_process is None
         assert control._script_cleanup is None
     finally:
+        release_kill.set()
+        assert cleanup.done.wait(timeout=1)
         reset_cron_authorization(tokens)
 
 
@@ -258,6 +420,7 @@ def test_run_result_reports_cleanup_incomplete_with_stuck_cleanup():
     release_worker = threading.Event()
     release_kill = threading.Event()
     result_holder = {}
+    cleanup_holder = {}
 
     def fake_run_job_impl(
         job,
@@ -268,7 +431,7 @@ def test_run_result_reports_cleanup_incomplete_with_stuck_cleanup():
         run_outcome_claim=None,
     ):
         assert _run_control.begin_script_spawn() is True
-        _run_control.attach_script_process(process)
+        cleanup_holder["cleanup"] = _run_control.attach_script_process(process)
         cleanup_attached.set()
         release_worker.wait(timeout=2)
         return _RunJobResult(True, "late", "late", None)
@@ -292,16 +455,21 @@ def test_run_result_reports_cleanup_incomplete_with_stuck_cleanup():
         started = time.monotonic()
         runner = threading.Thread(target=run_candidate)
         runner.start()
-        assert cleanup_attached.wait(timeout=1)
-        runner.join(timeout=0.25)
-        elapsed = time.monotonic() - started
+        try:
+            assert cleanup_attached.wait(timeout=1)
+            runner.join(timeout=0.25)
+            elapsed = time.monotonic() - started
 
-        assert not runner.is_alive()
-        assert elapsed < 0.2
-        result = result_holder["result"]
-        assert result.success is False
-        assert result.cleanup_incomplete is True
-        assert "cleanup_incomplete" in (result.error or "")
-
-        release_worker.set()
-        release_kill.set()
+            assert not runner.is_alive()
+            assert elapsed < 0.2
+            result = result_holder["result"]
+            assert result.success is False
+            assert result.cleanup_incomplete is True
+            assert "cleanup_incomplete" in (result.error or "")
+        finally:
+            release_worker.set()
+            release_kill.set()
+            runner.join(timeout=1)
+            cleanup = cleanup_holder.get("cleanup")
+            if cleanup is not None:
+                assert cleanup.done.wait(timeout=1)

@@ -25,7 +25,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -347,6 +347,61 @@ def _preparse_cron_run_timeout(job: dict) -> object | Optional[float]:
     return parsed if parsed > 0 else _CRON_ENTRY_TIMEOUT_UNSET
 
 
+_CRON_INTERRUPT_WORKER_LIMIT = 4
+_CRON_INTERRUPT_THREAD_PREFIX = "cron-bounded-interrupt"
+
+
+class _CronBoundedInterruptRunner:
+    """Run interrupt work only when a process-wide worker slot is available."""
+
+    def __init__(self, max_workers: int) -> None:
+        self.max_workers = max_workers
+        self._slots = threading.BoundedSemaphore(max_workers)
+        self._lock = threading.Lock()
+        self._active = 0
+        self._next_worker_id = 1
+
+    def submit(self, task: Callable[[], None], *, operation: str) -> bool:
+        """Start immediately or reject; this runner never queues work."""
+        if not self._slots.acquire(blocking=False):
+            return False
+        with self._lock:
+            worker_id = self._next_worker_id
+            self._next_worker_id += 1
+            self._active += 1
+
+        def _run() -> None:
+            try:
+                task()
+            finally:
+                with self._lock:
+                    self._active -= 1
+                    self._slots.release()
+
+        worker = threading.Thread(
+            target=_run,
+            name=f"{_CRON_INTERRUPT_THREAD_PREFIX}-{operation}-{worker_id}",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            with self._lock:
+                self._active -= 1
+                self._slots.release()
+            return False
+        return True
+
+    def active_count(self) -> int:
+        with self._lock:
+            return self._active
+
+
+_cron_bounded_interrupt_runner = _CronBoundedInterruptRunner(
+    _CRON_INTERRUPT_WORKER_LIMIT
+)
+
+
 @dataclass(frozen=True)
 class _CronInterruptResult:
     cleanup_complete: bool
@@ -425,17 +480,15 @@ class _CronScriptCleanup:
             self._perform(kill=kill)
             return self.completed
         if owner:
-            worker = threading.Thread(
-                target=self._perform_in_background,
-                kwargs={"kill": kill},
-                name="cron-script-cleanup",
-                daemon=True,
+            accepted = _cron_bounded_interrupt_runner.submit(
+                lambda: self._perform_in_background(kill=kill),
+                operation="script-cleanup",
             )
-            try:
-                worker.start()
-            except BaseException as exc:
+            if not accepted:
                 with self._lock:
-                    self._error = exc
+                    self._error = RuntimeError(
+                        "Cron interrupt worker capacity exhausted"
+                    )
                 self.done.set()
                 return False
         finished = self.done.wait(timeout=timeout)
@@ -618,6 +671,7 @@ class _CronRunControl:
             cleanup_timeout = self.cleanup_grace()
         cleanup_timeout = max(0.0, float(cleanup_timeout))
         cleanup_deadline = time.monotonic() + cleanup_timeout
+        script_spawn_incomplete = False
         with self._condition:
             self._interrupted = True
             agent = self._agent
@@ -628,31 +682,35 @@ class _CronRunControl:
                 remaining = cleanup_deadline - time.monotonic()
                 if remaining <= 0.0:
                     self._cleanup_incomplete = True
+                    script_spawn_incomplete = True
                     break
                 self._condition.wait(timeout=remaining)
             cleanup = self._script_cleanup
         if start_agent_interrupt:
             def _interrupt_agent() -> None:
                 try:
-                    request_hard_interrupt(agent, reason)
+                    accepted = request_hard_interrupt(agent, reason)
+                    if not accepted:
+                        with self._condition:
+                            self._agent_interrupt_failed = True
+                            self._cleanup_incomplete = True
                 except BaseException:
                     with self._condition:
                         self._agent_interrupt_failed = True
+                        self._cleanup_incomplete = True
                 finally:
                     self._agent_interrupt_done.set()
 
-            try:
-                threading.Thread(
-                    target=_interrupt_agent,
-                    name="cron-agent-interrupt",
-                    daemon=True,
-                ).start()
-            except BaseException:
+            accepted = _cron_bounded_interrupt_runner.submit(
+                _interrupt_agent,
+                operation="agent-interrupt",
+            )
+            if not accepted:
                 with self._condition:
                     self._agent_interrupt_failed = True
                     self._cleanup_incomplete = True
                 self._agent_interrupt_done.set()
-        cleanup_complete = cleanup is None and not self.cleanup_incomplete()
+        cleanup_complete = cleanup is None and not script_spawn_incomplete
         if cleanup is not None:
             cleanup_complete = self.cleanup_script_process(
                 cleanup,
@@ -5614,7 +5672,7 @@ def _run_job_body(
                 _elapsed,
                 _cron_run_timeout,
             )
-            request_hard_interrupt(agent, "Cron job exceeded total runtime limit")
+            _run_control.interrupt("Cron job exceeded total runtime limit")
             raise TimeoutError(
                 f"Cron job '{job_name}' exceeded total runtime limit of "
                 f"{_cron_run_timeout:g}s"
@@ -5641,7 +5699,7 @@ def _run_job_body(
                 _last_desc, _iter_n, _iter_max,
                 _cur_tool or "none",
             )
-            request_hard_interrupt(agent, "Cron job timed out (inactivity)")
+            _run_control.interrupt("Cron job timed out (inactivity)")
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
@@ -5892,9 +5950,30 @@ def _run_job_impl(
         run_outcome_claim=run_outcome_claim,
     )
     if isinstance(result, _RunJobResult):
+        cleanup_incomplete = bool(
+            result.cleanup_incomplete or _run_control.cleanup_incomplete()
+        )
+        if cleanup_incomplete:
+            return replace(
+                result,
+                success=False,
+                error=result.error
+                or "CleanupIncompleteError: cleanup_incomplete",
+                cleanup_incomplete=True,
+            )
         return result
     success, output, final_response, error = result
-    return _RunJobResult(success, output, final_response, error)
+    cleanup_incomplete = _run_control.cleanup_incomplete()
+    if cleanup_incomplete:
+        success = False
+        error = error or "CleanupIncompleteError: cleanup_incomplete"
+    return _RunJobResult(
+        success,
+        output,
+        final_response,
+        error,
+        cleanup_incomplete=cleanup_incomplete,
+    )
 
 
 def _run_job_result(
