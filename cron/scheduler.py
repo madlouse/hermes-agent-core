@@ -3697,11 +3697,13 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
 
 def _kill_cron_process_group(process: subprocess.Popen) -> None:
     """Immediately kill one cron script tree and synchronously reap its parent."""
-    if _IS_WINDOWS and process.poll() is not None:
-        return
-
     if _IS_WINDOWS:
+        if process.poll() is not None:
+            raise RuntimeError(
+                "Cannot prove Windows cron process-tree cleanup after parent exit"
+            )
         taskkill_succeeded = False
+        taskkill_failure = "taskkill returned a non-zero status"
         try:
             completed = subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -3714,17 +3716,43 @@ def _kill_cron_process_group(process: subprocess.Popen) -> None:
                 creationflags=windows_hide_flags(),
             )
             taskkill_succeeded = completed.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            if not taskkill_succeeded:
+                taskkill_failure = (
+                    f"taskkill exited {completed.returncode}: "
+                    f"{completed.stderr.strip()}"
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            taskkill_failure = f"taskkill failed: {exc}"
             logger.debug(
                 "Windows taskkill failed for cron process tree %s",
                 process.pid,
                 exc_info=True,
             )
-        if not taskkill_succeeded and process.poll() is None:
+        if not taskkill_succeeded:
             try:
+                import psutil
+
+                parent = psutil.Process(process.pid)
+                descendants = parent.children(recursive=True)
+                for child in descendants:
+                    child.kill()
                 process.kill()
-            except OSError:
-                pass
+                _, alive = psutil.wait_procs(descendants, timeout=5)
+                if alive:
+                    raise RuntimeError(
+                        "psutil could not terminate every cron descendant: "
+                        + ", ".join(str(child.pid) for child in alive)
+                    )
+            except BaseException as exc:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                process.wait()
+                raise RuntimeError(
+                    f"Windows cron process-tree cleanup is unproven ({taskkill_failure})"
+                ) from exc
     else:
         hard_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
         try:

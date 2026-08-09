@@ -1732,14 +1732,9 @@ def _cron_creation_governance_expected() -> bool:
     if not (plugin_dir / "plugin.yaml").is_file():
         return managed_profile
     try:
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import load_config_readonly
 
-        config_path = home / "config.yaml"
-        config = (
-            read_user_config_raw(config_path)
-            if config_path.is_file()
-            else {}
-        )
+        config = load_config_readonly()
         plugins = config.get("plugins") if isinstance(config, dict) else {}
         enabled = plugins.get("enabled") if isinstance(plugins, dict) else []
         disabled = plugins.get("disabled") if isinstance(plugins, dict) else []

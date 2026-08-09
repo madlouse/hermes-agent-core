@@ -268,6 +268,22 @@ class TestRunJobScript:
 
         calls = {"poll": 0, "kill": 0, "wait": 0}
 
+        class FakeChild:
+            pid = 54322
+
+            def kill(self):
+                calls["child_kill"] = calls.get("child_kill", 0) + 1
+
+        child = FakeChild()
+
+        class FakePsutilParent:
+            def __init__(self, pid):
+                assert pid == 54321
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [child]
+
         class FakeProcess:
             pid = 54321
 
@@ -286,10 +302,73 @@ class TestRunJobScript:
 
         monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
         monkeypatch.setattr(sched_mod.subprocess, "run", missing_taskkill)
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                Process=FakePsutilParent,
+                wait_procs=lambda children, timeout: (children, []),
+            ),
+        )
 
         sched_mod._kill_cron_process_group(FakeProcess())
 
-        assert calls == {"poll": 2, "kill": 1, "wait": 1}
+        assert calls == {"poll": 1, "kill": 1, "wait": 1, "child_kill": 1}
+
+    def test_windows_cleanup_fails_closed_when_a_descendant_survives(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        class FakeChild:
+            pid = 65432
+
+            def kill(self):
+                pass
+
+        child = FakeChild()
+
+        class FakePsutilParent:
+            def __init__(self, pid):
+                assert pid == 65431
+
+            def children(self, recursive=False):
+                assert recursive is True
+                return [child]
+
+        class FakeProcess:
+            pid = 65431
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                pass
+
+            def wait(self):
+                pass
+
+        monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            sched_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr="denied"),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                Process=FakePsutilParent,
+                wait_procs=lambda children, timeout: ([], children),
+            ),
+        )
+
+        cleanup = sched_mod._CronScriptCleanup(FakeProcess())
+        with pytest.raises(RuntimeError, match="cleanup is unproven"):
+            cleanup._perform(kill=True)
+
+        assert cleanup.completed is False
+        assert isinstance(cleanup.error, RuntimeError)
 
 
 class TestBuildJobPromptWithScript:
