@@ -347,6 +347,87 @@ def test_interrupt_worker_capacity_is_fixed_nonqueued_and_reclaimed():
         assert len(agent_calls) == agent_slots + 1
 
 
+def test_synchronous_cleanup_owners_share_bounded_runner_capacity():
+    assert _wait_until(
+        lambda: _cron_bounded_interrupt_runner.active_count() == 0
+    )
+    owner_count = _CRON_INTERRUPT_WORKER_LIMIT * 2
+    release = threading.Event()
+    start_barrier = threading.Barrier(owner_count + 1)
+    controls = []
+    cleanups = []
+    results = {}
+    result_lock = threading.Lock()
+
+    for index in range(owner_count):
+        control = _CronRunControl({"id": f"sync-owner-{index}"})
+        assert control.begin_script_spawn() is True
+        cleanup = control.attach_script_process(SimpleNamespace())
+        controls.append(control)
+        cleanups.append(cleanup)
+
+    def blocking_kill(candidate):
+        release.wait(timeout=2)
+
+    def run_owner(index):
+        start_barrier.wait(timeout=1)
+        result = controls[index].cleanup_script_process(
+            cleanups[index], kill=True, timeout=None
+        )
+        with result_lock:
+            results[index] = result
+
+    owners = [
+        threading.Thread(target=run_owner, args=(index,))
+        for index in range(owner_count)
+    ]
+    with patch(
+        "cron.scheduler._kill_cron_process_group", side_effect=blocking_kill
+    ) as kill_group:
+        try:
+            for owner in owners:
+                owner.start()
+            start_barrier.wait(timeout=1)
+
+            assert _wait_until(
+                lambda: _cron_bounded_interrupt_runner.active_count()
+                == _CRON_INTERRUPT_WORKER_LIMIT
+            )
+            assert _wait_until(
+                lambda: len(results)
+                == owner_count - _CRON_INTERRUPT_WORKER_LIMIT
+            )
+            assert kill_group.call_count <= _CRON_INTERRUPT_WORKER_LIMIT
+            assert (
+                _cron_bounded_interrupt_runner.active_count()
+                <= _CRON_INTERRUPT_WORKER_LIMIT
+            )
+            rejected = list(results)
+            assert all(results[index] is False for index in rejected)
+            assert all(controls[index].cleanup_incomplete() for index in rejected)
+            assert all(cleanups[index].done.is_set() for index in rejected)
+            assert all(not cleanups[index].completed for index in rejected)
+        finally:
+            release.set()
+            for owner in owners:
+                owner.join(timeout=1)
+
+        assert all(not owner.is_alive() for owner in owners)
+        assert len(results) == owner_count
+        assert sum(result is True for result in results.values()) == (
+            _CRON_INTERRUPT_WORKER_LIMIT
+        )
+        assert sum(result is False for result in results.values()) == (
+            owner_count - _CRON_INTERRUPT_WORKER_LIMIT
+        )
+        assert kill_group.call_count == _CRON_INTERRUPT_WORKER_LIMIT
+        assert _wait_until(
+            lambda: _cron_bounded_interrupt_runner.active_count() == 0
+        )
+        time.sleep(0.02)
+        assert kill_group.call_count == _CRON_INTERRUPT_WORKER_LIMIT
+
+
 def test_cleanup_owner_waiter_and_late_completion_share_one_kill():
     process = SimpleNamespace()
     control = _CronRunControl(

@@ -476,9 +476,6 @@ class _CronScriptCleanup:
             owner = not self._claimed
             if owner:
                 self._claimed = True
-        if owner and timeout is None:
-            self._perform(kill=kill)
-            return self.completed
         if owner:
             accepted = _cron_bounded_interrupt_runner.submit(
                 lambda: self._perform_in_background(kill=kill),
@@ -492,6 +489,10 @@ class _CronScriptCleanup:
                 self.done.set()
                 return False
         finished = self.done.wait(timeout=timeout)
+        if owner and timeout is None and finished:
+            error = self.error
+            if error is not None:
+                raise error
         return bool(finished and self.completed)
 
 
