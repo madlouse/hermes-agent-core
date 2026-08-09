@@ -449,6 +449,32 @@ class TestSensitivePathCheck:
         assert "error" in result
         assert "Hermes config" in result["error"]
 
+    def test_hermes_env_blocked_for_write_file(self, tmp_path, monkeypatch):
+        fake_env = tmp_path / ".env"
+        fake_env.write_text("TOKEN=secret\n", encoding="utf-8")
+        monkeypatch.setattr("tools.file_tools._hermes_env_resolved", str(fake_env))
+        monkeypatch.setattr("tools.file_tools._hermes_env_resolved_loaded", True)
+
+        from tools.file_tools import write_file_tool
+
+        result = json.loads(write_file_tool(str(fake_env), "TOKEN=replaced\n"))
+        assert "error" in result
+        assert "Hermes .env" in result["error"]
+
+    def test_hermes_env_blocked_through_symlink(self, tmp_path, monkeypatch):
+        fake_env = tmp_path / ".env"
+        fake_env.write_text("TOKEN=secret\n", encoding="utf-8")
+        alias = tmp_path / "settings.txt"
+        alias.symlink_to(fake_env)
+        monkeypatch.setattr("tools.file_tools._hermes_env_resolved", str(fake_env))
+        monkeypatch.setattr("tools.file_tools._hermes_env_resolved_loaded", True)
+
+        from tools.file_tools import write_file_tool
+
+        result = json.loads(write_file_tool(str(alias), "TOKEN=replaced\n"))
+        assert "error" in result
+        assert "Hermes .env" in result["error"]
+
 
     def test_system_path_still_blocked(self, monkeypatch):
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/some/other/path")
