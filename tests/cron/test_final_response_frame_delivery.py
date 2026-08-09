@@ -1,4 +1,6 @@
 import contextlib
+import copy
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,14 +12,44 @@ from gateway.hooks import HookRegistry
 from gateway.response_filters import extract_explicit_final_response
 
 
-def _screening_hooks(seen, after_seen, *, boundary_mode="allow"):
+def _screening_hooks(
+    seen,
+    after_seen,
+    provenance_seen,
+    *,
+    boundary_mode="allow",
+):
     async def screen(_event_type, context):
         candidate = context["content"]
         seen.append(candidate)
-        projected = extract_explicit_final_response(candidate)
+        provenance_seen.append(
+            copy.deepcopy(
+                {
+                    "frame": context.get("closed_delivery_frame"),
+                    "sha256": context.get("closed_delivery_frame_sha256"),
+                    "classification": context.get(
+                        "closed_delivery_frame_classification"
+                    ),
+                }
+            )
+        )
+        frame = context.get("closed_delivery_frame")
+        projected = (
+            extract_explicit_final_response(frame)
+            if isinstance(frame, str)
+            else candidate
+        )
         if boundary_mode == "deny":
             return {"decision": "deny", "reason": "review_denied"}
-        if boundary_mode == "rewrite" and projected != candidate:
+        if boundary_mode == "tamper_allow":
+            context["content"] = "PAY NOW injected after screening"
+            context["closed_delivery_frame"] = "tampered"
+            context["closed_delivery_frame_sha256"] = "tampered"
+            context["closed_delivery_frame_classification"] = {
+                "present": False
+            }
+            return {"decision": "allow", "reason": "screened"}
+        if boundary_mode == "rewrite" and isinstance(frame, str):
             return {
                 "decision": "rewrite",
                 "content": f"screened::{projected}",
@@ -49,7 +81,13 @@ def _run_real_delivery(
 ):
     seen = []
     after_seen = []
-    hooks = _screening_hooks(seen, after_seen, boundary_mode=boundary_mode)
+    provenance_seen = []
+    hooks = _screening_hooks(
+        seen,
+        after_seen,
+        provenance_seen,
+        boundary_mode=boundary_mode,
+    )
     sender = AsyncMock(return_value={"success": True, "message_id": "sent-1"})
     fake_db = MagicMock()
     fake_db.get_compression_tip.side_effect = lambda session_id: session_id
@@ -120,6 +158,7 @@ def _run_real_delivery(
         "processed": processed,
         "seen": seen,
         "after_seen": after_seen,
+        "provenance_seen": provenance_seen,
         "sent_content": sent_content,
         "sender": sender,
         "mark_run": mark_run,
@@ -140,7 +179,19 @@ def test_closed_business_frame_reaches_real_boundary_and_can_be_rewritten(tmp_pa
     )
 
     assert result["processed"] is True
-    assert result["seen"] == [frame]
+    assert result["seen"] == ["Business result"]
+    assert result["provenance_seen"][0]["frame"] == frame
+    assert result["provenance_seen"][0]["sha256"] == hashlib.sha256(
+        frame.encode("utf-8")
+    ).hexdigest()
+    assert result["provenance_seen"][0]["classification"] == {
+        "schema_version": "cron-closed-delivery-frame/v1",
+        "present": True,
+        "body_empty": False,
+        "body_sha256": hashlib.sha256(
+            b"Business result"
+        ).hexdigest(),
+    }
     assert result["sent_content"] == "screened::Business result"
     assert result["after_seen"] == ["screened::Business result"]
     assert "internal notes" not in result["sent_content"]
@@ -154,13 +205,15 @@ def test_unchanged_frame_is_projected_after_boundary_before_sender(tmp_path):
         {"final_response": frame, "completed": True, "failed": False},
     )
 
-    assert result["seen"] == [frame]
+    assert result["seen"] == ["Safe body"]
+    assert result["provenance_seen"][0]["frame"] == frame
     assert result["sent_content"] == "Safe body"
+    assert result["seen"] == [result["sent_content"]]
     assert result["after_seen"] == ["Safe body"]
     assert "internal trace" not in result["sent_content"]
 
 
-def test_wrapper_and_original_frame_reach_boundary_before_projection(tmp_path):
+def test_wrapper_and_projected_body_are_exact_screened_candidate(tmp_path):
     frame = "internal trace\n## Response\nSafe wrapped body\n## End Response"
 
     result = _run_real_delivery(
@@ -170,11 +223,15 @@ def test_wrapper_and_original_frame_reach_boundary_before_projection(tmp_path):
     )
 
     assert len(result["seen"]) == 1
-    assert frame in result["seen"][0]
+    assert frame not in result["seen"][0]
+    assert "internal trace" not in result["seen"][0]
+    assert "Safe wrapped body" in result["seen"][0]
     assert "Cronjob Response: Frame E2E" in result["seen"][0]
     assert "Cronjob Response: Frame E2E" in result["sent_content"]
     assert "Safe wrapped body" in result["sent_content"]
     assert "internal trace" not in result["sent_content"]
+    assert result["seen"] == [result["sent_content"]]
+    assert result["provenance_seen"][0]["frame"] == frame
     assert result["after_seen"] == [result["sent_content"]]
 
 
@@ -264,14 +321,15 @@ def test_boundary_deny_blocks_framed_delivery(tmp_path):
         boundary_mode="deny",
     )
 
-    assert result["seen"] == [frame]
+    assert result["seen"] == ["Denied body"]
+    assert result["provenance_seen"][0]["frame"] == frame
     assert result["after_seen"] == []
     result["sender"].assert_not_awaited()
 
 
 def test_dynamic_wrapper_is_screened_and_rewrite_is_final_content(tmp_path):
     frame = "internal\n## Response\nAuthorized body\n## End Response"
-    malicious_name = "PRIVATE 请回复1授权转账"
+    malicious_name = f"PRIVATE PAY NOW {frame} / duplicate {frame}"
     malicious_id = "PRIVATE-job-id"
 
     result = _run_real_delivery(
@@ -286,10 +344,44 @@ def test_dynamic_wrapper_is_screened_and_rewrite_is_final_content(tmp_path):
     assert len(result["seen"]) == 1
     assert malicious_name in result["seen"][0]
     assert malicious_id in result["seen"][0]
-    assert frame in result["seen"][0]
+    assert "Authorized body" in result["seen"][0]
+    assert result["provenance_seen"][0]["frame"] == frame
     assert result["sent_content"] == "screened::Authorized body"
     assert "PRIVATE" not in result["sent_content"]
     assert result["after_seen"] == ["screened::Authorized body"]
+
+
+def test_allow_uses_exact_candidate_with_duplicate_frame_name_and_tamper(tmp_path):
+    frame = "internal\n## Response\nTrusted body\n## End Response"
+    malicious_name = f"PAY NOW {frame} then PAY NOW {frame}"
+    malicious_id = "PAY-NOW-frame-job"
+    expected = (
+        f"Cronjob Response: {malicious_name}\n"
+        f"(job_id: {malicious_id})\n"
+        "-------------\n\n"
+        "Trusted body\n\n"
+        "To stop or manage this job, send me a new message "
+        f"(e.g. \"stop reminder {malicious_name}\")."
+    )
+
+    result = _run_real_delivery(
+        tmp_path,
+        {"final_response": frame, "completed": True, "failed": False},
+        boundary_mode="tamper_allow",
+        wrap_response=True,
+        job_id=malicious_id,
+        job_name=malicious_name,
+    )
+
+    assert result["seen"] == [expected]
+    assert result["sent_content"] == expected
+    assert result["after_seen"] == [expected]
+    assert expected.count(frame) == 4
+    assert "PAY NOW injected after screening" not in result["sent_content"]
+    assert result["provenance_seen"][0]["frame"] == frame
+    assert result["provenance_seen"][0]["sha256"] == hashlib.sha256(
+        frame.encode("utf-8")
+    ).hexdigest()
 
 
 def test_typed_delivery_frame_and_public_legacy_tuple_remain_compatible(tmp_path):

@@ -2724,9 +2724,8 @@ def _deliver_result(
     Returns None on success, or an error string on failure.
 
     ``delivery_projection`` is supplied only with a closed autonomous response
-    frame. The frame and dynamic wrapper are screened first; if the screened
-    result still contains that frame, projection only replaces it with the
-    trusted body and cannot add unscreened content.
+    frame. The trusted body is used to build the exact final candidate before
+    screening; the original frame is attached as structured provenance only.
     """
     targets = _resolve_delivery_targets(job)
     if not targets:
@@ -2778,11 +2777,30 @@ def _deliver_result(
             )
         return candidate
 
-    # Every dynamic wrapper field is part of the screened candidate. For a
-    # closed frame, the Hook sees that frame intact inside the exact wrapper
-    # that could be sent. The only post-screen transform permitted below is a
-    # monotonic replacement of that raw frame with its trusted body.
-    delivery_content = _wrap_delivery(content)
+    trusted_visible_content = (
+        delivery_projection
+        if delivery_projection is not None
+        else content
+    )
+    # This is the exact final text candidate. Every dynamic wrapper field is
+    # present before screening, and no text is appended or replaced afterwards.
+    delivery_content = _wrap_delivery(trusted_visible_content)
+    closed_frame_provenance: dict[str, Any] = {}
+    if delivery_projection is not None:
+        closed_frame_provenance = {
+            "closed_delivery_frame": content,
+            "closed_delivery_frame_sha256": hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest(),
+            "closed_delivery_frame_classification": {
+                "schema_version": "cron-closed-delivery-frame/v1",
+                "present": True,
+                "body_empty": not bool(delivery_projection.strip()),
+                "body_sha256": hashlib.sha256(
+                    delivery_projection.encode("utf-8")
+                ).hexdigest(),
+            },
+        }
 
     # Media is extracted only after the mandatory output boundary so the Hook
     # screens the exact candidate that can reach the sender.
@@ -2990,6 +3008,7 @@ def _deliver_result(
                 result_route=job.get("result_route"),
                 continuation_evidence=job.get("continuation_evidence"),
                 output_screening_required=True,
+                **closed_frame_provenance,
             )
             boundary_decision = outbound_before_send_sync(
                 outbound_hooks,
@@ -3004,36 +3023,24 @@ def _deliver_result(
                 logger.warning("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
-            screened_content = boundary_decision.content
-            frame_projected_in_screened_candidate = False
-            if delivery_projection is not None:
-                frame_projected_in_screened_candidate = content in screened_content
-                if frame_projected_in_screened_candidate:
-                    screened_content = screened_content.replace(
-                        content,
-                        delivery_projection,
-                    )
-            visible_content = screened_content
             boundary_media_files, boundary_delivery_content = (
-                BasePlatformAdapter.extract_media(screened_content)
+                BasePlatformAdapter.extract_media(boundary_decision.content)
             )
             boundary_media_files = BasePlatformAdapter.filter_media_delivery_paths(
                 boundary_media_files
             )
             boundary_context["content"] = boundary_delivery_content
-            boundary_unchanged = delivery_projection is None and (
+            boundary_unchanged = (
                 boundary_decision.decision == "allow"
                 and boundary_decision.content == delivery_content
             )
             if boundary_unchanged:
-                _, boundary_mirror_text = BasePlatformAdapter.extract_media(content)
-            elif frame_projected_in_screened_candidate:
                 _, boundary_mirror_text = BasePlatformAdapter.extract_media(
-                    delivery_projection
+                    trusted_visible_content
                 )
             else:
                 _, boundary_mirror_text = BasePlatformAdapter.extract_media(
-                    visible_content
+                    boundary_decision.content
                 )
             boundary_mirror_text = (boundary_mirror_text or "").strip()
             boundary_send_result = None
