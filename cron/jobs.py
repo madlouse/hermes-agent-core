@@ -1732,11 +1732,11 @@ def _cron_creation_governance_expected() -> bool:
     if not (plugin_dir / "plugin.yaml").is_file():
         return managed_profile
     try:
-        import yaml
+        from hermes_cli.config import read_user_config_raw
 
         config_path = home / "config.yaml"
         config = (
-            yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            read_user_config_raw(config_path)
             if config_path.is_file()
             else {}
         )

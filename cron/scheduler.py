@@ -3728,7 +3728,7 @@ def _kill_cron_process_group(process: subprocess.Popen) -> None:
     else:
         hard_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
         try:
-            os.killpg(process.pid, hard_kill)
+            os.killpg(process.pid, hard_kill)  # windows-footgun: ok - POSIX branch
         except ProcessLookupError:
             pass
         except OSError:
