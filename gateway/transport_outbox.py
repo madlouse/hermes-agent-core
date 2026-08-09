@@ -426,7 +426,14 @@ def _connect_read_only(home: Path) -> sqlite3.Connection:
     path = _db_path(home)
     _validate_profile_file(path, home, label="transport outbox database")
     _validate_existing_outbox_files(home)
-    uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+    has_sidecars = any(
+        Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm")
+    )
+    # A sealed database copy has no sidecars and must not require SQLite to
+    # create them merely to verify evidence.  Active databases must read their
+    # WAL, so immutable mode is deliberately limited to sidecar-free copies.
+    immutable = "" if has_sidecars else "&immutable=1"
+    uri = f"file:{quote(str(path.resolve()))}?mode=ro{immutable}"
     conn = sqlite3.connect(uri, uri=True, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")

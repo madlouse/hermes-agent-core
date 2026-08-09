@@ -37,9 +37,9 @@ _CRON_RUN_HEARTBEAT_CEILING = 6 * 3600.0
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import cron.jobs as cron_jobs
 from cron.jobs import (
     AmbiguousJobReference,
-    CronJobGovernanceError,
     claim_job_for_fire,
     create_job,
     get_job,
@@ -1082,7 +1082,7 @@ def cronjob(
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
 
-    except CronJobGovernanceError as e:
+    except cron_jobs.CronJobGovernanceError as e:
         return json.dumps(
             {"success": False, "error": str(e), "governance": e.payload()},
             indent=2,

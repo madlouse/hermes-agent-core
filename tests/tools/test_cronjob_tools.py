@@ -75,6 +75,36 @@ class TestCronGovernanceBridge:
             },
         }
 
+    def test_governance_error_uses_current_jobs_exception_class(self, monkeypatch):
+        class CurrentGovernanceError(
+            cronjob_tools_module.cron_jobs.CronJobGovernanceError
+        ):
+            pass
+
+        monkeypatch.setattr(
+            cronjob_tools_module.cron_jobs,
+            "CronJobGovernanceError",
+            CurrentGovernanceError,
+        )
+
+        def deny(**kwargs):
+            raise CurrentGovernanceError(
+                "denied after reload",
+                decision={"reason": "admin_review_required"},
+            )
+
+        monkeypatch.setattr("tools.cronjob_tools.create_job", deny)
+        result = json.loads(
+            cronjob(
+                action="create",
+                governance_resume={"schema_version": "cron-persist-resume/v1"},
+            )
+        )
+
+        assert result["success"] is False
+        assert result["error"] == "denied after reload"
+        assert result["governance"]["reason"] == "admin_review_required"
+
     def test_update_resume_ignores_parallel_fields_and_uses_no_repair_resolution(
         self, monkeypatch
     ):
