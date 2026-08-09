@@ -217,6 +217,80 @@ class TestRunJobScript:
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
 
+    def test_windows_cleanup_uses_taskkill_for_entire_process_tree(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        captured = {}
+
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                raise AssertionError("successful taskkill must not kill parent twice")
+
+            def wait(self):
+                captured["waited"] = True
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            sched_mod.os,
+            "killpg",
+            lambda *args: (_ for _ in ()).throw(
+                AssertionError("Windows must not call os.killpg")
+            ),
+        )
+
+        sched_mod._kill_cron_process_group(FakeProcess())
+
+        assert captured["args"] == [
+            "taskkill", "/PID", "12345", "/T", "/F",
+        ]
+        assert captured["kwargs"]["timeout"] == 10
+        assert captured["kwargs"]["creationflags"] == 0x08000000
+        assert captured["waited"] is True
+
+    def test_windows_cleanup_falls_back_when_taskkill_is_unavailable(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        calls = {"poll": 0, "kill": 0, "wait": 0}
+
+        class FakeProcess:
+            pid = 54321
+
+            def poll(self):
+                calls["poll"] += 1
+                return None
+
+            def kill(self):
+                calls["kill"] += 1
+
+            def wait(self):
+                calls["wait"] += 1
+
+        def missing_taskkill(*args, **kwargs):
+            raise FileNotFoundError(2, "taskkill not found")
+
+        monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(sched_mod.subprocess, "run", missing_taskkill)
+
+        sched_mod._kill_cron_process_group(FakeProcess())
+
+        assert calls == {"poll": 2, "kill": 1, "wait": 1}
+
 
 class TestBuildJobPromptWithScript:
     """Test that script output is injected into the prompt."""

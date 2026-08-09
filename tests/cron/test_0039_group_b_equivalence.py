@@ -147,6 +147,33 @@ def test_timeout_revokes_authority_in_already_copied_provider_context():
         reset_cron_authorization(tokens)
 
 
+def test_agent_published_after_deadline_receives_single_hard_interrupt():
+    control = _CronRunControl({"id": "proof-late-agent"})
+    interrupt_calls = []
+    interrupted = threading.Event()
+
+    class LateAgent:
+        def hard_interrupt(self, message=None):
+            interrupt_calls.append(message)
+            interrupted.set()
+            return True
+
+    result = control.interrupt("deadline", cleanup_timeout=0.05)
+    assert result.cleanup_incomplete is False
+
+    late_agent = LateAgent()
+    control.set_agent(late_agent)
+    control.set_agent(late_agent)
+
+    assert interrupted.wait(timeout=1)
+    assert interrupt_calls == ["deadline"]
+    assert control._agent_interrupt_done.wait(timeout=1)
+    assert control.cleanup_incomplete() is False
+    assert _wait_until(
+        lambda: _cron_bounded_interrupt_runner.active_count() == 0
+    )
+
+
 def test_timeout_waits_for_the_single_owned_script_cleanup_fence():
     process = SimpleNamespace()
     control = _CronRunControl({"id": "proof-0039"})

@@ -61,6 +61,7 @@ from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
+_IS_WINDOWS = sys.platform == "win32"
 
 
 @dataclass(frozen=True)
@@ -519,6 +520,7 @@ class _CronRunControl:
         self._script_cleanup: Optional[_CronScriptCleanup] = None
         self._script_spawn_in_progress = False
         self._interrupted = False
+        self._interrupt_reason = ""
         self._cleanup_incomplete = False
         self._agent_interrupt_started = False
         self._agent_interrupt_done = threading.Event()
@@ -588,8 +590,42 @@ class _CronRunControl:
             return self._timeout if self._configured else None
 
     def set_agent(self, agent: Any) -> None:
+        start_agent_interrupt = False
+        interrupt_reason = ""
         with self._condition:
             self._agent = agent
+            if self._interrupted and not self._agent_interrupt_started:
+                self._agent_interrupt_started = True
+                start_agent_interrupt = True
+                interrupt_reason = self._interrupt_reason or "Cron run interrupted"
+        if start_agent_interrupt:
+            self._start_agent_interrupt(agent, interrupt_reason)
+
+    def _start_agent_interrupt(self, agent: Any, reason: str) -> None:
+        """Start the single claimed agent interrupt without queuing work."""
+        def _interrupt_agent() -> None:
+            try:
+                accepted = request_hard_interrupt(agent, reason)
+                if not accepted:
+                    with self._condition:
+                        self._agent_interrupt_failed = True
+                        self._cleanup_incomplete = True
+            except BaseException:
+                with self._condition:
+                    self._agent_interrupt_failed = True
+                    self._cleanup_incomplete = True
+            finally:
+                self._agent_interrupt_done.set()
+
+        accepted = _cron_bounded_interrupt_runner.submit(
+            _interrupt_agent,
+            operation="agent-interrupt",
+        )
+        if not accepted:
+            with self._condition:
+                self._agent_interrupt_failed = True
+                self._cleanup_incomplete = True
+            self._agent_interrupt_done.set()
 
     def begin_script_spawn(self) -> bool:
         """Fence Popen creation against a concurrent deadline revocation."""
@@ -676,6 +712,8 @@ class _CronRunControl:
         script_spawn_incomplete = False
         with self._condition:
             self._interrupted = True
+            if not self._interrupt_reason:
+                self._interrupt_reason = reason
             agent = self._agent
             start_agent_interrupt = agent is not None and not self._agent_interrupt_started
             if start_agent_interrupt:
@@ -689,29 +727,7 @@ class _CronRunControl:
                 self._condition.wait(timeout=remaining)
             cleanup = self._script_cleanup
         if start_agent_interrupt:
-            def _interrupt_agent() -> None:
-                try:
-                    accepted = request_hard_interrupt(agent, reason)
-                    if not accepted:
-                        with self._condition:
-                            self._agent_interrupt_failed = True
-                            self._cleanup_incomplete = True
-                except BaseException:
-                    with self._condition:
-                        self._agent_interrupt_failed = True
-                        self._cleanup_incomplete = True
-                finally:
-                    self._agent_interrupt_done.set()
-
-            accepted = _cron_bounded_interrupt_runner.submit(
-                _interrupt_agent,
-                operation="agent-interrupt",
-            )
-            if not accepted:
-                with self._condition:
-                    self._agent_interrupt_failed = True
-                    self._cleanup_incomplete = True
-                self._agent_interrupt_done.set()
+            self._start_agent_interrupt(agent, self._interrupt_reason)
         cleanup_complete = cleanup is None and not script_spawn_incomplete
         if cleanup is not None:
             cleanup_complete = self.cleanup_script_process(
@@ -3681,17 +3697,38 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
 
 def _kill_cron_process_group(process: subprocess.Popen) -> None:
     """Immediately kill one cron script tree and synchronously reap its parent."""
-    if os.name == "nt" and process.poll() is not None:
+    if _IS_WINDOWS and process.poll() is not None:
         return
 
-    if os.name == "nt":
+    if _IS_WINDOWS:
+        taskkill_succeeded = False
         try:
-            process.kill()
-        except OSError:
-            pass
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                creationflags=windows_hide_flags(),
+            )
+            taskkill_succeeded = completed.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            logger.debug(
+                "Windows taskkill failed for cron process tree %s",
+                process.pid,
+                exc_info=True,
+            )
+        if not taskkill_succeeded and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
     else:
+        hard_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, hard_kill)
         except ProcessLookupError:
             pass
         except OSError:

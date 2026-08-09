@@ -982,6 +982,7 @@ class TestRunJobSessionPersistence:
         import threading
 
         interrupted = threading.Event()
+        conversation_started = threading.Event()
         created_agents = []
         monkeypatch.setenv("HERMES_MODEL", "test-model")
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
@@ -1004,7 +1005,8 @@ class TestRunJobSessionPersistence:
                 created_agents.append(self)
 
             def run_conversation(self, prompt):
-                interrupted.wait(timeout=2)
+                conversation_started.set()
+                interrupted.wait(timeout=5)
                 return {"final_response": "late"}
 
             def interrupt(self, message=None):
@@ -1034,12 +1036,13 @@ class TestRunJobSessionPersistence:
                     "name": "bounded",
                     "prompt": "wait",
                     "max_turns": 7,
-                    "run_timeout_seconds": 0.2,
+                    "run_timeout_seconds": 2,
                 }
             )
 
         assert success is False
         assert "total runtime limit" in (error or "")
+        assert conversation_started.is_set()
         assert interrupted.wait(timeout=1)
         assert created_agents[0].kwargs["max_iterations"] == 7
         assert {"needed", "terminal"}.issubset(
