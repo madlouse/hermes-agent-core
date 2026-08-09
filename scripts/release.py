@@ -35,6 +35,7 @@ VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 DESKTOP_PACKAGE_FILE = REPO_ROOT / "apps" / "desktop" / "package.json"
 PACKAGE_LOCK_FILE = REPO_ROOT / "package-lock.json"
+UV_LOCK_FILE = REPO_ROOT / "uv.lock"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -2227,6 +2228,18 @@ def update_version_files(semver: str, calver_date: str):
                 encoding="utf-8",
             )
 
+    if UV_LOCK_FILE.exists():
+        uv_lock = UV_LOCK_FILE.read_text(encoding="utf-8")
+        uv_lock, replacements = re.subn(
+            r'(?m)(^\[\[package\]\]\nname = "hermes-agent"\nversion = ")[^"]+("$)',
+            rf'\g<1>{semver}\g<2>',
+            uv_lock,
+            count=1,
+        )
+        if replacements != 1:
+            raise RuntimeError("uv.lock is missing the hermes-agent workspace package")
+        UV_LOCK_FILE.write_text(uv_lock, encoding="utf-8")
+
 
 def version_files_to_stage() -> list[str]:
     """Return every existing file mutated by ``update_version_files``."""
@@ -2237,6 +2250,7 @@ def version_files_to_stage() -> list[str]:
             PYPROJECT_FILE,
             DESKTOP_PACKAGE_FILE,
             PACKAGE_LOCK_FILE,
+            UV_LOCK_FILE,
         )
         if path.exists()
     ]

@@ -22,6 +22,7 @@ def test_version_update_and_stage_list_cover_desktop_lockfile(tmp_path, monkeypa
     pyproject = tmp_path / "pyproject.toml"
     desktop_package = tmp_path / "apps" / "desktop" / "package.json"
     package_lock = tmp_path / "package-lock.json"
+    uv_lock = tmp_path / "uv.lock"
     version_file.parent.mkdir()
     desktop_package.parent.mkdir(parents=True)
     version_file.write_text(
@@ -41,10 +42,15 @@ def test_version_update_and_stage_list_cover_desktop_lockfile(tmp_path, monkeypa
         + "\n",
         encoding="utf-8",
     )
+    uv_lock.write_text(
+        'version = 1\n\n[[package]]\nname = "hermes-agent"\nversion = "0.20.0"\n',
+        encoding="utf-8",
+    )
     monkeypatch.setattr(release, "VERSION_FILE", version_file)
     monkeypatch.setattr(release, "PYPROJECT_FILE", pyproject)
     monkeypatch.setattr(release, "DESKTOP_PACKAGE_FILE", desktop_package)
     monkeypatch.setattr(release, "PACKAGE_LOCK_FILE", package_lock)
+    monkeypatch.setattr(release, "UV_LOCK_FILE", uv_lock)
 
     release.update_version_files("0.20.1", "2026.8.9")
 
@@ -54,9 +60,11 @@ def test_version_update_and_stage_list_cover_desktop_lockfile(tmp_path, monkeypa
     assert json.loads(desktop_package.read_text(encoding="utf-8"))["version"] == "0.20.1"
     lock = json.loads(package_lock.read_text(encoding="utf-8"))
     assert lock["packages"]["apps/desktop"]["version"] == "0.20.1"
+    assert 'version = "0.20.1"' in uv_lock.read_text(encoding="utf-8")
     assert release.version_files_to_stage() == [
         str(version_file),
         str(pyproject),
         str(desktop_package),
         str(package_lock),
+        str(uv_lock),
     ]
