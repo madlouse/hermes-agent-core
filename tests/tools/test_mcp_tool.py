@@ -870,6 +870,40 @@ class TestToolsetInjection:
             assert call_count == 1  # Only broken retried
 
 
+class TestDiscoveryAllowlist:
+    def test_requested_servers_limit_discovery_scope(self):
+        import tools.mcp_tool as mcp_tool
+
+        config = {
+            "needed": {"enabled": True, "command": "needed"},
+            "unrelated": {"enabled": True, "command": "unrelated"},
+        }
+        with patch.object(mcp_tool, "_MCP_AVAILABLE", True), patch.object(
+            mcp_tool, "_load_mcp_config", return_value=config
+        ), patch.object(
+            mcp_tool,
+            "_try_acquire_mcp_discovery_lock",
+            return_value=mcp_tool._LOCK_UNAVAILABLE,
+        ), patch.object(
+            mcp_tool, "register_mcp_servers", return_value=[]
+        ) as register:
+            assert mcp_tool.discover_mcp_tools(server_names=["needed"]) == []
+
+        register.assert_called_once_with({"needed": config["needed"]})
+
+    def test_empty_allowlist_has_no_discovery_side_effects(self):
+        import tools.mcp_tool as mcp_tool
+
+        with patch.object(mcp_tool, "_MCP_AVAILABLE", True), patch.object(
+            mcp_tool,
+            "_load_mcp_config",
+            return_value={"unrelated": {"enabled": True, "command": "unrelated"}},
+        ), patch.object(mcp_tool, "register_mcp_servers") as register:
+            assert mcp_tool.discover_mcp_tools(server_names=[]) == []
+
+        register.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Graceful fallback
 # ---------------------------------------------------------------------------

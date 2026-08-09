@@ -38,7 +38,7 @@ needs to replace the import + call site:
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -127,6 +127,48 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Durable cron authorization identity. These values are intentionally kept out
+# of _VAR_MAP: that map is exported to local subprocesses for compatibility,
+# while authorization must remain in-process and task-local so a child process
+# cannot retain or replay a completed job's authority.
+_CRON_JOB_ID: ContextVar = ContextVar("HERMES_CRON_JOB_ID", default=_UNSET)
+_CRON_AUTHORIZED_BEHAVIOR_REF: ContextVar = ContextVar(
+    "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF", default=_UNSET
+)
+_CRON_PROCESS_CHARTER_REF: ContextVar = ContextVar(
+    "HERMES_CRON_PROCESS_CHARTER_REF", default=_UNSET
+)
+_CRON_RISK_TIER: ContextVar = ContextVar("HERMES_CRON_RISK_TIER", default=_UNSET)
+_CRON_IMPLEMENTATION_CATEGORIES: ContextVar = ContextVar(
+    "HERMES_CRON_IMPLEMENTATION_CATEGORIES", default=_UNSET
+)
+_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF: ContextVar = ContextVar(
+    "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF", default=_UNSET
+)
+_CRON_OBSERVED_SCOPE_EVIDENCE_REF: ContextVar = ContextVar(
+    "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF", default=_UNSET
+)
+_CRON_CANDIDATE_HASH: ContextVar = ContextVar(
+    "HERMES_CRON_CANDIDATE_HASH", default=_UNSET
+)
+# Every copied cron/delegate context shares this revocation lease. Resetting the
+# root scope clears it before restoring local tokens, so an agent thread still
+# unwinding after a deadline can no longer read durable authorization identity.
+_CRON_AUTH_SCOPE: ContextVar = ContextVar(
+    "HERMES_CRON_AUTH_SCOPE", default=_UNSET
+)
+
+_CRON_AUTH_VAR_MAP = {
+    "HERMES_CRON_JOB_ID": _CRON_JOB_ID,
+    "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": _CRON_AUTHORIZED_BEHAVIOR_REF,
+    "HERMES_CRON_PROCESS_CHARTER_REF": _CRON_PROCESS_CHARTER_REF,
+    "HERMES_CRON_RISK_TIER": _CRON_RISK_TIER,
+    "HERMES_CRON_IMPLEMENTATION_CATEGORIES": _CRON_IMPLEMENTATION_CATEGORIES,
+    "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": _CRON_IMPLEMENTATION_PATH_EVIDENCE_REF,
+    "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": _CRON_OBSERVED_SCOPE_EVIDENCE_REF,
+    "HERMES_CRON_CANDIDATE_HASH": _CRON_CANDIDATE_HASH,
+}
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -201,6 +243,45 @@ def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
         yield
     finally:
         _SESSION_ID.set(previous)
+
+
+@contextmanager
+def scoped_cron_authorization(values: Mapping[str, Any]) -> Iterator[None]:
+    """Bind cron authorization identity and restore the prior context on exit.
+
+    Unknown names are ignored so callers can pass a wider metadata mapping.
+    Tokens make this boundary safely nestable and guarantee cleanup on errors;
+    unlike ordinary session variables, an unset authorization value never falls
+    back to process-global environment state.
+    """
+    tokens = set_cron_authorization(values)
+    try:
+        yield
+    finally:
+        reset_cron_authorization(tokens)
+
+
+def set_cron_authorization(values: Mapping[str, Any]) -> list[tuple[ContextVar, Any]]:
+    """Bind cron authorization values and return tokens for exact restoration."""
+    from threading import Event
+
+    active = Event()
+    active.set()
+    tokens = [(_CRON_AUTH_SCOPE, _CRON_AUTH_SCOPE.set(active))]
+    for name, var in _CRON_AUTH_VAR_MAP.items():
+        value = values.get(name, "")
+        tokens.append((var, var.set(str(value or ""))))
+    return tokens
+
+
+def reset_cron_authorization(tokens: list[tuple[ContextVar, Any]]) -> None:
+    """Restore a prior cron authorization context from binding tokens."""
+    if tokens and tokens[0][0] is _CRON_AUTH_SCOPE:
+        active = _CRON_AUTH_SCOPE.get()
+        if active is not _UNSET and hasattr(active, "clear"):
+            active.clear()
+    for var, token in reversed(tokens):
+        var.reset(token)
 
 
 def set_session_vars(
@@ -346,8 +427,11 @@ def reset_session_vars() -> None:
     ``async_delivery_supported`` wrongly reports the new turn's channel as
     unable to route a background completion until ``set_session_vars`` runs.
     """
-    for var in _VAR_MAP.values():
+    for var in (*_VAR_MAP.values(), *_CRON_AUTH_VAR_MAP.values()):
         var.set(_UNSET)
+    # Do not clear an inherited lease here: a newly spawned sibling task must
+    # drop its local authority without revoking the still-running parent scope.
+    _CRON_AUTH_SCOPE.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -382,6 +466,20 @@ def get_session_env(name: str, default: str = "") -> str:
         value = var.get()
         if value is not _UNSET:
             return value
+    auth_var = _CRON_AUTH_VAR_MAP.get(name)
+    if auth_var is not None:
+        value = auth_var.get()
+        if value is _UNSET:
+            return default
+        active = _CRON_AUTH_SCOPE.get()
+        # Direct ContextVar binding remains available to in-process tests and
+        # compatibility callers. Scheduler-created scopes always carry a lease,
+        # whose cleared state revokes already-copied worker contexts.
+        if active is _UNSET:
+            return value
+        if not hasattr(active, "is_set") or not active.is_set():
+            return default
+        return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
 

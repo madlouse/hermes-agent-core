@@ -181,6 +181,87 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     return disabled
 
 
+def _positive_int(value: Any) -> Optional[int]:
+    """Return a positive integer setting, rejecting booleans and invalid values."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _resolve_cron_max_iterations(job: dict, cfg: dict) -> int:
+    """Resolve the bounded turn budget for a scheduled execution."""
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    for candidate in (
+        job.get("max_turns"),
+        cron_cfg.get("max_turns"),
+        agent_cfg.get("max_turns"),
+        cfg.get("max_turns"),
+        90,
+    ):
+        resolved = _positive_int(candidate)
+        if resolved is not None:
+            return resolved
+    return 90
+
+
+def _resolve_cron_run_timeout_seconds(job: dict, cfg: dict) -> Optional[float]:
+    """Resolve one run's total deadline; zero is an explicit opt-out."""
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    for candidate in (
+        job.get("run_timeout_seconds"),
+        cron_cfg.get("run_timeout_seconds"),
+    ):
+        if isinstance(candidate, bool) or candidate is None:
+            continue
+        try:
+            resolved = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if resolved == 0:
+            return None
+        if resolved > 0:
+            return resolved
+    return None
+
+
+def _cron_authorization_values(job: dict) -> dict[str, str]:
+    """Project a persisted job into the in-process authorization context."""
+    categories = job.get("implementation_categories")
+    if isinstance(categories, (list, tuple, set)):
+        category_items = [
+            str(item).strip() for item in categories if str(item or "").strip()
+        ]
+        if isinstance(categories, set):
+            category_items.sort()
+        categories_text = json.dumps(category_items)
+    else:
+        categories_text = str(categories or "")
+    join_keys = job.get("join_keys") if isinstance(job.get("join_keys"), dict) else {}
+    return {
+        "HERMES_CRON_JOB_ID": str(job.get("id") or ""),
+        "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": str(
+            job.get("authorized_behavior_ref") or ""
+        ),
+        "HERMES_CRON_PROCESS_CHARTER_REF": str(job.get("process_charter_ref") or ""),
+        "HERMES_CRON_RISK_TIER": str(job.get("risk_tier") or ""),
+        "HERMES_CRON_IMPLEMENTATION_CATEGORIES": categories_text,
+        "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": str(
+            job.get("implementation_path_evidence_ref") or ""
+        ),
+        "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": str(
+            job.get("observed_scope_evidence_ref") or ""
+        ),
+        "HERMES_CRON_CANDIDATE_HASH": str(
+            job.get("candidate_hash") or join_keys.get("candidate_hash") or ""
+        ),
+    }
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist.
 
@@ -3318,7 +3399,13 @@ def run_job(
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import (
+        _VAR_MAP,
+        clear_session_vars,
+        reset_cron_authorization,
+        set_cron_authorization,
+        set_session_vars,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3420,7 +3507,11 @@ def run_job(
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
+    _cron_auth_tokens = []
     try:
+        _cron_auth_tokens = set_cron_authorization(
+            _cron_authorization_values(job)
+        )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone
@@ -3569,8 +3660,9 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # Scheduled work has a bounded budget independent of broad interactive
+        # defaults, with an explicit per-job override for exceptional jobs.
+        max_iterations = _resolve_cron_max_iterations(job, _cfg)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3762,20 +3854,31 @@ def run_job(
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
-        # Initialize MCP servers so configured mcp_servers are available to
-        # the agent's tool registry before AIAgent is constructed. Without
-        # this, cron jobs never saw any MCP tools — only the gateway / CLI
-        # paths called discover_mcp_tools() at startup. Idempotent: subsequent
-        # ticks short-circuit on already-connected servers inside
-        # register_mcp_servers(). Non-fatal on failure: a broken MCP server
-        # shouldn't kill an otherwise-working cron job. See #4219.
+        # Discover only MCP servers reachable through this job's effective
+        # toolset. Unrelated servers cannot consume the run's startup budget.
+        cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
         try:
+            from hermes_cli.tools_config import enabled_mcp_server_names
             from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
+
+            selected_mcp_servers = (
+                None
+                if cron_enabled_toolsets is None
+                else sorted(
+                    set(cron_enabled_toolsets) & enabled_mcp_server_names(_cfg)
+                )
+            )
+            _mcp_tools = discover_mcp_tools(server_names=selected_mcp_servers)
             if _mcp_tools:
                 logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+                    "Job '%s': %d MCP tool(s) available from %s",
+                    job_id,
+                    len(_mcp_tools),
+                    (
+                        "all configured servers"
+                        if selected_mcp_servers is None
+                        else selected_mcp_servers
+                    ),
                 )
         except Exception as _mcp_exc:
             logger.warning(
@@ -3802,7 +3905,7 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=cron_enabled_toolsets,
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
@@ -3878,32 +3981,43 @@ def run_job(
         _cron_context = contextvars.copy_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
+        _cron_run_timeout = _resolve_cron_run_timeout_seconds(job, _cfg)
+        _run_started_at = time.monotonic()
+        _wall_clock_timeout = False
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
-                        )
-                        if done:
-                            result = _cron_future.result()
-                            break
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
+            if (
+                _cron_inactivity_limit is None
+                and _cron_run_timeout is None
+                and not _is_oneshot
+            ):
+                result = _cron_future.result()
             else:
                 result = None
                 while True:
+                    _wait_timeout = _POLL_INTERVAL
+                    if _cron_run_timeout is not None:
+                        _remaining = _cron_run_timeout - (
+                            time.monotonic() - _run_started_at
+                        )
+                        if _remaining <= 0:
+                            _wall_clock_timeout = True
+                            break
+                        _wait_timeout = min(_wait_timeout, _remaining)
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future}, timeout=_wait_timeout,
                     )
                     if done:
                         result = _cron_future.result()
                         break
                     _heartbeat_run_claim_if_due()
+                    if (
+                        _cron_run_timeout is not None
+                        and time.monotonic() - _run_started_at >= _cron_run_timeout
+                    ):
+                        _wall_clock_timeout = True
+                        break
+                    if _cron_inactivity_limit is None:
+                        continue
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
                     if hasattr(agent, "get_activity_summary"):
@@ -3920,6 +4034,20 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        if _wall_clock_timeout:
+            _elapsed = time.monotonic() - _run_started_at
+            logger.error(
+                "Job '%s' exceeded total runtime %.1fs (limit %.1fs)",
+                job_name,
+                _elapsed,
+                _cron_run_timeout,
+            )
+            request_hard_interrupt(agent, "Cron job exceeded total runtime limit")
+            raise TimeoutError(
+                f"Cron job '{job_name}' exceeded total runtime limit of "
+                f"{_cron_run_timeout:g}s"
+            )
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -4082,6 +4210,7 @@ def run_job(
         clear_session_vars(_ctx_tokens)
         if _cron_session_token is not None:
             _cron_session_var.reset(_cron_session_token)
+        reset_cron_authorization(_cron_auth_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:

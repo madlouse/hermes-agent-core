@@ -6432,14 +6432,16 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(server_names: Optional[List[str]] = None) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
     the ``mcp`` package is not installed (returns empty list).
 
     Idempotent for already-connected servers. If some servers failed on a
-    previous call, only the missing ones are retried.
+    previous call, only the missing ones are retried. ``server_names`` limits
+    discovery side effects to an explicit allowlist; ``None`` preserves the
+    legacy all-server behavior.
 
     Returns:
         List of all registered MCP tool names.
@@ -6449,8 +6451,16 @@ def discover_mcp_tools() -> List[str]:
         return []
 
     servers = _load_mcp_config()
+    if server_names is not None:
+        requested = {
+            str(name).strip() for name in server_names if str(name).strip()
+        }
+        servers = {name: cfg for name, cfg in servers.items() if name in requested}
     if not servers:
-        logger.debug("No MCP servers configured")
+        logger.debug(
+            "No %sMCP servers configured",
+            "requested " if server_names is not None else "",
+        )
         return []
 
     # Cross-process discovery guard (#62771). A lock loser waits for
