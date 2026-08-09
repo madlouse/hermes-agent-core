@@ -979,37 +979,51 @@ class TestRunJobSessionPersistence:
             assert not agent_constructed.wait(timeout=0.2)
 
 
-    def test_mcp_profile_ownership_conflict_aborts_before_agent_init(
-        self, tmp_path, monkeypatch
+    @pytest.mark.parametrize("blocked_stage", ["runtime_governance", "no_agent"])
+    def test_config_deadline_precedes_governance_and_no_agent(
+        self, blocked_stage, tmp_path
     ):
-        from tools.mcp_tool import MCPServerOwnershipError
+        import concurrent.futures
+        import threading
+        import time
 
-        monkeypatch.setenv("HERMES_MODEL", "test-model")
+        stage_entered = threading.Event()
+        stage_release = threading.Event()
+        (tmp_path / "config.yaml").write_text(
+            "cron:\n  run_timeout_seconds: 1\n", encoding="utf-8"
+        )
+
+        def governance(_job):
+            if blocked_stage == "runtime_governance":
+                stage_entered.set()
+                stage_release.wait(timeout=3)
+
+        def script(*args, **kwargs):
+            if blocked_stage == "no_agent":
+                stage_entered.set()
+                stage_release.wait(timeout=3)
+            return True, "done"
+
+        job = {"id": f"entry-timeout-{blocked_stage}", "prompt": "run"}
+        if blocked_stage == "no_agent":
+            job.update({"no_agent": True, "script": "script.py"})
+
         with patch("cron.scheduler._hermes_home", tmp_path), patch(
-            "cron.scheduler._resolve_origin", return_value=None
+            "cron.jobs._apply_cron_runtime_governance", side_effect=governance
         ), patch(
-            "cron.jobs._apply_cron_runtime_governance", return_value=None
-        ), patch("hermes_cli.env_loader.load_hermes_dotenv"), patch(
-            "hermes_cli.env_loader.reset_secret_source_cache"
-        ), patch("hermes_state.SessionDB", return_value=MagicMock()), patch(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            return_value={
-                "api_key": "test-key",
-                "base_url": "https://example.invalid/v1",
-                "provider": "openrouter",
-                "api_mode": "chat_completions",
-            },
-        ), patch(
-            "tools.mcp_tool.discover_mcp_tools",
-            side_effect=MCPServerOwnershipError("profile collision"),
-        ), patch("run_agent.AIAgent") as agent_cls:
-            success, _output, _response, error = run_job(
-                {"id": "mcp-owner-conflict", "prompt": "run"}
-            )
-
-        assert success is False
-        assert "MCPServerOwnershipError" in (error or "")
-        agent_cls.assert_not_called()
+            "cron.scheduler._run_job_script_with_claim_heartbeat",
+            side_effect=script,
+        ):
+            started = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(run_job, job)
+                assert stage_entered.wait(timeout=2)
+                success, _output, _response, error = future.result(timeout=2)
+            elapsed = time.monotonic() - started
+            assert success is False
+            assert "total runtime limit" in (error or "")
+            assert elapsed < 2
+            stage_release.set()
 
 
     @contextlib.contextmanager

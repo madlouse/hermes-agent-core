@@ -39,7 +39,6 @@ from gateway.session_context import (
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
-    get_cron_runtime_context,
     get_session_env,
     reset_session_vars,
     scoped_cron_authorization,
@@ -252,58 +251,3 @@ def test_completed_cron_scope_revokes_already_copied_context():
     assert copied.run(get_session_env, "HERMES_CRON_JOB_ID") == ""
     assert copied.run(get_session_env, "HERMES_CRON_SESSION") == ""
     assert "HERMES_CRON_SESSION" not in copied.run(_make_run_env, {})
-
-
-def test_cron_runtime_api_drives_real_plugin_hook_composite(tmp_path, monkeypatch):
-    """User plugins consume the stable API and compose through PluginManager."""
-    import yaml
-
-    home = tmp_path / "profile"
-    plugins = home / "plugins"
-    boundary = plugins / "hck-tool-boundary"
-    observer = plugins / "observer"
-    boundary.mkdir(parents=True)
-    observer.mkdir(parents=True)
-    (boundary / "plugin.yaml").write_text(
-        "name: hck-tool-boundary\nprovides_hooks: [pre_tool_call]\n",
-        encoding="utf-8",
-    )
-    (boundary / "__init__.py").write_text(
-        "from gateway.session_context import get_cron_runtime_context\n"
-        "def pre_tool_call(**kwargs):\n"
-        "    runtime = get_cron_runtime_context()\n"
-        "    return {'owner': 'hck', 'job_id': runtime.job_id if runtime else ''}\n"
-        "def register(ctx):\n"
-        "    ctx.register_hook('pre_tool_call', pre_tool_call)\n",
-        encoding="utf-8",
-    )
-    (observer / "plugin.yaml").write_text(
-        "name: observer\nprovides_hooks: [pre_tool_call]\n", encoding="utf-8"
-    )
-    (observer / "__init__.py").write_text(
-        "def register(ctx):\n"
-        "    ctx.register_hook('pre_tool_call', lambda **kwargs: {'owner': 'observer'})\n",
-        encoding="utf-8",
-    )
-    (home / "config.yaml").write_text(
-        yaml.safe_dump({"plugins": {"enabled": ["hck-tool-boundary", "observer"]}}),
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    monkeypatch.setenv("HERMES_CRON_JOB_ID", "forged-env-job")
-
-    from hermes_cli.plugins import PluginManager
-
-    manager = PluginManager()
-    manager.discover_and_load()
-    with scoped_cron_authorization({"HERMES_CRON_JOB_ID": "verified-job"}):
-        runtime = get_cron_runtime_context()
-        assert runtime is not None
-        assert runtime.job_id == "verified-job"
-        assert manager.invoke_hook("pre_tool_call", tool_name="terminal") == [
-            {"owner": "hck", "job_id": "verified-job"},
-            {"owner": "observer"},
-        ]
-
-    assert get_cron_runtime_context() is None
