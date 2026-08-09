@@ -198,18 +198,38 @@ class TestBuildSessionContextPrompt:
         with patch.dict(_os.environ, {}, clear=False):
             _os.environ.pop("SLACK_BOT_TOKEN", None)
 
-            # Simulate a connected MCP server ("company-slack") that has
-            # registered a real tool, via the actual tracking function used
-            # by the live registration path (tools/mcp_tool.py:_track_mcp_tool_server),
-            # not a mock of the capability check.
-            _mcp_tool_mod._track_mcp_tool_server("mcp-company-slack_post_message", "company-slack")
+            # Register the tool with the same Profile/config owner binding as
+            # the live MCP path. A bare provenance entry is intentionally not
+            # visible because it could belong to another Profile.
+            binding_token = _mcp_tool_mod._active_mcp_server_keys.set({})
+            with _mcp_tool_mod._lock:
+                saved_logical_names = dict(_mcp_tool_mod._server_logical_names)
+            namespaced = _mcp_tool_mod._namespace_mcp_servers(
+                {
+                    "company-slack": {
+                        "command": "company-slack-mcp",
+                        "args": [],
+                    }
+                }
+            )
+            server_key = next(iter(namespaced))
+            tool_name = "mcp-company-slack_post_message_profile_test"
+            _mcp_tool_mod._track_mcp_tool_server(
+                tool_name,
+                "company-slack",
+                server_key,
+            )
             try:
                 assert _slack_tools_loaded() is True, (
                     "A connected MCP server with 'slack' in its name and "
                     "registered tools must be detected as Slack capability"
                 )
             finally:
-                _mcp_tool_mod._forget_mcp_tool_server("mcp-company-slack_post_message")
+                _mcp_tool_mod._forget_mcp_tool_server(tool_name, server_key)
+                _mcp_tool_mod._active_mcp_server_keys.reset(binding_token)
+                with _mcp_tool_mod._lock:
+                    _mcp_tool_mod._server_logical_names.clear()
+                    _mcp_tool_mod._server_logical_names.update(saved_logical_names)
 
 
     def test_shared_slack_prompt_warns_against_guessed_self_mentions(self):
@@ -1528,5 +1548,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

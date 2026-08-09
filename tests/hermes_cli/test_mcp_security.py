@@ -89,7 +89,7 @@ def test_explicit_registration_skips_dangerous_entry_before_connect(monkeypatch)
     connected = []
 
     async def _discover_one(name, config):
-        connected.append(name)
+        connected.append((name, config.get("_hermes_logical_name")))
         return []
 
     def _run_on_loop(coro_or_factory, timeout=30):
@@ -106,15 +106,22 @@ def test_explicit_registration_skips_dangerous_entry_before_connect(monkeypatch)
         saved_servers = dict(mcp_tool._servers)
         saved_connecting = set(mcp_tool._server_connecting)
         saved_errors = dict(mcp_tool._server_connect_errors)
+        saved_logical_names = dict(mcp_tool._server_logical_names)
         mcp_tool._servers.clear()
         mcp_tool._server_connecting.clear()
         mcp_tool._server_connect_errors.clear()
+    binding_token = mcp_tool._active_mcp_server_keys.set({})
 
     try:
         mcp_tool.register_mcp_servers({
             "evil": _dangerous_entry(),
             "clean": {"command": "npx", "args": ["-y", "clean-mcp"]},
         })
+        assert len(connected) == 1
+        internal_name, logical_name = connected[0]
+        assert logical_name == "clean"
+        assert internal_name.startswith("clean::")
+        assert mcp_tool._logical_server_name(internal_name) == "clean"
     finally:
         with mcp_tool._lock:
             mcp_tool._servers.clear()
@@ -123,8 +130,9 @@ def test_explicit_registration_skips_dangerous_entry_before_connect(monkeypatch)
             mcp_tool._server_connecting.update(saved_connecting)
             mcp_tool._server_connect_errors.clear()
             mcp_tool._server_connect_errors.update(saved_errors)
-
-    assert connected == ["clean"]
+            mcp_tool._server_logical_names.clear()
+            mcp_tool._server_logical_names.update(saved_logical_names)
+        mcp_tool._active_mcp_server_keys.reset(binding_token)
 
 
 def test_migration_disables_existing_dangerous_entry(tmp_path):
