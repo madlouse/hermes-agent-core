@@ -67,7 +67,15 @@ def ctx(**overrides):
     return base
 
 
-def process_gateway_reply(monkeypatch, *, hooks, response):
+def process_gateway_reply(
+    monkeypatch,
+    *,
+    hooks,
+    response,
+    send_result=None,
+    send_voice_result=None,
+    send_document_result=None,
+):
     from gateway import run as gateway_run
 
     monkeypatch.setattr(
@@ -81,11 +89,20 @@ def process_gateway_reply(monkeypatch, *, hooks, response):
     )
     adapter._message_handler = AsyncMock(return_value=response)
     adapter._send_with_retry = AsyncMock(
-        return_value=SendResult(success=True, message_id="sent")
+        return_value=(
+            send_result
+            if send_result is not None
+            else SendResult(success=True, message_id="sent")
+        )
     )
     adapter._run_processing_hook = AsyncMock()
     adapter._stop_typing_refresh = AsyncMock()
     adapter._flush_text_debounce_now = AsyncMock(return_value=False)
+    adapter._notify_media_delivery_failure = AsyncMock()
+    if send_voice_result is not None:
+        adapter.send_voice = AsyncMock(return_value=send_voice_result)
+    if send_document_result is not None:
+        adapter.send_document = AsyncMock(return_value=send_document_result)
     event = MessageEvent(
         text="生成机构日报",
         message_type=MessageType.TEXT,
@@ -241,6 +258,78 @@ def test_adapter_blocks_plain_gateway_reply_when_boundary_bridge_raises(monkeypa
     )
 
     adapter._send_with_retry.assert_not_awaited()
+
+
+def _capturing_boundary_events():
+    calls = []
+
+    def boundary(event_type, payload):
+        calls.append((event_type, dict(payload)))
+        return {"decision": "allow", "reason": "screened"}
+
+    return calls, Hooks(named_handler(boundary))
+
+
+def test_adapter_after_send_reports_failed_text_result(monkeypatch):
+    calls, hooks = _capturing_boundary_events()
+
+    process_gateway_reply(
+        monkeypatch,
+        hooks=hooks,
+        response="delivery fails",
+        send_result=SendResult(success=False, error="transport rejected"),
+    )
+
+    after_send = [payload for event_type, payload in calls if event_type == ob.AFTER_SEND]
+    assert len(after_send) == 1
+    assert after_send[0]["success"] is False
+    assert after_send[0]["send_result"]["success"] is False
+    assert after_send[0]["send_result"]["error"] == "transport rejected"
+
+
+def test_adapter_after_send_reports_failed_voice_media_result(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "failed.ogg"
+    media.write_bytes(b"OggS")
+    calls, hooks = _capturing_boundary_events()
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=hooks,
+        response=f"[[audio_as_voice]]\nMEDIA:{media}",
+        send_voice_result=SendResult(success=False, error="voice rejected"),
+    )
+    adapter.send_voice.assert_awaited_once()
+
+    after_send = [payload for event_type, payload in calls if event_type == ob.AFTER_SEND]
+    assert len(after_send) == 1
+    assert after_send[0]["success"] is False
+    assert after_send[0]["send_result"]["success"] is False
+    assert after_send[0]["send_result"]["error"] == "voice rejected"
+
+
+def test_adapter_after_send_reports_failed_document_attachment_result(
+    tmp_path, monkeypatch
+):
+    attachment = tmp_path / "failed.pdf"
+    attachment.write_bytes(b"%PDF-1.4")
+    calls, hooks = _capturing_boundary_events()
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=hooks,
+        response=f"MEDIA:{attachment}",
+        send_document_result=SendResult(
+            success=False,
+            error="document rejected",
+        ),
+    )
+    adapter.send_document.assert_awaited_once()
+
+    after_send = [payload for event_type, payload in calls if event_type == ob.AFTER_SEND]
+    assert len(after_send) == 1
+    assert after_send[0]["success"] is False
+    assert after_send[0]["send_result"]["success"] is False
+    assert after_send[0]["send_result"]["error"] == "document rejected"
 
 
 def test_hidden_outbound_metadata_is_stripped_and_forwarded():

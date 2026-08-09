@@ -414,8 +414,11 @@ def _operator_streaming_boundary_channel_matches(
     return bool(targets & identities)
 
 
-def _operator_enforce_streaming_boundary_source_armed(profile_path: Any, source: Any) -> bool:
-    """True when source's channel_policy arms operator-enforce for streaming."""
+def _operator_enforce_streaming_boundary_policy_state(
+    profile_path: Any,
+    source: Any,
+) -> Optional[bool]:
+    """Return policy armed state, or ``None`` when it cannot be trusted."""
     policy_path = Path(profile_path).expanduser() / "channel_policy.toml"
     try:
         try:
@@ -424,14 +427,18 @@ def _operator_enforce_streaming_boundary_source_armed(profile_path: Any, source:
             import tomli as _toml  # type: ignore
         policy = _toml.loads(policy_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return False
+        logging.getLogger(__name__).warning(
+            "Operator-enforce streaming boundary policy missing; buffering output: %s",
+            policy_path,
+        )
+        return None
     except Exception as exc:
-        logging.getLogger(__name__).debug(
-            "Operator-enforce streaming boundary policy load failed for %s: %s",
+        logging.getLogger(__name__).warning(
+            "Operator-enforce streaming boundary policy load failed; buffering output for %s: %s",
             policy_path,
             exc,
         )
-        return False
+        return None
 
     platform = getattr(source, "platform", "")
     chat_id = getattr(source, "chat_id", None)
@@ -451,28 +458,40 @@ def _operator_enforce_streaming_boundary_source_armed(profile_path: Any, source:
     )
 
 
+def _operator_enforce_streaming_boundary_source_armed(profile_path: Any, source: Any) -> bool:
+    """True only when the source's readable policy explicitly arms screening."""
+    return (
+        _operator_enforce_streaming_boundary_policy_state(profile_path, source)
+        is True
+    )
+
+
 def _resolve_output_streaming_modes(
     profile_path: Any,
     source: Any,
     *,
     streaming_enabled: bool,
     interim_enabled: bool = False,
+    output_screening_required: bool,
 ) -> tuple[bool, bool, bool]:
-    """Return ``(armed, stream_deltas, interim_messages)`` for one source.
+    """Return ``(buffered, stream_deltas, interim_messages)`` for one source.
 
-    An armed channel must not emit any user-visible model output until the
-    complete response has passed the durable outbound boundary. This decision
-    is made before consumers or callbacks are installed so no first token can
-    race ahead of screening.
+    A response requiring screening must not emit any user-visible model output
+    until the complete response has passed the durable outbound boundary. The
+    policy check remains relevant for explicit operator-enforce channels, but
+    mandatory screening itself is sufficient to require buffering. This
+    decision is made before consumers or callbacks are installed so no first
+    token can race ahead of screening.
     """
-    armed = _operator_enforce_streaming_boundary_source_armed(
+    policy_state = _operator_enforce_streaming_boundary_policy_state(
         profile_path,
         source,
     )
+    buffered = bool(output_screening_required or policy_state is not False)
     return (
-        armed,
-        bool(streaming_enabled and not armed),
-        bool(interim_enabled and not armed),
+        buffered,
+        bool(streaming_enabled and not buffered),
+        bool(interim_enabled and not buffered),
     )
 
 
@@ -4627,6 +4646,10 @@ class TurnRunner:
                 ctx.source,
                 streaming_enabled=_streaming_enabled,
                 interim_enabled=ctx.interim_assistant_messages_enabled,
+                # Every GatewayRunner final reply is screened before Base sends
+                # it. Buffer here, before installing any delta consumer, so the
+                # final deny/rewrite decision owns all user-visible content.
+                output_screening_required=True,
             )
         except Exception as boundary_err:
             logger.warning(
@@ -24034,6 +24057,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._resolve_profile_home_for_source(source),
                 source,
                 streaming_enabled=_streaming_enabled,
+                output_screening_required=True,
             )
         except Exception as boundary_err:
             logger.warning(

@@ -346,9 +346,11 @@ class DelayedInterimAgent:
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        self.interim_assistant_callback("first interim")
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback("first interim")
         time.sleep(0.45)
-        self.interim_assistant_callback("second interim")
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback("second interim")
         time.sleep(0.1)
         return {
             "final_response": "done",
@@ -977,7 +979,8 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
-    assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+    assert adapter.sent == []
+    assert result["final_response"] == "done"
 
 
 class TransformedStreamAgent:
@@ -1004,12 +1007,10 @@ class TransformedStreamAgent:
 
 
 @pytest.mark.asyncio
-async def test_transformed_response_edits_streamed_message_in_place(monkeypatch, tmp_path):
-    """When a transform_llm_output hook modifies the response after streaming,
-    the gateway must edit the existing streamed message in place with the full
-    transformed content (so plugins like content filters / appenders reach the
-    user) and still mark already_sent=True (no duplicate send).
-    """
+async def test_transformed_response_is_buffered_for_mandatory_screening(
+    monkeypatch, tmp_path
+):
+    """A transformed response reaches screening without a raw stream preview."""
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -1026,14 +1027,10 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
         adapter_cls=MetadataEditProgressCaptureAdapter,
     )
 
-    # Final delivery happened (no duplicate send fallback).
-    assert result.get("already_sent") is True
-    # The transformed final text reached the user — appended portion is present
-    # in an edit_message call (not just in the streamed sends).
-    edited_texts = [e["content"] for e in adapter.edits]
-    assert any("[plugin appended this]" in text for text in edited_texts), (
-        f"expected transformed text in adapter.edits, got: {edited_texts!r}"
-    )
+    assert result.get("already_sent") is not True
+    assert adapter.sent == []
+    assert adapter.edits == []
+    assert result["final_response"] == "original answer\n\n[plugin appended this]"
 
 
 @pytest.mark.asyncio
@@ -1155,7 +1152,9 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
 
 
 @pytest.mark.asyncio
-async def test_run_agent_drops_interim_commentary_after_generation_invalidation(monkeypatch, tmp_path):
+async def test_run_agent_buffers_interim_commentary_for_mandatory_screening(
+    monkeypatch, tmp_path
+):
     import yaml
 
     (tmp_path / "config.yaml").write_text(
@@ -1186,18 +1185,6 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
     session_key = "agent:main:discord:dm:dm-2"
     runner._session_run_generation[session_key] = 1
 
-    original_send = adapter.send
-    invalidated = {"done": False}
-
-    async def send_and_invalidate(chat_id, content, reply_to=None, metadata=None):
-        result = await original_send(chat_id, content, reply_to=reply_to, metadata=metadata)
-        if content == "first interim" and not invalidated["done"]:
-            invalidated["done"] = True
-            runner._invalidate_session_run_generation(session_key, reason="test_stop")
-        return result
-
-    adapter.send = send_and_invalidate
-
     result = await runner._run_agent(
         message="hello",
         context_prompt="",
@@ -1208,10 +1195,9 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
         run_generation=1,
     )
 
-    sent_texts = [call["content"] for call in adapter.sent]
     assert result["final_response"] == "done"
-    assert "first interim" in sent_texts
-    assert "second interim" not in sent_texts
+    assert adapter.sent == []
+    assert adapter.edits == []
 
 
 @pytest.mark.asyncio
