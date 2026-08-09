@@ -160,6 +160,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--refresh-governance",
+        action="store_true",
+        help="Re-evaluate the unchanged Job through persistence governance",
+    )
+    cron_edit.add_argument("--retire-verification-profile-id")
+    cron_edit.add_argument("--retire-verification-job-revision")
+    cron_edit.add_argument("--retire-verification-command-sha256")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

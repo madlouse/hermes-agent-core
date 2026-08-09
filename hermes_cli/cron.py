@@ -374,14 +374,50 @@ def cron_create(args):
 
 
 def cron_edit(args):
-    from cron.jobs import AmbiguousJobReference, resolve_job_ref
+    from cron.jobs import (
+        AmbiguousJobReference,
+        CronJobGovernanceError,
+        resolve_job_ref,
+    )
+
+    retirement_values = {
+        "profile_id": getattr(args, "retire_verification_profile_id", None),
+        "job_revision": getattr(args, "retire_verification_job_revision", None),
+        "command_sha256": getattr(
+            args,
+            "retire_verification_command_sha256",
+            None,
+        ),
+    }
+    retirement = None
+    if any(retirement_values.values()):
+        if not all(retirement_values.values()):
+            print(color(
+                "All verification retirement preconditions are required.",
+                Colors.RED,
+            ))
+            return 1
+        retirement = {
+            "schema_version": "cron-verification-retirement/v1",
+            **retirement_values,
+        }
+    special_governance_update = bool(
+        getattr(args, "refresh_governance", False)
+        or retirement is not None
+    )
 
     try:
-        job = resolve_job_ref(args.job_id)
+        job = resolve_job_ref(
+            args.job_id,
+            repair_recoverable=not special_governance_update,
+        )
     except AmbiguousJobReference as exc:
         print(color(str(exc), Colors.RED))
         for m in exc.matches:
             print(f"  {m['id']}  (name: {m.get('name')!r})")
+        return 1
+    except CronJobGovernanceError as exc:
+        print(color(f"Failed to update job: {exc}", Colors.RED))
         return 1
     if not job:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
@@ -417,6 +453,8 @@ def cron_edit(args):
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
         no_agent=getattr(args, "no_agent", None),
+        governance_refresh=getattr(args, "refresh_governance", False),
+        deprecated_verification_retirement=retirement,
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))

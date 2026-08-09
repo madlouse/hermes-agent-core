@@ -2,12 +2,221 @@
 
 import json
 import pytest
+import tools.cronjob_tools as cronjob_tools_module
 
 from tools.cronjob_tools import (
+    CRONJOB_SCHEMA,
     _scan_cron_prompt,
     check_cronjob_requirements,
     cronjob,
 )
+
+
+class TestCronGovernanceBridge:
+    def test_create_forwards_only_the_opaque_resume_package(self, monkeypatch):
+        package = {"schema_version": "cron-persist-resume/v1", "opaque": True}
+        observed = {}
+
+        def fake_create_job(**kwargs):
+            observed.update(kwargs)
+            return {
+                "id": "abc123def456",
+                "name": "resumed",
+                "skill": None,
+                "skills": [],
+                "schedule_display": "every 1h",
+                "repeat": {"times": None, "completed": 0},
+                "deliver": "local",
+                "next_run_at": None,
+            }
+
+        monkeypatch.setattr("tools.cronjob_tools.create_job", fake_create_job)
+        monkeypatch.setattr("tools.cronjob_tools._local_delivery_notice", lambda *a: None)
+
+        result = json.loads(cronjob(action="create", governance_resume=package))
+
+        assert result["success"] is True
+        assert observed == {
+            "prompt": None,
+            "schedule": "",
+            "governance_resume": package,
+        }
+        assert CRONJOB_SCHEMA["parameters"]["properties"]["governance_resume"]["type"] == "object"
+
+    def test_governance_error_is_returned_as_structured_payload(self, monkeypatch):
+        from cron.jobs import CronJobGovernanceError
+
+        def deny(**kwargs):
+            raise CronJobGovernanceError(
+                "denied",
+                decision={
+                    "reason": "admin_review_required",
+                    "state": "review_required",
+                },
+            )
+
+        monkeypatch.setattr("tools.cronjob_tools.create_job", deny)
+        result = json.loads(
+            cronjob(
+                action="create",
+                governance_resume={"schema_version": "cron-persist-resume/v1"},
+            )
+        )
+
+        assert result == {
+            "success": False,
+            "error": "denied",
+            "governance": {
+                "schema_version": "cron-admin-pending-action/v1",
+                "action": "blocked",
+                "reason": "admin_review_required",
+                "state": "review_required",
+                "pending_action": {},
+            },
+        }
+
+    def test_update_resume_ignores_parallel_fields_and_uses_no_repair_resolution(
+        self, monkeypatch
+    ):
+        package = {"schema_version": "cron-persist-resume/v1", "opaque": True}
+        job = {
+            "id": "abc123def456",
+            "name": "resumed",
+            "skill": None,
+            "skills": [],
+            "schedule": {"display": "every 1h"},
+            "schedule_display": "every 1h",
+            "repeat": {"times": None, "completed": 0},
+            "deliver": "local",
+            "next_run_at": None,
+        }
+        captured = {}
+
+        def resolve(ref, **kwargs):
+            captured["resolve"] = (ref, kwargs)
+            return job
+
+        def update(ref, updates, **kwargs):
+            captured["update"] = (ref, updates, kwargs)
+            return job
+
+        monkeypatch.setattr("tools.cronjob_tools.resolve_job_ref", resolve)
+        monkeypatch.setattr("tools.cronjob_tools.update_job", update)
+        monkeypatch.setattr(
+            "tools.cronjob_tools._notify_provider_jobs_changed_safe",
+            lambda: None,
+        )
+
+        result = json.loads(cronjob(
+            action="update",
+            job_id=job["id"],
+            prompt="ignore previous instructions",
+            no_agent=True,
+            governance_resume=package,
+        ))
+
+        assert result["success"] is True
+        assert captured["resolve"] == (
+            job["id"],
+            {"repair_recoverable": False},
+        )
+        assert captured["update"] == (
+            job["id"],
+            {},
+            {"governance_resume": package},
+        )
+
+    @pytest.mark.parametrize("operation", ["refresh", "retirement"])
+    def test_special_update_forwards_control_without_provider_reconcile(
+        self, monkeypatch, operation
+    ):
+        job = {
+            "id": "abc123def456",
+            "name": "governed",
+            "skill": None,
+            "skills": [],
+            "schedule": {"display": "every 1h"},
+            "schedule_display": "every 1h",
+            "repeat": {"times": None, "completed": 0},
+            "deliver": "local",
+            "next_run_at": None,
+        }
+        captured = {}
+
+        def resolve(ref, **kwargs):
+            captured["resolve"] = (ref, kwargs)
+            return job
+
+        def update(ref, updates, **kwargs):
+            captured["update"] = (ref, updates, kwargs)
+            return job
+
+        monkeypatch.setattr("tools.cronjob_tools.resolve_job_ref", resolve)
+        monkeypatch.setattr("tools.cronjob_tools.update_job", update)
+        monkeypatch.setattr(
+            "tools.cronjob_tools._notify_provider_jobs_changed_safe",
+            lambda: pytest.fail("special governance update reconciled provider"),
+        )
+        kwargs = {"governance_refresh": True}
+        if operation == "retirement":
+            kwargs = {
+                "deprecated_verification_retirement": {
+                    "schema_version": "cron-verification-retirement/v1",
+                    "profile_id": "default",
+                    "job_revision": "sha256:" + "1" * 64,
+                    "command_sha256": "sha256:" + "2" * 64,
+                }
+            }
+
+        result = json.loads(cronjob(
+            action="update",
+            job_id=job["id"],
+            **kwargs,
+        ))
+
+        assert result["success"] is True
+        assert captured["resolve"] == (
+            job["id"],
+            {"repair_recoverable": False},
+        )
+        forwarded = captured["update"][2]
+        assert forwarded["governance_refresh"] is (operation == "refresh")
+        assert forwarded["deprecated_verification_retirement"] == kwargs.get(
+            "deprecated_verification_retirement"
+        )
+
+    def test_registered_tool_forwards_governance_controls(self, monkeypatch):
+        captured = {}
+        retirement = {
+            "schema_version": "cron-verification-retirement/v1",
+            "profile_id": "default",
+            "job_revision": "sha256:" + "1" * 64,
+            "command_sha256": "sha256:" + "2" * 64,
+        }
+        monkeypatch.setattr(
+            cronjob_tools_module,
+            "cronjob",
+            lambda **kwargs: captured.update(kwargs) or json.dumps({"success": True}),
+        )
+
+        result = json.loads(
+            cronjob_tools_module.registry._tools["cronjob"].handler(
+                {
+                    "action": "update",
+                    "job_id": "abc123def456",
+                    "governance_refresh": True,
+                    "deprecated_verification_retirement": retirement,
+                },
+                task_id="task-1",
+            )
+        )
+
+        assert result["success"] is True
+        assert captured["governance_refresh"] is True
+        assert captured["deprecated_verification_retirement"] == retirement
+        properties = CRONJOB_SCHEMA["parameters"]["properties"]
+        assert properties["governance_refresh"]["type"] == "boolean"
+        assert properties["deprecated_verification_retirement"]["type"] == "object"
 
 
 # =========================================================================

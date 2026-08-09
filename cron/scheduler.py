@@ -2783,6 +2783,13 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # Runtime admission is deliberately before the no_agent short-circuit and
+    # before any Agent/session construction. A script-only job is still a
+    # durable behavior and cannot bypass its persisted authorization binding.
+    from cron.jobs import _apply_cron_runtime_governance
+
+    _apply_cron_runtime_governance(job)
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------

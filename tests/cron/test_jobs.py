@@ -251,6 +251,34 @@ class TestUpdateJob:
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
 
+    def test_runtime_update_preserves_legacy_null_skill_shape(self, tmp_cron_dir):
+        job = create_job(prompt="legacy skills", schedule="every 1h")
+        legacy = {
+            **job,
+            "skill": None,
+            "skills": ["work/retrospective", "work/knowledge-recall"],
+            "enabled": False,
+            "state": "paused",
+            "paused_reason": "test",
+        }
+        save_jobs([legacy])
+        stored_before = load_jobs()[0]
+
+        resumed = resume_job(job["id"])
+
+        assert resumed is not None
+        stored_after = load_jobs()[0]
+        assert stored_after["skill"] is None
+        assert stored_after["skills"] == legacy["skills"]
+        runtime_fields = {
+            "enabled", "state", "paused_at", "paused_reason", "next_run_at"
+        }
+        assert {
+            key: value for key, value in stored_after.items() if key not in runtime_fields
+        } == {
+            key: value for key, value in stored_before.items() if key not in runtime_fields
+        }
+
 
 class TestPauseResumeJob:
     def test_pause_sets_state(self, tmp_cron_dir):

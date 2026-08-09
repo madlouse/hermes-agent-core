@@ -92,6 +92,34 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
 
+    def test_cron_persist_hooks_are_discovered_and_invokable(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes_test"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        _make_plugin_dir(
+            hermes_home / "plugins",
+            "cron_governance",
+            register_body=(
+                "ctx.register_hook('pre_cron_job_persist', "
+                "lambda **kw: {'action': 'block', 'operation': kw['operation']})\n"
+                "    ctx.register_hook('post_cron_job_persist', "
+                "lambda **kw: {'observed': kw['notification_effect']})"
+            ),
+        )
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        assert "pre_cron_job_persist" in VALID_HOOKS
+        assert "post_cron_job_persist" in VALID_HOOKS
+        assert "pre_cron_job_run" in VALID_HOOKS
+        assert manager.invoke_hook("pre_cron_job_persist", operation="create") == [
+            {"action": "block", "operation": "create"}
+        ]
+        assert manager.invoke_hook(
+            "post_cron_job_persist",
+            notification_effect={"frame_id": "frame-1"},
+        ) == [{"observed": {"frame_id": "frame-1"}}]
+
 
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -305,6 +333,43 @@ class TestPluginLoading:
 
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
+
+    def test_mandatory_hook_reports_callback_failure_with_plugin_provenance(self):
+        manager = PluginManager()
+        crashing = PluginContext(
+            PluginManifest(name="crashing-policy", key="policy/crashing", source="user"),
+            manager,
+        )
+        allowing = PluginContext(
+            PluginManifest(name="allowing-policy", key="policy/allowing", source="bundled"),
+            manager,
+        )
+
+        def crash(**_kwargs):
+            raise TimeoutError("private failure detail")
+
+        crashing.register_hook("pre_cron_job_persist", crash)
+        allowing.register_hook(
+            "pre_cron_job_persist",
+            lambda **_kwargs: {"action": "allow"},
+        )
+
+        report = manager.invoke_mandatory_hook(
+            "pre_cron_job_persist",
+            operation="create",
+        )
+
+        assert report["callback_count"] == 2
+        assert report["results"] == [{"action": "allow"}]
+        assert report["failures"] == [{
+            "plugin": "policy/crashing",
+            "plugin_name": "crashing-policy",
+            "source": "user",
+            "callback": crash.__qualname__,
+            "module": __name__,
+            "hook": "pre_cron_job_persist",
+            "exception_class": "TimeoutError",
+        }]
 
 
 
