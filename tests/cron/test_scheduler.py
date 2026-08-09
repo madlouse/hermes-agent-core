@@ -833,6 +833,185 @@ class TestRunJobSessionPersistence:
         assert get_session_env("HERMES_CRON_JOB_ID") == ""
 
 
+    def test_late_worker_cannot_use_cron_approval_after_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+
+        release_worker = threading.Event()
+        worker_started = threading.Event()
+        late_check_done = threading.Event()
+        observed = {}
+        monkeypatch.setenv("HERMES_MODEL", "test-model")
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+        class NonCooperativeAgent:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run_conversation(self, prompt):
+                worker_started.set()
+                release_worker.wait(timeout=2)
+                from gateway.session_context import get_cron_runtime_context
+                from tools.approval import _is_cron_approval_context
+
+                observed["approval"] = _is_cron_approval_context()
+                observed["runtime"] = get_cron_runtime_context()
+                late_check_done.set()
+                return {"final_response": "late", "completed": True}
+
+            def interrupt(self, message=None):
+                # Deliberately ignore cancellation to model a stuck provider/tool.
+                pass
+
+            def close(self):
+                pass
+
+        with patch("cron.scheduler._hermes_home", tmp_path), patch(
+            "cron.scheduler._resolve_origin", return_value=None
+        ), patch(
+            "cron.jobs._apply_cron_runtime_governance", return_value=None
+        ), patch("hermes_cli.env_loader.load_hermes_dotenv"), patch(
+            "hermes_cli.env_loader.reset_secret_source_cache"
+        ), patch("hermes_state.SessionDB", return_value=MagicMock()), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        ), patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), patch(
+            "run_agent.AIAgent", NonCooperativeAgent
+        ):
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    run_job,
+                    {
+                        "id": "late-worker",
+                        "prompt": "wait",
+                        "run_timeout_seconds": 1,
+                        "authorized_behavior_ref": "behavior.late-worker",
+                    },
+                )
+                assert worker_started.wait(timeout=2)
+                success, _output, _response, error = future.result(timeout=2)
+            assert success is False
+            assert "total runtime limit" in (error or "")
+            release_worker.set()
+            assert late_check_done.wait(timeout=1)
+
+        assert observed == {"approval": False, "runtime": None}
+
+
+    @pytest.mark.parametrize("blocked_stage", ["mcp_discovery", "agent_init"])
+    def test_total_deadline_covers_discovery_and_agent_initialization(
+        self, blocked_stage, tmp_path, monkeypatch
+    ):
+        import threading
+        import time
+
+        stage_entered = threading.Event()
+        stage_release = threading.Event()
+        agent_constructed = threading.Event()
+        monkeypatch.setenv("HERMES_MODEL", "test-model")
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+        def slow_discovery(*args, **kwargs):
+            if blocked_stage == "mcp_discovery":
+                stage_entered.set()
+                stage_release.wait(timeout=2)
+            return []
+
+        class SlowInitAgent:
+            def __init__(self, *args, **kwargs):
+                if blocked_stage == "agent_init":
+                    stage_entered.set()
+                    stage_release.wait(timeout=2)
+                agent_constructed.set()
+
+            def run_conversation(self, prompt):
+                return {"final_response": "ok", "completed": True}
+
+            def close(self):
+                pass
+
+        with patch("cron.scheduler._hermes_home", tmp_path), patch(
+            "cron.scheduler._resolve_origin", return_value=None
+        ), patch(
+            "cron.jobs._apply_cron_runtime_governance", return_value=None
+        ), patch("hermes_cli.env_loader.load_hermes_dotenv"), patch(
+            "hermes_cli.env_loader.reset_secret_source_cache"
+        ), patch("hermes_state.SessionDB", return_value=MagicMock()), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        ), patch("tools.mcp_tool.discover_mcp_tools", side_effect=slow_discovery), patch(
+            "run_agent.AIAgent", SlowInitAgent
+        ):
+            import concurrent.futures
+
+            started = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    run_job,
+                    {
+                        "id": f"timeout-{blocked_stage}",
+                        "prompt": "run",
+                        "run_timeout_seconds": 1,
+                    },
+                )
+                assert stage_entered.wait(timeout=2)
+                success, _output, _response, error = future.result(timeout=2)
+            elapsed = time.monotonic() - started
+            assert success is False
+            assert "total runtime limit" in (error or "")
+            assert elapsed < 2
+            stage_release.set()
+
+        if blocked_stage == "mcp_discovery":
+            assert not agent_constructed.wait(timeout=0.2)
+
+
+    def test_mcp_profile_ownership_conflict_aborts_before_agent_init(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.mcp_tool import MCPServerOwnershipError
+
+        monkeypatch.setenv("HERMES_MODEL", "test-model")
+        with patch("cron.scheduler._hermes_home", tmp_path), patch(
+            "cron.scheduler._resolve_origin", return_value=None
+        ), patch(
+            "cron.jobs._apply_cron_runtime_governance", return_value=None
+        ), patch("hermes_cli.env_loader.load_hermes_dotenv"), patch(
+            "hermes_cli.env_loader.reset_secret_source_cache"
+        ), patch("hermes_state.SessionDB", return_value=MagicMock()), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        ), patch(
+            "tools.mcp_tool.discover_mcp_tools",
+            side_effect=MCPServerOwnershipError("profile collision"),
+        ), patch("run_agent.AIAgent") as agent_cls:
+            success, _output, _response, error = run_job(
+                {"id": "mcp-owner-conflict", "prompt": "run"}
+            )
+
+        assert success is False
+        assert "MCPServerOwnershipError" in (error or "")
+        agent_cls.assert_not_called()
+
+
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
         """Apply every patch run_job tests need, as one bundle.

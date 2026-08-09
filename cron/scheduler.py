@@ -229,6 +229,107 @@ def _resolve_cron_run_timeout_seconds(job: dict, cfg: dict) -> Optional[float]:
     return None
 
 
+class _CronRunControl:
+    """Shared deadline, interrupt target, and revocation fence for one run."""
+
+    def __init__(self, job: dict) -> None:
+        from gateway.session_context import new_cron_runtime_lease
+
+        self.started_at = time.monotonic()
+        self.lease = new_cron_runtime_lease()
+        self._condition = threading.Condition()
+        self._timeout: Optional[float] = None
+        self._configured = False
+        self._agent = None
+
+        raw_override = job.get("run_timeout_seconds")
+        if raw_override is not None and not isinstance(raw_override, bool):
+            try:
+                parsed = float(raw_override)
+            except (TypeError, ValueError):
+                parsed = -1
+            if parsed >= 0:
+                self.configure(None if parsed == 0 else parsed)
+
+    def configure(self, timeout: Optional[float]) -> None:
+        """Publish the effective timeout once; per-job values stay authoritative."""
+        with self._condition:
+            if self._configured:
+                return
+            self._timeout = timeout
+            self._configured = True
+            self._condition.notify_all()
+
+    def wait_timeout(self, maximum: float = 0.05) -> float:
+        with self._condition:
+            if not self._configured:
+                return maximum
+            if self._timeout is None:
+                return maximum
+            remaining = self._timeout - (time.monotonic() - self.started_at)
+            return max(0.0, min(maximum, remaining))
+
+    def remaining(self) -> Optional[float]:
+        with self._condition:
+            if not self._configured or self._timeout is None:
+                return None
+            return self._timeout - (time.monotonic() - self.started_at)
+
+    def timeout(self) -> Optional[float]:
+        with self._condition:
+            return self._timeout if self._configured else None
+
+    def set_agent(self, agent: Any) -> None:
+        with self._condition:
+            self._agent = agent
+
+    def raise_if_expired(self, stage: str) -> None:
+        remaining = self.remaining()
+        if remaining is not None and remaining <= 0:
+            timeout = self.timeout() or 0.0
+            raise TimeoutError(
+                f"Cron total runtime limit of {timeout:g}s expired during {stage}"
+            )
+
+    def interrupt(self, reason: str) -> None:
+        from gateway.session_context import revoke_cron_runtime_lease
+
+        revoke_cron_runtime_lease(self.lease)
+        with self._condition:
+            agent = self._agent
+        if agent is not None:
+            request_hard_interrupt(agent, reason)
+
+
+class _DeferredCronAgentCollector:
+    """Close agents that finish after their owning run already timed out."""
+
+    def __init__(self, job_id: str) -> None:
+        self._job_id = job_id
+        self._lock = threading.Lock()
+        self._agents: list[Any] = []
+        self._revoked = False
+
+    def append(self, agent: Any) -> None:
+        with self._lock:
+            if not self._revoked:
+                self._agents.append(agent)
+                return
+        _teardown_cron_agent(agent, self._job_id)
+
+    def transfer_to(self, target: list) -> None:
+        with self._lock:
+            agents, self._agents = self._agents, []
+        target.extend(agents)
+
+    def revoke(self) -> None:
+        with self._lock:
+            self._revoked = True
+            agents, self._agents = self._agents, []
+        for agent in agents:
+            _teardown_cron_agent(agent, self._job_id)
+
+
 def _cron_authorization_values(job: dict) -> dict[str, str]:
     """Project a persisted job into the in-process authorization context."""
     categories = job.get("implementation_categories")
@@ -3132,8 +3233,11 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
-def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
+def _run_job_impl(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    _run_control: _CronRunControl,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3160,6 +3264,7 @@ def run_job(
     from cron.jobs import _apply_cron_runtime_governance
 
     _apply_cron_runtime_governance(job)
+    _run_control.raise_if_expired("runtime governance")
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3510,7 +3615,7 @@ def run_job(
     _cron_auth_tokens = []
     try:
         _cron_auth_tokens = set_cron_authorization(
-            _cron_authorization_values(job)
+            _cron_authorization_values(job), lease=_run_control.lease
         )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
@@ -3539,6 +3644,7 @@ def run_job(
         )
         reset_secret_source_cache()
         load_hermes_dotenv(hermes_home=_get_hermes_home())
+        _run_control.raise_if_expired("dotenv loading")
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -3609,6 +3715,9 @@ def run_job(
                             model = _default
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+        finally:
+            _run_control.configure(_resolve_cron_run_timeout_seconds(job, _cfg))
+        _run_control.raise_if_expired("config loading")
 
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
@@ -3762,6 +3871,7 @@ def run_job(
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
+        _run_control.raise_if_expired("provider resolution")
 
         reasoning_config = resolve_reasoning_config(
             _cfg if isinstance(_cfg, dict) else {}, str(model)
@@ -3880,7 +3990,12 @@ def run_job(
                         else selected_mcp_servers
                     ),
                 )
+            _run_control.raise_if_expired("MCP discovery")
         except Exception as _mcp_exc:
+            from tools.mcp_tool import MCPServerOwnershipError
+
+            if isinstance(_mcp_exc, (MCPServerOwnershipError, TimeoutError)):
+                raise
             logger.warning(
                 "Job '%s': MCP initialization failed (non-fatal): %s",
                 job_id, _mcp_exc,
@@ -3919,6 +4034,8 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        _run_control.set_agent(agent)
+        _run_control.raise_if_expired("agent initialization")
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -3981,8 +4098,8 @@ def run_job(
         _cron_context = contextvars.copy_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
-        _cron_run_timeout = _resolve_cron_run_timeout_seconds(job, _cfg)
-        _run_started_at = time.monotonic()
+        _cron_run_timeout = _run_control.timeout()
+        _run_started_at = _run_control.started_at
         _wall_clock_timeout = False
         try:
             if (
@@ -4296,6 +4413,74 @@ def run_job(
                 defer_agent_teardown.append(agent)
         else:
             _teardown_cron_agent(agent, job_id)
+
+
+def run_job(
+    job: dict, *, defer_agent_teardown: Optional[list] = None
+) -> tuple[bool, str, str, Optional[str]]:
+    """Execute a job under one deadline measured from this entry boundary.
+
+    The monitored worker includes runtime governance, dotenv/config/provider
+    loading, MCP and plugin discovery, agent construction, and the conversation
+    itself. A timeout revokes the shared cron runtime lease before returning, so
+    a non-cooperative late worker cannot retain cron approval authority.
+    """
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    job_id = str(job.get("id") or "")
+    job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    control = _CronRunControl(job)
+    collector = (
+        _DeferredCronAgentCollector(job_id)
+        if defer_agent_teardown is not None
+        else None
+    )
+    worker_deferred = collector if collector is not None else None
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    worker_context = contextvars.copy_context()
+    future = pool.submit(
+        worker_context.run,
+        _run_job_impl,
+        job,
+        defer_agent_teardown=worker_deferred,
+        _run_control=control,
+    )
+
+    try:
+        while True:
+            if future.done():
+                result = future.result()
+                if collector is not None and defer_agent_teardown is not None:
+                    collector.transfer_to(defer_agent_teardown)
+                return result
+
+            remaining = control.remaining()
+            if remaining is not None and remaining <= 0:
+                timeout = control.timeout() or 0.0
+                reason = (
+                    f"Cron job '{job_name}' exceeded total runtime limit of "
+                    f"{timeout:g}s"
+                )
+                control.interrupt(reason)
+                if collector is not None:
+                    collector.revoke()
+                future.cancel()
+                logger.error("Job '%s': %s", job_id, reason)
+                output = (
+                    f"# Cron Job: {job_name} (FAILED)\n\n"
+                    f"**Job ID:** {job_id}\n"
+                    f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    "## Error\n\n"
+                    f"```\nTimeoutError: {reason}\n```\n"
+                )
+                return False, output, "", f"TimeoutError: {reason}"
+
+            try:
+                future.result(timeout=control.wait_timeout())
+            except concurrent.futures.TimeoutError:
+                continue
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _teardown_cron_agent(agent, job_id: str) -> None:
