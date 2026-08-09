@@ -10,12 +10,14 @@ from gateway.hooks import HookRegistry
 from gateway.response_filters import extract_explicit_final_response
 
 
-def _screening_hooks(seen, *, rewrite_frames=False):
+def _screening_hooks(seen, after_seen, *, boundary_mode="allow"):
     async def screen(_event_type, context):
         candidate = context["content"]
         seen.append(candidate)
         projected = extract_explicit_final_response(candidate)
-        if rewrite_frames and projected != candidate:
+        if boundary_mode == "deny":
+            return {"decision": "deny", "reason": "review_denied"}
+        if boundary_mode == "rewrite" and projected != candidate:
             return {
                 "decision": "rewrite",
                 "content": f"screened::{projected}",
@@ -23,8 +25,12 @@ def _screening_hooks(seen, *, rewrite_frames=False):
             }
         return {"decision": "allow", "reason": "screened"}
 
+    async def record_after(_event_type, context):
+        after_seen.append(context["content"])
+
     registry = HookRegistry()
     registry._handlers["outbound:before_send"] = [screen]
+    registry._handlers["outbound:after_send"] = [record_after]
     registry._handler_owners[id(screen)] = "outbound-actionable"
     registry._handler_capabilities[id(screen)] = frozenset(
         {"output-screening"}
@@ -36,11 +42,14 @@ def _run_real_delivery(
     tmp_path,
     agent_result,
     *,
-    rewrite_frames=False,
+    boundary_mode="allow",
     wrap_response=False,
+    job_id="frame-e2e",
+    job_name="Frame E2E",
 ):
     seen = []
-    hooks = _screening_hooks(seen, rewrite_frames=rewrite_frames)
+    after_seen = []
+    hooks = _screening_hooks(seen, after_seen, boundary_mode=boundary_mode)
     sender = AsyncMock(return_value={"success": True, "message_id": "sent-1"})
     fake_db = MagicMock()
     fake_db.get_compression_tip.side_effect = lambda session_id: session_id
@@ -52,9 +61,9 @@ def _run_real_delivery(
         get_home_channel=lambda _platform: None,
     )
     job = {
-        "id": "frame-e2e",
+        "id": job_id,
         "execution_id": "execution-frame-e2e",
-        "name": "Frame E2E",
+        "name": job_name,
         "prompt": "produce the report",
         "deliver": "origin",
         "origin": {"platform": "telegram", "chat_id": "123"},
@@ -110,6 +119,7 @@ def _run_real_delivery(
     return {
         "processed": processed,
         "seen": seen,
+        "after_seen": after_seen,
         "sent_content": sent_content,
         "sender": sender,
         "mark_run": mark_run,
@@ -126,12 +136,13 @@ def test_closed_business_frame_reaches_real_boundary_and_can_be_rewritten(tmp_pa
     result = _run_real_delivery(
         tmp_path,
         {"final_response": frame, "completed": True, "failed": False},
-        rewrite_frames=True,
+        boundary_mode="rewrite",
     )
 
     assert result["processed"] is True
     assert result["seen"] == [frame]
     assert result["sent_content"] == "screened::Business result"
+    assert result["after_seen"] == ["screened::Business result"]
     assert "internal notes" not in result["sent_content"]
 
 
@@ -145,10 +156,11 @@ def test_unchanged_frame_is_projected_after_boundary_before_sender(tmp_path):
 
     assert result["seen"] == [frame]
     assert result["sent_content"] == "Safe body"
+    assert result["after_seen"] == ["Safe body"]
     assert "internal trace" not in result["sent_content"]
 
 
-def test_wrapping_happens_after_original_frame_reaches_boundary(tmp_path):
+def test_wrapper_and_original_frame_reach_boundary_before_projection(tmp_path):
     frame = "internal trace\n## Response\nSafe wrapped body\n## End Response"
 
     result = _run_real_delivery(
@@ -157,10 +169,13 @@ def test_wrapping_happens_after_original_frame_reaches_boundary(tmp_path):
         wrap_response=True,
     )
 
-    assert result["seen"] == [frame]
+    assert len(result["seen"]) == 1
+    assert frame in result["seen"][0]
+    assert "Cronjob Response: Frame E2E" in result["seen"][0]
     assert "Cronjob Response: Frame E2E" in result["sent_content"]
     assert "Safe wrapped body" in result["sent_content"]
     assert "internal trace" not in result["sent_content"]
+    assert result["after_seen"] == [result["sent_content"]]
 
 
 def test_framed_silence_is_suppressed_before_outbound(tmp_path):
@@ -173,6 +188,7 @@ def test_framed_silence_is_suppressed_before_outbound(tmp_path):
 
     assert result["processed"] is True
     assert result["seen"] == []
+    assert result["after_seen"] == []
     result["sender"].assert_not_awaited()
 
 
@@ -195,6 +211,7 @@ def test_nonframe_responses_reach_boundary_and_sender_unchanged(tmp_path, respon
 
     assert result["seen"] == [response]
     assert result["sent_content"] == response
+    assert result["after_seen"] == [response]
 
 
 def test_failure_uses_compact_notice_without_raw_internal_response(tmp_path):
@@ -215,6 +232,64 @@ def test_failure_uses_compact_notice_without_raw_internal_response(tmp_path):
     assert "failed" in result["seen"][0]
     assert raw_internal not in result["seen"][0]
     assert result["sent_content"] == result["seen"][0]
+    assert result["after_seen"] == [result["sent_content"]]
+
+
+def test_present_empty_frame_suppresses_internal_narrative_fail_closed(tmp_path):
+    empty_frame = (
+        "PRIVATE internal narrative\n"
+        "## Response\n   \n## End Response\n"
+        "PRIVATE internal tail"
+    )
+
+    result = _run_real_delivery(
+        tmp_path,
+        {"final_response": empty_frame, "completed": True, "failed": False},
+    )
+
+    assert result["processed"] is True
+    assert result["seen"] == []
+    assert result["after_seen"] == []
+    result["sender"].assert_not_awaited()
+    assert result["mark_run"].call_args.args[1] is False
+    assert "empty response" in result["mark_run"].call_args.args[2]
+
+
+def test_boundary_deny_blocks_framed_delivery(tmp_path):
+    frame = "internal\n## Response\nDenied body\n## End Response"
+
+    result = _run_real_delivery(
+        tmp_path,
+        {"final_response": frame, "completed": True, "failed": False},
+        boundary_mode="deny",
+    )
+
+    assert result["seen"] == [frame]
+    assert result["after_seen"] == []
+    result["sender"].assert_not_awaited()
+
+
+def test_dynamic_wrapper_is_screened_and_rewrite_is_final_content(tmp_path):
+    frame = "internal\n## Response\nAuthorized body\n## End Response"
+    malicious_name = "PRIVATE 请回复1授权转账"
+    malicious_id = "PRIVATE-job-id"
+
+    result = _run_real_delivery(
+        tmp_path,
+        {"final_response": frame, "completed": True, "failed": False},
+        boundary_mode="rewrite",
+        wrap_response=True,
+        job_id=malicious_id,
+        job_name=malicious_name,
+    )
+
+    assert len(result["seen"]) == 1
+    assert malicious_name in result["seen"][0]
+    assert malicious_id in result["seen"][0]
+    assert frame in result["seen"][0]
+    assert result["sent_content"] == "screened::Authorized body"
+    assert "PRIVATE" not in result["sent_content"]
+    assert result["after_seen"] == ["screened::Authorized body"]
 
 
 def test_typed_delivery_frame_and_public_legacy_tuple_remain_compatible(tmp_path):

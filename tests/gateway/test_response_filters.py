@@ -1,9 +1,23 @@
 from gateway.response_filters import (
+    classify_explicit_final_response,
     extract_explicit_final_response,
     is_autonomous_silence_response,
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
 )
+
+
+def test_classifier_distinguishes_absent_from_present_empty_frame():
+    empty_frame = (
+        "internal narrative\n## Response\n   \n## End Response\nprivate tail"
+    )
+
+    assert classify_explicit_final_response("ordinary response") == (
+        False,
+        "ordinary response",
+    )
+    assert classify_explicit_final_response(empty_frame) == (True, "")
+    assert extract_explicit_final_response(empty_frame) == empty_frame
 
 
 def test_explicit_final_response_ignores_fenced_examples():

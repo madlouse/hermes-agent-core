@@ -1285,11 +1285,20 @@ def _extract_cron_final_response(text: str) -> str:
     return extract_explicit_final_response(text)
 
 
+def _cron_final_response_parts(text: str) -> tuple[str, str | None]:
+    """Return control body and original frame, preserving present-empty."""
+    from gateway.response_filters import classify_explicit_final_response
+
+    frame_present, body = classify_explicit_final_response(text)
+    if frame_present:
+        return body, text
+    return text, None
+
+
 def _closed_cron_final_response_frame(text: str) -> str | None:
     """Return the original closed frame, without treating examples as frames."""
-    if not isinstance(text, str) or not text.strip():
-        return None
-    return text if _extract_cron_final_response(text) != text else None
+    _, frame = _cron_final_response_parts(text)
+    return frame
 
 
 def _strip_cron_silence_markers_from_report(text: str) -> str:
@@ -2715,8 +2724,9 @@ def _deliver_result(
     Returns None on success, or an error string on failure.
 
     ``delivery_projection`` is supplied only with a closed autonomous response
-    frame. The frame is screened first; the projection is the trusted body
-    fallback when the boundary leaves that frame unchanged.
+    frame. The frame and dynamic wrapper are screened first; if the screened
+    result still contains that frame, projection only replaces it with the
+    trusted body and cannot add unscreened content.
     """
     targets = _resolve_delivery_targets(job)
     if not targets:
@@ -2768,15 +2778,11 @@ def _deliver_result(
             )
         return candidate
 
-    # A closed frame reaches outbound:before_send byte-for-byte. Its body is a
-    # fail-safe projection only: it is selected after the Hook sees the frame
-    # when the Hook allows the candidate unchanged. Ordinary responses retain
-    # the historical pre-boundary wrapping behavior.
-    delivery_content = (
-        content
-        if delivery_projection is not None
-        else _wrap_delivery(content)
-    )
+    # Every dynamic wrapper field is part of the screened candidate. For a
+    # closed frame, the Hook sees that frame intact inside the exact wrapper
+    # that could be sent. The only post-screen transform permitted below is a
+    # monotonic replacement of that raw frame with its trusted body.
+    delivery_content = _wrap_delivery(content)
 
     # Media is extracted only after the mandatory output boundary so the Hook
     # screens the exact candidate that can reach the sender.
@@ -2999,18 +3005,15 @@ def _deliver_result(
                 delivery_errors.append(msg)
                 continue
             screened_content = boundary_decision.content
+            frame_projected_in_screened_candidate = False
             if delivery_projection is not None:
-                if screened_content == delivery_content:
-                    visible_content = delivery_projection
-                elif _closed_cron_final_response_frame(screened_content):
-                    visible_content = _extract_cron_final_response(
-                        screened_content
+                frame_projected_in_screened_candidate = content in screened_content
+                if frame_projected_in_screened_candidate:
+                    screened_content = screened_content.replace(
+                        content,
+                        delivery_projection,
                     )
-                else:
-                    visible_content = screened_content
-                screened_content = _wrap_delivery(visible_content)
-            else:
-                visible_content = screened_content
+            visible_content = screened_content
             boundary_media_files, boundary_delivery_content = (
                 BasePlatformAdapter.extract_media(screened_content)
             )
@@ -3024,6 +3027,10 @@ def _deliver_result(
             )
             if boundary_unchanged:
                 _, boundary_mirror_text = BasePlatformAdapter.extract_media(content)
+            elif frame_projected_in_screened_candidate:
+                _, boundary_mirror_text = BasePlatformAdapter.extract_media(
+                    delivery_projection
+                )
             else:
                 _, boundary_mirror_text = BasePlatformAdapter.extract_media(
                     visible_content
@@ -5796,7 +5803,7 @@ def _run_job_body(
             )
 
         original_final_response = result.get("final_response", "") or ""
-        delivery_frame = _closed_cron_final_response_frame(
+        final_response, delivery_frame = _cron_final_response_parts(
             original_final_response
         )
         # Frame-unwrap before the silence/empty checks.  The agent sometimes
@@ -5806,7 +5813,6 @@ def _run_job_body(
         # quiet tick must be treated as silence, not an empty-response failure.
         # Keep the original closed frame separately for the outbound boundary;
         # only this control/body value is used for logging and suppression.
-        final_response = _extract_cron_final_response(original_final_response)
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -6457,19 +6463,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # The body controls silence/empty behavior. A separately retained
         # closed frame is the only successful delivery candidate so the output
         # boundary can project it with its full provenance still attached.
-        delivery_control_content = (
-            _extract_cron_final_response(final_response)
-            if success
-            else _summarize_cron_failure_for_delivery(job, error)
-        )
         delivery_frame = None
         if success:
-            delivery_frame = (
-                run_result.delivery_frame
-                or _closed_cron_final_response_frame(final_response)
-            )
+            if run_result.delivery_frame is not None:
+                delivery_control_content, delivery_frame = (
+                    _cron_final_response_parts(run_result.delivery_frame)
+                )
+            else:
+                delivery_control_content, delivery_frame = (
+                    _cron_final_response_parts(final_response)
+                )
+            if delivery_frame is None:
+                delivery_control_content = final_response
             deliver_content = delivery_frame or final_response
         else:
+            delivery_control_content = _summarize_cron_failure_for_delivery(
+                job, error
+            )
             deliver_content = delivery_control_content
         # Whitespace-only responses are not delivered; the guard below records
         # them as a soft failure.
