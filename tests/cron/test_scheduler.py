@@ -1326,6 +1326,7 @@ class TestRunJobSessionPersistence:
         release_cleanup = threading.Event()
         worker_started = threading.Event()
         worker_done = threading.Event()
+        results = {}
 
         def blocking_kill(candidate):
             assert candidate is process
@@ -1338,11 +1339,13 @@ class TestRunJobSessionPersistence:
         cleanup = control.attach_script_process(process)
 
         def watchdog():
-            control.interrupt("deadline")
+            results["watchdog"] = control.interrupt("deadline")
 
         def worker():
             worker_started.set()
-            control.cleanup_script_process(cleanup, kill=True)
+            results["worker"] = control.cleanup_script_process(
+                cleanup, kill=True
+            )
             worker_done.set()
 
         with patch(
@@ -1369,6 +1372,9 @@ class TestRunJobSessionPersistence:
         assert not worker_thread.is_alive()
         assert cleanup.done.is_set() is True
         assert worker_done.is_set() is True
+        assert results["watchdog"].cleanup_complete is True
+        assert results["worker"] is True
+        assert control.cleanup_incomplete() is False
         with control._condition:
             assert control._script_process is None
             assert control._script_cleanup is None

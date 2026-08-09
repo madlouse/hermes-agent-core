@@ -71,6 +71,7 @@ class _RunJobResult:
     error: Optional[str]
     runtime_admission_receipt: dict[str, Any] | None = None
     runtime_admission_decision: dict[str, Any] | None = None
+    cleanup_incomplete: bool = False
 
     def legacy_tuple(self) -> tuple[bool, str, str, Optional[str]]:
         return self.success, self.output, self.final_response, self.error
@@ -346,30 +347,99 @@ def _preparse_cron_run_timeout(job: dict) -> object | Optional[float]:
     return parsed if parsed > 0 else _CRON_ENTRY_TIMEOUT_UNSET
 
 
+@dataclass(frozen=True)
+class _CronInterruptResult:
+    cleanup_complete: bool
+    agent_interrupt_complete: bool = True
+
+    @property
+    def cleanup_incomplete(self) -> bool:
+        return not (self.cleanup_complete and self.agent_interrupt_complete)
+
+
 class _CronScriptCleanup:
     """Single-owner process cleanup with a completion fence for all callers."""
 
-    def __init__(self, process: subprocess.Popen) -> None:
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        *,
+        on_finished: Optional[Callable[["_CronScriptCleanup"], None]] = None,
+    ) -> None:
         self.process = process
         self._lock = threading.Lock()
         self._claimed = False
+        self._completed = False
+        self._error: Optional[BaseException] = None
+        self._on_finished = on_finished
         self.done = threading.Event()
 
-    def cleanup(self, *, kill: bool) -> None:
+    @property
+    def completed(self) -> bool:
         with self._lock:
-            owner = not self._claimed
-            if owner:
-                self._claimed = True
-        if not owner:
-            self.done.wait()
-            return
+            return self._completed
+
+    @property
+    def error(self) -> Optional[BaseException]:
+        with self._lock:
+            return self._error
+
+    def _perform(self, *, kill: bool) -> None:
+        error = None
         try:
             if kill:
                 _kill_cron_process_group(self.process)
             else:
                 self.process.wait()
+        except BaseException as exc:
+            error = exc
         finally:
+            with self._lock:
+                self._completed = error is None
+                self._error = error
             self.done.set()
+            if self._on_finished is not None:
+                try:
+                    self._on_finished(self)
+                except Exception:
+                    logger.debug(
+                        "Cron script cleanup completion callback failed",
+                        exc_info=True,
+                    )
+        if error is not None:
+            raise error
+
+    def _perform_in_background(self, *, kill: bool) -> None:
+        try:
+            self._perform(kill=kill)
+        except BaseException:
+            logger.warning("Cron script cleanup failed", exc_info=True)
+
+    def cleanup(self, *, kill: bool, timeout: Optional[float] = None) -> bool:
+        """Run/await the single cleanup, bounded when ``timeout`` is supplied."""
+        with self._lock:
+            owner = not self._claimed
+            if owner:
+                self._claimed = True
+        if owner and timeout is None:
+            self._perform(kill=kill)
+            return self.completed
+        if owner:
+            worker = threading.Thread(
+                target=self._perform_in_background,
+                kwargs={"kill": kill},
+                name="cron-script-cleanup",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except BaseException as exc:
+                with self._lock:
+                    self._error = exc
+                self.done.set()
+                return False
+        finished = self.done.wait(timeout=timeout)
+        return bool(finished and self.completed)
 
 
 class _CronRunControl:
@@ -394,6 +464,10 @@ class _CronRunControl:
         self._script_cleanup: Optional[_CronScriptCleanup] = None
         self._script_spawn_in_progress = False
         self._interrupted = False
+        self._cleanup_incomplete = False
+        self._agent_interrupt_started = False
+        self._agent_interrupt_done = threading.Event()
+        self._agent_interrupt_failed = False
 
         raw_override = job.get("run_timeout_seconds")
         if raw_override is not None and not isinstance(raw_override, bool):
@@ -479,7 +553,9 @@ class _CronRunControl:
         self, process: subprocess.Popen
     ) -> _CronScriptCleanup:
         """Publish a Popen and its shared cleanup fence before leaving spawn."""
-        cleanup = _CronScriptCleanup(process)
+        cleanup = _CronScriptCleanup(
+            process, on_finished=self._script_cleanup_finished
+        )
         with self._condition:
             self._script_process = process
             self._script_cleanup = cleanup
@@ -487,19 +563,39 @@ class _CronRunControl:
             interrupted = self._interrupted
             self._condition.notify_all()
         if interrupted:
-            self.cleanup_script_process(cleanup, kill=True)
+            self.cleanup_script_process(cleanup, kill=True, timeout=0.0)
         return cleanup
 
-    def cleanup_script_process(
-        self, cleanup: _CronScriptCleanup, *, kill: bool
-    ) -> None:
-        """Run or await the process's one cleanup, then clear published state."""
-        cleanup.cleanup(kill=kill)
+    def _script_cleanup_finished(self, cleanup: _CronScriptCleanup) -> None:
+        """Clear only a genuinely completed late cleanup from published state."""
         with self._condition:
-            if self._script_cleanup is cleanup and cleanup.done.is_set():
+            if self._script_cleanup is cleanup and cleanup.completed:
                 self._script_cleanup = None
                 self._script_process = None
                 self._condition.notify_all()
+
+    def cleanup_script_process(
+        self,
+        cleanup: _CronScriptCleanup,
+        *,
+        kill: bool,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Run or await the process's one cleanup, then clear published state."""
+        completed = cleanup.cleanup(kill=kill, timeout=timeout)
+        with self._condition:
+            if self._script_cleanup is cleanup and completed:
+                self._script_cleanup = None
+                self._script_process = None
+                self._condition.notify_all()
+            elif not completed:
+                self._cleanup_incomplete = True
+        return completed
+
+    def cleanup_incomplete(self) -> bool:
+        """Return the sticky cleanup-deadline failure state for this run."""
+        with self._condition:
+            return self._cleanup_incomplete
 
     def raise_if_expired(self, stage: str) -> None:
         remaining = self.remaining()
@@ -509,20 +605,76 @@ class _CronRunControl:
                 f"Cron total runtime limit of {timeout:g}s expired during {stage}"
             )
 
-    def interrupt(self, reason: str) -> None:
+    def interrupt(
+        self,
+        reason: str,
+        *,
+        cleanup_timeout: Optional[float] = None,
+    ) -> _CronInterruptResult:
         from gateway.session_context import revoke_cron_runtime_lease
 
         revoke_cron_runtime_lease(self.lease)
+        if cleanup_timeout is None:
+            cleanup_timeout = self.cleanup_grace()
+        cleanup_timeout = max(0.0, float(cleanup_timeout))
+        cleanup_deadline = time.monotonic() + cleanup_timeout
         with self._condition:
             self._interrupted = True
             agent = self._agent
+            start_agent_interrupt = agent is not None and not self._agent_interrupt_started
+            if start_agent_interrupt:
+                self._agent_interrupt_started = True
             while self._script_spawn_in_progress:
-                self._condition.wait()
+                remaining = cleanup_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    self._cleanup_incomplete = True
+                    break
+                self._condition.wait(timeout=remaining)
             cleanup = self._script_cleanup
+        if start_agent_interrupt:
+            def _interrupt_agent() -> None:
+                try:
+                    request_hard_interrupt(agent, reason)
+                except BaseException:
+                    with self._condition:
+                        self._agent_interrupt_failed = True
+                finally:
+                    self._agent_interrupt_done.set()
+
+            try:
+                threading.Thread(
+                    target=_interrupt_agent,
+                    name="cron-agent-interrupt",
+                    daemon=True,
+                ).start()
+            except BaseException:
+                with self._condition:
+                    self._agent_interrupt_failed = True
+                    self._cleanup_incomplete = True
+                self._agent_interrupt_done.set()
+        cleanup_complete = cleanup is None and not self.cleanup_incomplete()
         if cleanup is not None:
-            self.cleanup_script_process(cleanup, kill=True)
+            cleanup_complete = self.cleanup_script_process(
+                cleanup,
+                kill=True,
+                timeout=max(0.0, cleanup_deadline - time.monotonic()),
+            )
+        agent_interrupt_complete = True
         if agent is not None:
-            request_hard_interrupt(agent, reason)
+            remaining = max(0.0, cleanup_deadline - time.monotonic())
+            if remaining > 0.0:
+                self._agent_interrupt_done.wait(timeout=remaining)
+            with self._condition:
+                agent_interrupt_complete = bool(
+                    self._agent_interrupt_done.is_set()
+                    and not self._agent_interrupt_failed
+                )
+                if not agent_interrupt_complete:
+                    self._cleanup_incomplete = True
+        return _CronInterruptResult(
+            cleanup_complete=cleanup_complete,
+            agent_interrupt_complete=agent_interrupt_complete,
+        )
 
 
 class _DeferredCronAgentCollector:
@@ -5791,15 +5943,23 @@ def _run_job_result(
             remaining = control.execution_remaining()
             if remaining is not None and remaining <= 0:
                 timeout = control.timeout() or 0.0
-                reason = (
+                base_reason = (
                     f"Cron job '{job_name}' exceeded total runtime limit of "
                     f"{timeout:g}s"
                 )
-                control.interrupt(reason)
+                hard_deadline = control.hard_deadline()
+                cleanup_remaining = (
+                    max(0.0, hard_deadline - time.monotonic())
+                    if hard_deadline is not None
+                    else 0.0
+                )
+                interrupt_result = control.interrupt(
+                    base_reason,
+                    cleanup_timeout=cleanup_remaining,
+                )
                 if collector is not None:
                     collector.revoke()
                 future.cancel()
-                hard_deadline = control.hard_deadline()
                 cleanup_remaining = (
                     max(0.0, hard_deadline - time.monotonic())
                     if hard_deadline is not None
@@ -5812,6 +5972,16 @@ def _run_job_result(
                         pass
                     except BaseException:
                         pass
+                cleanup_incomplete = bool(
+                    interrupt_result.cleanup_incomplete
+                    or control.cleanup_incomplete()
+                    or not future.done()
+                )
+                reason = (
+                    f"{base_reason}; cleanup_incomplete"
+                    if cleanup_incomplete
+                    else base_reason
+                )
                 logger.error("Job '%s': %s", job_id, reason)
                 output = (
                     f"# Cron Job: {job_name} (FAILED)\n\n"
@@ -5825,6 +5995,7 @@ def _run_job_result(
                     output,
                     "",
                     f"TimeoutError: {reason}",
+                    cleanup_incomplete=cleanup_incomplete,
                 )
 
             if future.done():
