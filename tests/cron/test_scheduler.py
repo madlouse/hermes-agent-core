@@ -1113,6 +1113,195 @@ class TestBuildJobPromptMissingSkill:
         assert "not found" in result.lower() or "skipped" in result.lower()
 
 
+class TestBuildJobPromptSkillBindings:
+    def _binding(self, tmp_path, monkeypatch):
+        from agent.skill_resolution import resolve_skill_ref
+
+        profile = tmp_path / "profile"
+        skill_dir = profile / "skills" / "work" / "bound-skill"
+        skill_dir.mkdir(parents=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(
+            "---\nname: bound-skill\ndescription: test\n---\n\nBound body.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        return profile, skill_md, resolve_skill_ref(profile, "bound-skill")
+
+    def test_scheduler_prefers_binding_path(self, tmp_path, monkeypatch):
+        _profile, skill_md, binding = self._binding(tmp_path, monkeypatch)
+        seen = []
+
+        def _skill_view(name):
+            seen.append(name)
+            return json.dumps(
+                {
+                    "success": True,
+                    "content": "Bound body.",
+                    "_source_path": str(skill_md),
+                }
+            )
+
+        with patch("tools.skills_tool.skill_view", side_effect=_skill_view) as skill_view_mock, \
+             patch("tools.skill_usage.bump_use"):
+            result = _build_job_prompt(
+                {
+                    "skills": ["bound-skill"],
+                    "skill_bindings": [binding],
+                    "prompt": "go",
+                }
+            )
+
+        assert seen == []
+        skill_view_mock.assert_not_called()
+        assert "Bound body." in result
+
+    def test_binding_digest_mismatch_does_not_fall_back(self, tmp_path, monkeypatch):
+        from agent.skill_resolution import SkillResolutionError
+
+        _profile, skill_md, binding = self._binding(tmp_path, monkeypatch)
+        skill_md.write_text(skill_md.read_text() + "changed\n", encoding="utf-8")
+
+        with patch("tools.skills_tool.skill_view") as skill_view_mock, pytest.raises(
+            SkillResolutionError, match="Persisted Cron skill binding was rejected"
+        ):
+            _build_job_prompt(
+                {
+                    "skills": ["bound-skill"],
+                    "skill_bindings": [binding],
+                    "prompt": "go",
+                }
+            )
+
+        skill_view_mock.assert_not_called()
+
+    def test_binding_failure_blocks_prerun_script(self, tmp_path, monkeypatch):
+        from agent.skill_resolution import SkillResolutionError
+
+        _profile, skill_md, binding = self._binding(tmp_path, monkeypatch)
+        skill_md.write_text(skill_md.read_text() + "changed\n", encoding="utf-8")
+
+        with patch("cron.scheduler._run_job_script") as script, pytest.raises(
+            SkillResolutionError, match="Persisted Cron skill binding was rejected"
+        ):
+            _build_job_prompt(
+                {
+                    "skills": ["bound-skill"],
+                    "skill_bindings": [binding],
+                    "script": "/tmp/must-not-run",
+                    "prompt": "go",
+                }
+            )
+
+        script.assert_not_called()
+
+    def test_bound_skill_preprocesses_verified_bytes_without_loader_reread(
+        self, tmp_path, monkeypatch
+    ):
+        _profile, skill_md, binding = self._binding(tmp_path, monkeypatch)
+        calls = []
+
+        def preprocess(content, skill_dir, session_id=None, skills_cfg=None):
+            calls.append((content, skill_dir, session_id, skills_cfg))
+            return "Processed verified body."
+
+        with patch("tools.skills_tool.skill_view") as skill_view_mock, patch(
+            "agent.skill_preprocessing.preprocess_skill_content",
+            side_effect=preprocess,
+        ), patch("tools.skill_usage.bump_use"):
+            result = _build_job_prompt(
+                {
+                    "skills": ["bound-skill"],
+                    "skill_bindings": [binding],
+                    "prompt": "go",
+                }
+            )
+
+        skill_view_mock.assert_not_called()
+        assert calls == [(skill_md.read_text(), skill_md.parent.resolve(), None, None)]
+        assert "Processed verified body." in result
+
+    def test_scheduler_validates_registered_plugin_binding(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.skill_resolution import resolve_skill_ref
+
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text(
+            "---\nname: task\ndescription: plugin\n---\n\nPlugin body.\n",
+            encoding="utf-8",
+        )
+        binding = resolve_skill_ref(
+            profile,
+            "demo:task",
+            plugin_skill_path=plugin_skill,
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        manager = MagicMock()
+        manager.find_plugin_skill.return_value = plugin_skill
+
+        with patch("hermes_cli.plugins.discover_plugins"), \
+             patch("hermes_cli.plugins.get_plugin_manager", return_value=manager), \
+             patch(
+                 "tools.skills_tool.skill_view",
+                 return_value=json.dumps(
+                    {
+                        "success": True,
+                        "content": "Plugin body.",
+                        "_source_path": str(plugin_skill),
+                    }
+                 ),
+             ) as skill_view_mock, \
+             patch("tools.skill_usage.bump_use"):
+            result = _build_job_prompt(
+                {
+                    "skills": ["demo:task"],
+                    "skill_bindings": [binding],
+                    "prompt": "go",
+                }
+            )
+
+        manager.find_plugin_skill.assert_called_once_with("demo:task")
+        skill_view_mock.assert_not_called()
+        assert "Plugin body." in result
+
+    def test_scheduler_rejects_disabled_registered_plugin_binding(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.skill_resolution import SkillResolutionError, resolve_skill_ref
+
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        plugin_skill = tmp_path / "plugin" / "SKILL.md"
+        plugin_skill.parent.mkdir()
+        plugin_skill.write_text(
+            "---\nname: task\ndescription: plugin\n---\n\nPlugin body.\n",
+            encoding="utf-8",
+        )
+        binding = resolve_skill_ref(
+            profile,
+            "demo:task",
+            plugin_skill_path=plugin_skill,
+        )
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+
+        with patch("hermes_cli.plugins._get_disabled_plugins", return_value={"demo"}), \
+             patch("hermes_cli.plugins.discover_plugins") as discover, \
+             pytest.raises(SkillResolutionError, match="plugin skill is disabled"):
+            _build_job_prompt(
+                {
+                    "skills": ["demo:task"],
+                    "skill_bindings": [binding],
+                    "prompt": "go",
+                }
+            )
+
+        discover.assert_not_called()
+
+
 class TestBuildJobPromptAbsoluteSkillPath:
     """Cron jobs may store absolute skill paths; normalize before skill_view."""
 
@@ -1820,6 +2009,11 @@ class TestMultiTargetDeliveryContinuesOnFailure:
     and silently dropping every subsequent target.
     """
 
+    @staticmethod
+    def _fail_asyncio_run(coro):
+        coro.close()
+        raise RuntimeError("no running loop")
+
     def _email_cfg(self):
         from gateway.config import Platform
 
@@ -1838,7 +2032,7 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
         with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("asyncio.run", side_effect=self._fail_asyncio_run), \
              patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
             mock_pool = MagicMock()
             mock_pool_cls.return_value = mock_pool
@@ -1847,7 +2041,13 @@ class TestMultiTargetDeliveryContinuesOnFailure:
             fail_future.result.side_effect = ConnectionError("SMTP connection refused")
             ok_future = MagicMock()
             ok_future.result.return_value = {"success": True}
-            mock_pool.submit.side_effect = [fail_future, ok_future]
+            futures = iter((fail_future, ok_future))
+
+            def submit(_runner, coro):
+                coro.close()
+                return next(futures)
+
+            mock_pool.submit.side_effect = submit
 
             result = _deliver_result(job, "Report content")
 
@@ -1869,14 +2069,19 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
         with patch("gateway.config.load_gateway_config", return_value=self._email_cfg()), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run", side_effect=RuntimeError("no running loop")), \
+             patch("asyncio.run", side_effect=self._fail_asyncio_run), \
              patch("concurrent.futures.ThreadPoolExecutor") as mock_pool_cls:
             mock_pool = MagicMock()
             mock_pool_cls.return_value = mock_pool
 
             fail_future = MagicMock()
             fail_future.result.side_effect = ConnectionError("connection refused")
-            mock_pool.submit.return_value = fail_future
+
+            def submit(_runner, coro):
+                coro.close()
+                return fail_future
+
+            mock_pool.submit.side_effect = submit
 
             result = _deliver_result(job, "Report content")
 
@@ -1899,5 +2104,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
-

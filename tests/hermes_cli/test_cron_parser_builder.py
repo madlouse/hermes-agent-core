@@ -25,8 +25,8 @@ def _build():
 
 def test_cron_subactions_present():
     parser = _build()
-    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "tick"):
-        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "tick")
+    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "migrate-skill-bindings", "tick"):
+        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "migrate-skill-bindings", "tick")
                                else ["cron", action, "jobid"] if action in ("pause", "resume", "run", "remove", "edit")
                                else ["cron", "create", "30m"])
         assert ns.command == "cron"
@@ -48,3 +48,12 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_skill_binding_migration_flags():
+    parser = _build()
+    ns = parser.parse_args(
+        ["cron", "migrate-skill-bindings", "--apply", "--json"]
+    )
+    assert ns.apply is True
+    assert ns.json is True

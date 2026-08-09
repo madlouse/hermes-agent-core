@@ -2440,6 +2440,103 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _resolve_persisted_cron_skill_entries(
+    job: dict,
+    legacy_skill_names: list[str],
+    bindings: Any,
+) -> list[tuple[str, str, dict[str, Any], str, Path]]:
+    """Validate all durable bindings before any Cron script or agent can run."""
+    from agent.skill_resolution import SkillResolutionError, load_verified_skill_content
+
+    if not isinstance(bindings, list):
+        raise SkillResolutionError(
+            "skill_binding_invalid", "", "Cron job has invalid persisted skill bindings."
+        )
+    binding_names = [
+        str(binding.get("canonical_name") or "").strip()
+        for binding in bindings
+        if isinstance(binding, dict)
+    ]
+    if binding_names != legacy_skill_names:
+        raise SkillResolutionError(
+            "skill_binding_mismatch",
+            ",".join(legacy_skill_names),
+            "Cron job skill compatibility fields do not match persisted bindings.",
+        )
+
+    entries: list[tuple[str, str, dict[str, Any], str, Path]] = []
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise SkillResolutionError(
+                "skill_binding_invalid",
+                "",
+                "Cron job contains an invalid persisted skill binding.",
+            )
+        skill_name = str(binding.get("canonical_name") or "").strip()
+        if not skill_name:
+            raise SkillResolutionError(
+                "skill_binding_invalid", "", "Cron skill binding has no canonical name."
+            )
+        try:
+            plugin_skill_path = None
+            if binding.get("source_kind") == "plugin":
+                try:
+                    from hermes_cli.plugins import (
+                        _get_disabled_plugins,
+                        discover_plugins,
+                        get_plugin_manager,
+                    )
+
+                    namespace = skill_name.partition(":")[0]
+                    if not namespace or namespace in _get_disabled_plugins():
+                        raise SkillResolutionError(
+                            "skill_binding_disabled",
+                            skill_name,
+                            "Persisted Cron plugin skill is disabled.",
+                        )
+                    discover_plugins()
+                    plugin_skill_path = get_plugin_manager().find_plugin_skill(skill_name)
+                except SkillResolutionError:
+                    raise
+                except Exception as exc:
+                    raise SkillResolutionError(
+                        "skill_plugin_resolution_failed",
+                        skill_name,
+                        "Plugin skill discovery failed during Cron execution.",
+                    ) from exc
+            skill_path, verified_content = load_verified_skill_content(
+                _get_hermes_home(),
+                binding,
+                plugin_skill_path=plugin_skill_path,
+            )
+            if binding.get("source_kind") == "plugin":
+                load_name = skill_name
+            else:
+                relative_skill = skill_path.relative_to(
+                    (_get_hermes_home() / "skills").resolve(strict=False)
+                )
+                load_name = (
+                    relative_skill.parent.as_posix()
+                    if relative_skill.name == "SKILL.md"
+                    else relative_skill.with_suffix("").as_posix()
+                )
+            entries.append(
+                (skill_name, load_name, binding, verified_content, skill_path)
+            )
+        except (SkillResolutionError, OSError, ValueError) as exc:
+            logger.warning(
+                "Cron job '%s': persisted skill binding rejected — %s",
+                job.get("name", job.get("id")),
+                exc,
+            )
+            raise SkillResolutionError(
+                "skill_binding_validation_failed",
+                skill_name,
+                f"Persisted Cron skill binding was rejected: {exc}",
+            ) from exc
+    return entries
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -2454,6 +2551,19 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
     skills = job.get("skills")
+    if skills is None:
+        legacy = job.get("skill")
+        skills = [legacy] if legacy else []
+    elif isinstance(skills, str):
+        skills = [skills]
+    legacy_skill_names = [str(name).strip() for name in skills if str(name).strip()]
+    bindings_present = "skill_bindings" in job
+    bindings = job.get("skill_bindings") if bindings_present else None
+    bound_skill_entries = (
+        _resolve_persisted_cron_skill_entries(job, legacy_skill_names, bindings)
+        if bindings_present
+        else None
+    )
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
     # command-shape strings (a triage feed ingesting a bug report that
@@ -2553,14 +2663,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "findings normally, or say [SILENT] and nothing more.]\n\n"
     )
     prompt = cron_hint + prompt
-    if skills is None:
-        legacy = job.get("skill")
-        skills = [legacy] if legacy else []
-    elif isinstance(skills, str):
-        skills = [skills]
-
-    skill_names = [str(name).strip() for name in skills if str(name).strip()]
-    if not skill_names:
+    if not legacy_skill_names and not bindings:
         return _scan_assembled_cron_prompt(
             prompt,
             job,
@@ -2572,16 +2675,27 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
+    from agent.skill_resolution import SkillResolutionError
     from agent.skill_utils import normalize_skill_lookup_name
 
     parts = []
     skipped: list[str] = []
-    for skill_name in skill_names:
+    skill_entries: list[tuple[str, str, Optional[dict[str, Any]], Optional[str], Optional[Path]]] = []
+    if bindings_present:
+        skill_entries = list(bound_skill_entries or [])
+    else:
+        skill_entries = [(name, name, None, None, None) for name in legacy_skill_names]
+
+    for skill_name, load_name, binding, verified_content, verified_path in skill_entries:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
         # that behavior so `skills: ["my-bundle"]` expands bundle members instead
         # of being treated as a missing skill.
-        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        bundle_key = (
+            resolve_bundle_command_key(skill_name.lstrip("/"))
+            if binding is None
+            else None
+        )
         if bundle_key:
             bundle_payload = build_bundle_invocation_message(
                 bundle_key,
@@ -2602,17 +2716,48 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             skipped.append(skill_name)
             continue
 
-        try:
-            loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
-            skipped.append(skill_name)
-            continue
-        if not loaded.get("success"):
-            error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
-            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
-            skipped.append(skill_name)
-            continue
+        if binding is not None:
+            from agent.skill_preprocessing import preprocess_skill_content
+            from agent.skill_utils import parse_frontmatter
+            from tools.skills_tool import _is_skill_disabled, skill_matches_platform
+
+            frontmatter, _ = parse_frontmatter(verified_content or "")
+            if not skill_matches_platform(frontmatter):
+                raise SkillResolutionError(
+                    "skill_binding_platform_unsupported",
+                    skill_name,
+                    "Persisted Cron skill is not supported on this platform.",
+                )
+            if _is_skill_disabled(skill_name):
+                raise SkillResolutionError(
+                    "skill_binding_disabled",
+                    skill_name,
+                    "Persisted Cron skill is disabled in the active profile.",
+                )
+            preprocess_dir = (
+                verified_path.parent
+                if verified_path is not None and verified_path.name == "SKILL.md"
+                else None
+            )
+            content = preprocess_skill_content(
+                str(verified_content or ""),
+                preprocess_dir,
+                session_id=None,
+            ).strip()
+        else:
+            try:
+                loaded = json.loads(skill_view(normalize_skill_lookup_name(load_name)))
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
+                skipped.append(skill_name)
+                continue
+
+            if not loaded.get("success"):
+                error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
+                logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
+                skipped.append(skill_name)
+                continue
+            content = str(loaded.get("content") or "").strip()
 
         # Bump usage so the curator sees this skill as actively used.
         try:
@@ -2620,7 +2765,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except Exception:
             logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
-        content = str(loaded.get("content") or "").strip()
         if parts:
             parts.append("")
         parts.extend(

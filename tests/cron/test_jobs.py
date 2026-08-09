@@ -3,6 +3,7 @@
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from cron.jobs import (
     parse_duration,
@@ -187,6 +188,17 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _write_profile_skill(profile_home: Path, relative_dir: str, *, name: str) -> Path:
+    skill_dir = profile_home / "skills" / relative_dir
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(
+        f"---\nname: {name}\ndescription: test\n---\n\nDo the work.\n",
+        encoding="utf-8",
+    )
+    return skill_md
+
+
 class TestJobCRUD:
     def test_create_and_get(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="30m")
@@ -234,6 +246,68 @@ class TestJobCRUD:
         )
         assert job["deliver"] == "origin"
 
+    def test_create_persists_one_canonical_binding_for_aliases(self, tmp_cron_dir):
+        _write_profile_skill(
+            tmp_cron_dir, "work/cron-task-force", name="cron-task-force"
+        )
+
+        job = create_job(
+            prompt="Check recovery",
+            schedule="every 1h",
+            skills=[
+                "cron-task-force",
+                "work/cron-task-force",
+                "work:cron-task-force",
+            ],
+        )
+
+        assert job["skills"] == ["cron-task-force"]
+        assert job["skill"] == "cron-task-force"
+        assert len(job["skill_bindings"]) == 1
+        assert job["skill_bindings"][0]["relative_path"] == (
+            "skills/work/cron-task-force/SKILL.md"
+        )
+
+    def test_missing_skill_fails_without_job_mutation(self, tmp_cron_dir):
+        from agent.skill_resolution import SkillResolutionError
+
+        with pytest.raises(SkillResolutionError) as excinfo:
+            create_job(
+                prompt="Check recovery",
+                schedule="every 1h",
+                skills=["not-installed"],
+            )
+
+        assert excinfo.value.code == "skill_unavailable_in_active_profile"
+        assert load_jobs() == []
+
+    def test_plugin_local_collision_fails_without_job_mutation(
+        self, tmp_cron_dir, tmp_path, monkeypatch
+    ):
+        from agent.skill_resolution import SkillResolutionError
+
+        _write_profile_skill(tmp_cron_dir, "work/task", name="task")
+        plugin = tmp_path / "plugin" / "SKILL.md"
+        plugin.parent.mkdir()
+        plugin.write_text(
+            "---\nname: task\ndescription: plugin\n---\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "cron.jobs._registered_plugin_skill_paths",
+            lambda selectors, profile: {"work:task": plugin},
+        )
+
+        with pytest.raises(SkillResolutionError) as excinfo:
+            create_job(
+                prompt="Check recovery",
+                schedule="every 1h",
+                skills=["work:task"],
+            )
+
+        assert excinfo.value.code == "skill_plugin_local_conflict"
+        assert load_jobs() == []
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
@@ -250,6 +324,54 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_unrelated_update_preserves_exact_bindings(self, tmp_cron_dir):
+        _write_profile_skill(
+            tmp_cron_dir, "work/cron-task-force", name="cron-task-force"
+        )
+        job = create_job(
+            prompt="Check recovery",
+            schedule="every 1h",
+            skills=["work:cron-task-force"],
+        )
+
+        updated = update_job(job["id"], {"name": "Renamed"})
+
+        assert updated["skill_bindings"] == job["skill_bindings"]
+        assert updated["skills"] == ["cron-task-force"]
+
+    def test_skill_change_resolves_before_atomic_write(self, tmp_cron_dir):
+        from agent.skill_resolution import SkillResolutionError
+
+        _write_profile_skill(tmp_cron_dir, "work/current", name="current")
+        job = create_job(
+            prompt="Check recovery",
+            schedule="every 1h",
+            skills=["current"],
+        )
+        before = get_job(job["id"])
+
+        with pytest.raises(SkillResolutionError):
+            update_job(job["id"], {"skills": ["missing"], "skill": "missing"})
+
+        assert get_job(job["id"]) == before
+
+    def test_skills_only_update_replaces_legacy_primary(self, tmp_cron_dir):
+        _write_profile_skill(tmp_cron_dir, "work/old", name="old")
+        _write_profile_skill(tmp_cron_dir, "work/new", name="new")
+        job = create_job(
+            prompt="Check recovery",
+            schedule="every 1h",
+            skills=["old"],
+        )
+
+        updated = update_job(job["id"], {"skills": ["new"]})
+
+        assert updated["skills"] == ["new"]
+        assert updated["skill"] == "new"
+        assert [binding["canonical_name"] for binding in updated["skill_bindings"]] == [
+            "new"
+        ]
 
 
 class TestPauseResumeJob:

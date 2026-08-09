@@ -214,6 +214,31 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
             print(f"    {record['error']}")
 
 
+def cron_migrate_skill_bindings(*, apply: bool = False, as_json: bool = False) -> int:
+    """Plan or apply canonical skill bindings for the active profile."""
+    from cron.jobs import apply_skill_binding_migration, plan_skill_binding_migration
+
+    plan = plan_skill_binding_migration()
+    result = apply_skill_binding_migration(plan) if apply and not plan["errors"] else plan
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif plan["errors"]:
+        print(color("Skill binding migration is blocked:", Colors.RED))
+        for error in plan["errors"]:
+            print(f"  {error.get('job_id') or '?'}: {error.get('reason')}")
+    elif apply:
+        print(color(f"Skill binding migration: {result['status']}", Colors.GREEN))
+        print(f"  Jobs updated: {result['jobs_updated']}")
+        if result.get("backup_path"):
+            print(f"  Backup: {result['backup_path']}")
+    else:
+        print("Skill binding migration plan")
+        print(f"  Jobs scanned: {plan['jobs_scanned']}")
+        print(f"  Jobs to update: {len(plan['changes'])}")
+        print("  Re-run with --apply to create a backup and apply this plan.")
+    return 1 if plan["errors"] else 0
+
+
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import list_jobs
@@ -481,6 +506,12 @@ def cron_command(args):
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
         return 0
 
+    if subcmd == "migrate-skill-bindings":
+        return cron_migrate_skill_bindings(
+            apply=getattr(args, "apply", False),
+            as_json=getattr(args, "json", False),
+        )
+
     if subcmd in {"create", "add"}:
         return cron_create(args)
 
@@ -500,5 +531,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|migrate-skill-bindings|tick]")
     sys.exit(1)
