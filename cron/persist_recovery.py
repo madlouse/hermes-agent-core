@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 SCHEMA_VERSION = "cron-persist-recovery/v1"
 REGISTRATION_SCHEMA_VERSION = "cron-persist-recovery-registration/v1"
-DISPATCH_ACK_SCHEMA_VERSION = "cron-persist-recovery-dispatch-ack/v1"
+DISPATCH_ACK_SCHEMA_VERSION = "cron-persist-recovery-dispatch-ack/v2"
 _DB_FILENAME = "persist-recovery.sqlite3"
 _LOCK = threading.RLock()
 _DISPATCH_LEASE_SECONDS = 30.0
