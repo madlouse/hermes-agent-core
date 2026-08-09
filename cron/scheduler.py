@@ -72,6 +72,7 @@ class _RunJobResult:
     runtime_admission_receipt: dict[str, Any] | None = None
     runtime_admission_decision: dict[str, Any] | None = None
     cleanup_incomplete: bool = False
+    delivery_frame: str | None = None
 
     def legacy_tuple(self) -> tuple[bool, str, str, Optional[str]]:
         return self.success, self.output, self.final_response, self.error
@@ -1284,16 +1285,37 @@ def _extract_cron_final_response(text: str) -> str:
     return extract_explicit_final_response(text)
 
 
+def _closed_cron_final_response_frame(text: str) -> str | None:
+    """Return the original closed frame, without treating examples as frames."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return text if _extract_cron_final_response(text) != text else None
+
+
 def _strip_cron_silence_markers_from_report(text: str) -> str:
-    """Remove standalone silence markers from an otherwise real report."""
+    """Remove report markers without altering examples inside code fences."""
     if not isinstance(text, str):
         return text
     tokens = {"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"}
-    retained = [
-        line
-        for line in text.splitlines()
-        if " ".join(line.strip().upper().split()) not in tokens
-    ]
+    retained = []
+    fence: str | None = None
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        fence_match = re.match(r"(```+|~~~+)", stripped)
+        in_fence = fence is not None
+        if fence_match:
+            token = fence_match.group(1)
+            if fence is None:
+                fence = token
+                in_fence = True
+            elif (
+                token[0] == fence[0]
+                and len(token) >= len(fence)
+                and not stripped[fence_match.end() :].strip()
+            ):
+                fence = None
+        if in_fence or " ".join(line.strip().upper().split()) not in tokens:
+            retained.append(line)
     return "\n".join(retained).strip()
 
 # ---------------------------------------------------------------------------
@@ -2680,6 +2702,7 @@ def _deliver_result(
     *,
     delivery_receipts: list[dict[str, Any]] | None = None,
     heartbeat: Callable[[], None] | None = None,
+    delivery_projection: str | None = None,
 ) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -2690,6 +2713,10 @@ def _deliver_result(
     the adapter path fails or is unavailable.
 
     Returns None on success, or an error string on failure.
+
+    ``delivery_projection`` is supplied only with a closed autonomous response
+    frame. The frame is screened first; the projection is the trusted body
+    fallback when the boundary leaves that frame unchanged.
     """
     targets = _resolve_delivery_targets(job)
     if not targets:
@@ -2727,18 +2754,29 @@ def _deliver_result(
     except Exception:
         pass
 
-    if wrap_response and not job.get("_operational_notice_no_wrap"):
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
+    def _wrap_delivery(candidate: str) -> str:
+        if wrap_response and not job.get("_operational_notice_no_wrap"):
+            task_name = job.get("name", job["id"])
+            job_id = job.get("id", "")
+            return (
+                f"Cronjob Response: {task_name}\n"
+                f"(job_id: {job_id})\n"
+                f"-------------\n\n"
+                f"{candidate}\n\n"
+                "To stop or manage this job, send me a new message "
+                f"(e.g. \"stop reminder {task_name}\")."
+            )
+        return candidate
+
+    # A closed frame reaches outbound:before_send byte-for-byte. Its body is a
+    # fail-safe projection only: it is selected after the Hook sees the frame
+    # when the Hook allows the candidate unchanged. Ordinary responses retain
+    # the historical pre-boundary wrapping behavior.
+    delivery_content = (
+        content
+        if delivery_projection is not None
+        else _wrap_delivery(content)
+    )
 
     # Media is extracted only after the mandatory output boundary so the Hook
     # screens the exact candidate that can reach the sender.
@@ -2960,21 +2998,36 @@ def _deliver_result(
                 logger.warning("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
+            screened_content = boundary_decision.content
+            if delivery_projection is not None:
+                if screened_content == delivery_content:
+                    visible_content = delivery_projection
+                elif _closed_cron_final_response_frame(screened_content):
+                    visible_content = _extract_cron_final_response(
+                        screened_content
+                    )
+                else:
+                    visible_content = screened_content
+                screened_content = _wrap_delivery(visible_content)
+            else:
+                visible_content = screened_content
             boundary_media_files, boundary_delivery_content = (
-                BasePlatformAdapter.extract_media(boundary_decision.content)
+                BasePlatformAdapter.extract_media(screened_content)
             )
             boundary_media_files = BasePlatformAdapter.filter_media_delivery_paths(
                 boundary_media_files
             )
             boundary_context["content"] = boundary_delivery_content
-            boundary_unchanged = (
+            boundary_unchanged = delivery_projection is None and (
                 boundary_decision.decision == "allow"
                 and boundary_decision.content == delivery_content
             )
             if boundary_unchanged:
                 _, boundary_mirror_text = BasePlatformAdapter.extract_media(content)
             else:
-                boundary_mirror_text = boundary_delivery_content
+                _, boundary_mirror_text = BasePlatformAdapter.extract_media(
+                    visible_content
+                )
             boundary_mirror_text = (boundary_mirror_text or "").strip()
             boundary_send_result = None
         except Exception as exc:
@@ -5742,15 +5795,18 @@ def _run_job_body(
                 job_name,
             )
 
-        final_response = result.get("final_response", "") or ""
+        original_final_response = result.get("final_response", "") or ""
+        delivery_frame = _closed_cron_final_response_frame(
+            original_final_response
+        )
         # Frame-unwrap before the silence/empty checks.  The agent sometimes
         # wraps the marker inside the explicit final-response frame it is told
         # to use for business results ("## Response\n[SILENT]\n## End Response").
         # The marker is still the entire user-visible payload, so a legitimate
         # quiet tick must be treated as silence, not an empty-response failure.
-        _projected_final = _extract_cron_final_response(final_response)
-        if _projected_final:
-            final_response = _projected_final
+        # Keep the original closed frame separately for the outbound boundary;
+        # only this control/body value is used for logging and suppression.
+        final_response = _extract_cron_final_response(original_final_response)
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -5795,7 +5851,13 @@ def _run_job_body(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None
+        return _RunJobResult(
+            True,
+            output,
+            final_response,
+            None,
+            delivery_frame=delivery_frame,
+        )
         
     except CronRunOutcomeOwnershipLost:
         raise
@@ -5974,6 +6036,11 @@ def _run_job_impl(
         final_response,
         error,
         cleanup_incomplete=cleanup_incomplete,
+        delivery_frame=(
+            _closed_cron_final_response_frame(final_response)
+            if success
+            else None
+        ),
     )
 
 
@@ -6387,26 +6454,40 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "(tool subprocess was killed mid-flight)."
             )
 
-        # Deliver the final response to the origin/target chat. [SILENT] skips
-        # delivery, but failed jobs still deliver their compact failure notice.
-        deliver_content = (
+        # The body controls silence/empty behavior. A separately retained
+        # closed frame is the only successful delivery candidate so the output
+        # boundary can project it with its full provenance still attached.
+        delivery_control_content = (
             _extract_cron_final_response(final_response)
             if success
             else _summarize_cron_failure_for_delivery(job, error)
         )
+        delivery_frame = None
+        if success:
+            delivery_frame = (
+                run_result.delivery_frame
+                or _closed_cron_final_response_frame(final_response)
+            )
+            deliver_content = delivery_frame or final_response
+        else:
+            deliver_content = delivery_control_content
         # Whitespace-only responses are not delivered; the guard below records
         # them as a soft failure.
-        should_deliver = bool(deliver_content.strip())
+        should_deliver = bool(delivery_control_content.strip())
         # Cron silence suppression preserves reports that merely quote the
         # marker while accepting the intentional prefix/trailing-line forms.
         if should_deliver and success:
-            if _is_cron_silence_response(deliver_content):
+            if _is_cron_silence_response(delivery_control_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
             else:
                 # A standalone marker after a real report is contradictory;
                 # preserve the report while keeping raw output for audit.
-                deliver_content = _strip_cron_silence_markers_from_report(deliver_content)
+                cleaned_control_content = _strip_cron_silence_markers_from_report(
+                    delivery_control_content
+                )
+                if delivery_frame is None:
+                    deliver_content = cleaned_control_content
 
         if should_deliver:
             try:
@@ -6417,6 +6498,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 }
                 if run_outcome_claim is not None:
                     delivery_kwargs["heartbeat"] = _renew_run_outcome_owner
+                if delivery_frame is not None:
+                    delivery_kwargs["delivery_projection"] = (
+                        cleaned_control_content
+                    )
                 delivery_error = _deliver_result(
                     job,
                     deliver_content,
@@ -6432,7 +6517,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
         # (issue #8585)
-        if success and not final_response.strip():
+        if success and not delivery_control_content.strip():
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
