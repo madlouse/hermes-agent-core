@@ -229,13 +229,71 @@ def _resolve_cron_run_timeout_seconds(job: dict, cfg: dict) -> Optional[float]:
     return None
 
 
+_CRON_ENTRY_TIMEOUT_UNSET = object()
+_CRON_ENTRY_CONFIG_MAX_BYTES = 1024 * 1024
+
+
+def _preparse_cron_run_timeout(job: dict) -> object | Optional[float]:
+    """Read only the entry deadline from trusted Profile-local config.yaml.
+
+    This deliberately avoids dotenv, managed overlays, plugin discovery, and
+    the full config/default pipeline: those are inside the deadline boundary.
+    The file must be regular and bounded before parsing. A valid per-job value
+    remains authoritative, including zero as an explicit opt-out.
+    """
+    raw_job = job.get("run_timeout_seconds")
+    if raw_job is not None and not isinstance(raw_job, bool):
+        try:
+            parsed = float(raw_job)
+        except (TypeError, ValueError):
+            parsed = -1
+        if parsed >= 0:
+            return None if parsed == 0 else parsed
+
+    config_path = _get_hermes_home() / "config.yaml"
+    try:
+        stat_result = config_path.stat()
+        if not config_path.is_file() or stat_result.st_size > _CRON_ENTRY_CONFIG_MAX_BYTES:
+            return _CRON_ENTRY_TIMEOUT_UNSET
+        with open(config_path, "rb") as handle:
+            payload = handle.read(_CRON_ENTRY_CONFIG_MAX_BYTES + 1)
+        if len(payload) > _CRON_ENTRY_CONFIG_MAX_BYTES:
+            return _CRON_ENTRY_TIMEOUT_UNSET
+        from utils import fast_safe_load
+
+        cfg = fast_safe_load(payload) or {}
+    except Exception:
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    if not isinstance(cfg, dict):
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    cron_cfg = cfg.get("cron")
+    if not isinstance(cron_cfg, dict):
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    raw_timeout = cron_cfg.get("run_timeout_seconds")
+    if raw_timeout is None or isinstance(raw_timeout, bool):
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    try:
+        parsed = float(raw_timeout)
+    except (TypeError, ValueError):
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    if parsed == 0:
+        return None
+    return parsed if parsed > 0 else _CRON_ENTRY_TIMEOUT_UNSET
+
+
 class _CronRunControl:
     """Shared deadline, interrupt target, and revocation fence for one run."""
 
-    def __init__(self, job: dict) -> None:
+    def __init__(
+        self,
+        job: dict,
+        *,
+        started_at: Optional[float] = None,
+        entry_timeout: object | Optional[float] = _CRON_ENTRY_TIMEOUT_UNSET,
+    ) -> None:
         from gateway.session_context import new_cron_runtime_lease
 
-        self.started_at = time.monotonic()
+        self.started_at = started_at if started_at is not None else time.monotonic()
         self.lease = new_cron_runtime_lease()
         self._condition = threading.Condition()
         self._timeout: Optional[float] = None
@@ -250,6 +308,8 @@ class _CronRunControl:
                 parsed = -1
             if parsed >= 0:
                 self.configure(None if parsed == 0 else parsed)
+        if not self._configured and entry_timeout is not _CRON_ENTRY_TIMEOUT_UNSET:
+            self.configure(entry_timeout)
 
     def configure(self, timeout: Optional[float]) -> None:
         """Publish the effective timeout once; per-job values stay authoritative."""
@@ -3992,9 +4052,7 @@ def _run_job_impl(
                 )
             _run_control.raise_if_expired("MCP discovery")
         except Exception as _mcp_exc:
-            from tools.mcp_tool import MCPServerOwnershipError
-
-            if isinstance(_mcp_exc, (MCPServerOwnershipError, TimeoutError)):
+            if isinstance(_mcp_exc, TimeoutError):
                 raise
             logger.warning(
                 "Job '%s': MCP initialization failed (non-fatal): %s",
@@ -4427,9 +4485,13 @@ def run_job(
     """
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
+    started_at = time.monotonic()
+    entry_timeout = _preparse_cron_run_timeout(job)
     job_id = str(job.get("id") or "")
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
-    control = _CronRunControl(job)
+    control = _CronRunControl(
+        job, started_at=started_at, entry_timeout=entry_timeout
+    )
     collector = (
         _DeferredCronAgentCollector(job_id)
         if defer_agent_teardown is not None

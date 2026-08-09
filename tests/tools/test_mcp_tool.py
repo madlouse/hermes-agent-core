@@ -17,19 +17,27 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolate_mcp_server_owners():
-    """Profile/config ownership is process-global; isolate it per test."""
+def _isolate_mcp_profile_bindings():
+    """Profile/config routing metadata is process-global; isolate it per test."""
     import tools.mcp_tool as mcp_tool
 
     with mcp_tool._lock:
-        saved = dict(mcp_tool._server_owners)
-        mcp_tool._server_owners.clear()
+        saved_names = dict(mcp_tool._server_logical_names)
+        saved_keys = {
+            name: set(keys) for name, keys in mcp_tool._mcp_tool_server_keys.items()
+        }
+        mcp_tool._server_logical_names.clear()
+        mcp_tool._mcp_tool_server_keys.clear()
+    token = mcp_tool._active_mcp_server_keys.set({})
     try:
         yield
     finally:
+        mcp_tool._active_mcp_server_keys.reset(token)
         with mcp_tool._lock:
-            mcp_tool._server_owners.clear()
-            mcp_tool._server_owners.update(saved)
+            mcp_tool._server_logical_names.clear()
+            mcp_tool._server_logical_names.update(saved_names)
+            mcp_tool._mcp_tool_server_keys.clear()
+            mcp_tool._mcp_tool_server_keys.update(saved_keys)
 
 
 # ---------------------------------------------------------------------------
@@ -840,7 +848,8 @@ class TestToolsetInjection:
         async def flaky_connect(name, config):
             nonlocal call_count
             call_count += 1
-            if name == "broken" and not broken_fixed:
+            logical_name = config["_hermes_logical_name"]
+            if logical_name == "broken" and not broken_fixed:
                 raise ConnectionError("cannot reach server")
             server = MCPServerTask(name)
             server.session = mock_session
@@ -877,7 +886,8 @@ class TestToolsetInjection:
             # per-worker-session discovery passes). Expire that cooldown to
             # simulate the retry window having elapsed.
             import tools.mcp_tool as _mcp_mod
-            _mcp_mod._server_connect_retry_after.pop("broken", None)
+            broken_key = _mcp_mod._active_mcp_server_keys.get()["broken"]
+            _mcp_mod._server_connect_retry_after.pop(broken_key, None)
 
             # Next call after the cooldown: should retry broken, skip good
             result2 = discover_mcp_tools()
@@ -921,12 +931,18 @@ class TestDiscoveryAllowlist:
 
 
 class TestMCPProfileOwnership:
-    def test_same_name_across_profiles_with_distinct_credentials_fails_closed(
-        self, tmp_path, monkeypatch
+    def test_same_name_profiles_connect_call_and_cleanup_independently(
+        self, tmp_path
     ):
-        import tools.mcp_tool as mcp_tool
+        import concurrent.futures
+        from contextlib import AbstractAsyncContextManager
 
-        server = SimpleNamespace(session=object(), _registered_tool_names=[])
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
         profile_a = tmp_path / "profiles" / "atlas"
         profile_b = tmp_path / "profiles" / "yuange"
         config_a = {
@@ -937,32 +953,124 @@ class TestMCPProfileOwnership:
             "command": "shared-mcp",
             "env": {"TOKEN": "yuange-secret"},
         }
+
+        class AsyncLock(AbstractAsyncContextManager):
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class Session:
+            def __init__(self, owner):
+                self.owner = owner
+
+            async def call_tool(self, name, arguments):
+                return SimpleNamespace(
+                    content=[SimpleNamespace(text=self.owner)],
+                    isError=False,
+                    structuredContent=None,
+                )
+
+        def server(owner, name):
+            return SimpleNamespace(
+                name=name,
+                session=Session(owner),
+                _rpc_lock=AsyncLock(),
+                _pending_call_context=None,
+                _registered_tool_names=[],
+                tool_timeout=1,
+                _is_recycled_stdio=lambda: False,
+            )
+
+        connection_barrier = threading.Barrier(2, timeout=5)
+        call_barrier = threading.Barrier(2, timeout=5)
+        connected = []
+        connected_lock = threading.Lock()
+        handler = mcp_tool._make_tool_handler("shared", "whoami", 1)
+
+        async def connect(name, config):
+            owner = config["env"]["TOKEN"].removesuffix("-secret")
+            connection_barrier.wait()
+            with connected_lock:
+                connected.append((name, owner))
+            return server(owner, name)
+
+        def run_profile(profile, config, owner):
+            token = set_hermes_home_override(profile)
+            try:
+                key = mcp_tool._mcp_server_identity_key("shared", config)
+                mcp_tool.register_mcp_servers({"shared": config})
+                call_barrier.wait()
+                result = json.loads(handler({}))
+                return key, result["result"]
+            finally:
+                reset_hermes_home_override(token)
+
         with mcp_tool._lock:
             saved_servers = dict(mcp_tool._servers)
             mcp_tool._servers.clear()
-            mcp_tool._servers["shared"] = server
 
         try:
-            monkeypatch.setenv("HERMES_HOME", str(profile_a))
             with patch.object(mcp_tool, "_MCP_AVAILABLE", True), patch.object(
                 mcp_tool, "_filter_suspicious_mcp_servers", side_effect=lambda value: value
+            ), patch.object(
+                mcp_tool, "_ensure_mcp_loop"
+            ), patch.object(
+                mcp_tool, "_connect_server", side_effect=connect
+            ), patch.object(
+                mcp_tool, "_register_server_tools", return_value=[]
+            ), patch.object(
+                mcp_tool,
+                "_run_on_mcp_loop",
+                side_effect=lambda factory, timeout: asyncio.run(factory()),
             ):
-                mcp_tool.register_mcp_servers({"shared": config_a})
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(run_profile, profile_a, config_a, "atlas"),
+                        executor.submit(run_profile, profile_b, config_b, "yuange"),
+                    ]
+                    results = [future.result(timeout=5) for future in futures]
 
-                with pytest.raises(mcp_tool.MCPServerOwnershipError, match="shared"):
-                    mcp_tool.register_mcp_servers({"shared": config_b})
+                assert {result for _, result in results} == {"atlas", "yuange"}
+                keys = {key for key, _ in results}
+                assert len(keys) == 2
+                assert all(key.startswith("shared::") for key in keys)
+                assert {owner for _, owner in connected} == {"atlas", "yuange"}
+                assert {key for key, _ in connected} == keys
 
-                monkeypatch.setenv("HERMES_HOME", str(profile_b))
-                with pytest.raises(mcp_tool.MCPServerOwnershipError, match="shared"):
-                    mcp_tool.register_mcp_servers({"shared": config_a})
-                with pytest.raises(mcp_tool.MCPServerOwnershipError, match="shared"):
-                    mcp_tool.register_mcp_servers({"shared": config_b})
+                atlas_key = next(key for key, value in results if value == "atlas")
+                yuange_key = next(key for key, value in results if value == "yuange")
+                mcp_tool._track_mcp_tool_server(
+                    "mcp__shared__whoami", "shared", atlas_key
+                )
+                mcp_tool._track_mcp_tool_server(
+                    "mcp__shared__whoami", "shared", yuange_key
+                )
+                with mcp_tool._lock:
+                    atlas_server = mcp_tool._servers.pop(atlas_key)
+                    yuange_server = mcp_tool._servers[yuange_key]
+                    mcp_tool._server_logical_names.pop(atlas_key, None)
+                atlas_server._registered_tool_names = ["mcp__shared__whoami"]
+                yuange_server._registered_tool_names = ["mcp__shared__whoami"]
+                mcp_tool.MCPServerTask._deregister_tools(atlas_server)
+                with mcp_tool._lock:
+                    assert mcp_tool._mcp_tool_server_keys[
+                        "mcp__shared__whoami"
+                    ] == {yuange_key}
 
-            with mcp_tool._lock:
-                owner_profile, owner_fingerprint = mcp_tool._server_owners["shared"]
-            assert owner_profile == str(profile_a.resolve())
-            assert owner_fingerprint == mcp_tool._mcp_server_owner(config_a)[1]
-            assert mcp_tool._servers["shared"] is server
+                token = set_hermes_home_override(profile_b)
+                binding_token = mcp_tool._active_mcp_server_keys.set(
+                    {"shared": yuange_key}
+                )
+                try:
+                    assert json.loads(handler({}))["result"] == "yuange"
+                finally:
+                    mcp_tool._active_mcp_server_keys.reset(binding_token)
+                    reset_hermes_home_override(token)
+                mcp_tool.MCPServerTask._deregister_tools(yuange_server)
+                with mcp_tool._lock:
+                    assert "mcp__shared__whoami" not in mcp_tool._mcp_tool_server_keys
         finally:
             with mcp_tool._lock:
                 mcp_tool._servers.clear()
@@ -2215,7 +2323,8 @@ class TestDiscoveryFailedCount:
         }
 
         async def fake_register(name, cfg):
-            if name == "bad_server":
+            logical_name = cfg["_hermes_logical_name"]
+            if logical_name == "bad_server":
                 raise ConnectionError("Connection refused")
             # Simulate successful registration
             from tools.mcp_tool import MCPServerTask
@@ -2223,7 +2332,7 @@ class TestDiscoveryFailedCount:
             server.session = MagicMock()
             server._tools = [_make_mcp_tool("tool_a")]
             _servers[name] = server
-            return [f"mcp__{name}__tool_a"]
+            return [f"mcp__{logical_name}__tool_a"]
 
         with patch("tools.mcp_tool._load_mcp_config", return_value=fake_config), \
              patch("tools.mcp_tool._discover_and_register_server", side_effect=fake_register), \
@@ -2260,14 +2369,15 @@ class TestDiscoveryFailedCount:
         }
 
         async def selective_register(name, cfg):
-            if name == "fail1":
+            logical_name = cfg["_hermes_logical_name"]
+            if logical_name == "fail1":
                 raise ConnectionError("Refused")
             from tools.mcp_tool import MCPServerTask
             server = MCPServerTask(name)
             server.session = MagicMock()
             server._tools = [_make_mcp_tool("t")]
             _servers[name] = server
-            return [f"mcp__{name}__t"]
+            return [f"mcp__{logical_name}__t"]
 
         with patch("tools.mcp_tool._load_mcp_config", return_value=fake_config), \
              patch("tools.mcp_tool._discover_and_register_server", side_effect=selective_register), \
@@ -2660,8 +2770,8 @@ class TestMcpParallelToolCalls:
     def test_register_mcp_servers_tracks_parallel_flag(self):
         """register_mcp_servers populates _parallel_safe_servers from config."""
         from tools.mcp_tool import (
-            register_mcp_servers, _parallel_safe_servers, _lock,
-            sanitize_mcp_name_component,
+            register_mcp_servers, _active_mcp_server_keys,
+            _parallel_safe_servers, _lock,
         )
         fake_config = {
             "parallel_srv": {
@@ -2683,12 +2793,13 @@ class TestMcpParallelToolCalls:
              patch("tools.mcp_tool._existing_tool_names", return_value=[]):
             register_mcp_servers(fake_config)
 
+        bindings = _active_mcp_server_keys.get()
         with _lock:
-            assert sanitize_mcp_name_component("parallel_srv") in _parallel_safe_servers
-            assert sanitize_mcp_name_component("serial_srv") not in _parallel_safe_servers
-            assert sanitize_mcp_name_component("default_srv") not in _parallel_safe_servers
+            assert bindings["parallel_srv"] in _parallel_safe_servers
+            assert bindings["serial_srv"] not in _parallel_safe_servers
+            assert bindings["default_srv"] not in _parallel_safe_servers
             # Cleanup
-            _parallel_safe_servers.discard(sanitize_mcp_name_component("parallel_srv"))
+            _parallel_safe_servers.discard(bindings["parallel_srv"])
 
 # ---------------------------------------------------------------------------
 # Cross-process MCP discovery lock (issue #62771)
