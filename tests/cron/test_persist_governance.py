@@ -15,6 +15,7 @@ import pytest
 
 from cron.jobs import (
     CronJobGovernanceError,
+    _active_cron_profile_identity,
     _cron_persist_spec_hash,
     _cron_stable_hash,
     create_job,
@@ -41,9 +42,12 @@ def _receipt(
     resume_id: str = "",
     receipt_id: str = "sha256:creation",
 ) -> dict[str, Any]:
+    identity = _active_cron_profile_identity()
     receipt = {
         "schema_version": "cron-creation-governance/v1",
         "receipt_id": receipt_id,
+        "profile_id": identity["profile_id"],
+        "profile_home_sha256": identity["profile_home_sha256"],
     }
     if resume_id:
         receipt["resume_receipt_id"] = resume_id
@@ -72,6 +76,35 @@ def _allow_decision(
         "persist_disposition": "allow_write",
         "job_patch": patch,
     }
+
+
+def test_new_governance_write_binds_legacy_hook_receipt_to_canonical_home(
+    governed_store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    governed_store.mkdir(parents=True, exist_ok=True)
+    identity = _active_cron_profile_identity()
+    legacy_hook_decision = {
+        "action": "allow",
+        "persist_disposition": "allow_write",
+        "job_patch": {
+            "creation_governance_receipt": {
+                "schema_version": "cron-creation-governance/v1",
+                "receipt_id": "sha256:creation",
+                "profile_id": identity["profile_id"],
+            }
+        },
+    }
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_mandatory_hook",
+        lambda _name, **_kwargs: _mandatory_report([legacy_hook_decision]),
+    )
+
+    created = create_job(prompt="bind home", schedule="every 1h")
+
+    assert created["creation_governance_receipt"]["profile_home_sha256"] == (
+        identity["profile_home_sha256"]
+    )
 
 
 def _mandatory_report(

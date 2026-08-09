@@ -44,11 +44,15 @@ from cron.jobs import (
 
 
 def _signed_job_revision(job_id="job.receipt", profile_id="default"):
+    from cron.jobs import _active_cron_profile_identity
+
+    profile_home_sha256 = _active_cron_profile_identity()["profile_home_sha256"]
     return {
         "id": job_id,
         "creation_governance_receipt": {
             "schema_version": "cron-creation-governance/v1",
             "profile_id": profile_id,
+            "profile_home_sha256": profile_home_sha256,
             "cron_job_id": job_id,
             "receipt_id": "sha256:" + "1" * 64,
             "candidate_hash": "sha256:" + "2" * 64,

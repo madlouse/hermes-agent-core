@@ -653,10 +653,13 @@ from cron.jobs import (
     abandon_job_run_outcome,
     advance_next_runs,
     begin_job_run_outcome,
+    bind_operational_notice_transport_request,
     claim_dispatch,
     claim_operational_notice_delivery,
+    CronCreationProfileBindingError,
     cron_creation_profile_identity,
     get_due_jobs,
+    heartbeat_operational_notice_delivery,
     heartbeat_job_run_outcome,
     heartbeat_run_claim,
     mark_job_run,
@@ -670,6 +673,9 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS = 300
+_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS = 60.0
 
 _OPERATIONAL_NOTICE_FIELDS = {
     "status",
@@ -689,6 +695,59 @@ _OPERATIONAL_NOTICE_FIELDS = {
     "admin_content",
     "user_content",
 }
+
+
+class _OperationalNoticeHeartbeat:
+    """Keep one notice owner alive across screening, outbox, and transport."""
+
+    def __init__(self, job_id: str, key: str, owner: str):
+        self.job_id = job_id
+        self.key = key
+        self.owner = owner
+        self.request_id = ""
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"cron-notice-heartbeat-{job_id}",
+            daemon=True,
+        )
+
+    def _pulse(self) -> None:
+        result = heartbeat_operational_notice_delivery(
+            self.job_id,
+            self.key,
+            claim_owner=self.owner,
+            transport_request_id=self.request_id,
+            lease_seconds=_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
+        )
+        if result.get("status") != "claimed":
+            self._lost.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS):
+            try:
+                self._pulse()
+            except Exception:
+                self._lost.set()
+                return
+
+    def start(self) -> None:
+        self._pulse()
+        self._thread.start()
+
+    def bind_request(self, request_id: str) -> None:
+        self.request_id = request_id
+        self.ensure_owner()
+
+    def ensure_owner(self) -> None:
+        if self._lost.is_set():
+            raise RuntimeError("operational notice claim ownership lost")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS * 2, 1.0))
 
 
 def _ready_operational_notice(raw: Any) -> dict | None:
@@ -718,6 +777,8 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
         return "not_available"
     try:
         profile_id = cron_creation_profile_identity(job)["profile_id"]
+    except CronCreationProfileBindingError as exc:
+        return exc.code
     except Exception:
         return "profile_unverified"
     if profile_id != notice["profile_id"]:
@@ -731,18 +792,33 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
     if datetime.now(timezone.utc) >= expires_at:
         return "notice_expired"
     try:
-        claim = claim_operational_notice_delivery(str(job.get("id") or ""), notice["idempotency_key"])
+        claim = claim_operational_notice_delivery(
+            str(job.get("id") or ""),
+            notice["idempotency_key"],
+            lease_seconds=_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
+        )
     except Exception:  # noqa: BLE001 - lack of a durable claim must not send
         return "receipt_unavailable"
     if claim.get("claimed") is not True:
         return str(claim.get("status") or "not_claimed")
     claim_owner = str(claim.get("claim_owner") or "")
+    heartbeat = _OperationalNoticeHeartbeat(
+        str(job.get("id") or ""),
+        notice["idempotency_key"],
+        claim_owner,
+    )
+    try:
+        heartbeat.start()
+    except Exception:
+        return "ownership_lost"
     target = notice["target"]
     route = {
         "transport_id": str(target["transport_id"]).lower(),
         "channel_id": str(target["channel_id"]),
         "thread_id": "",
     }
+    transport_request: dict[str, Any] | None = None
+    result: dict[str, Any] = {}
     try:
         from gateway.outbound_boundary import (
             build_outbound_context,
@@ -765,6 +841,7 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
             looks_actionable=True,
         )
         decision = outbound_before_send_sync(_active_outbound_hooks(), context)
+        heartbeat.ensure_owner()
         if not decision.transmit:
             mark_operational_notice_delivery(
                 str(job.get("id") or ""),
@@ -772,6 +849,7 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
                 "failed",
                 claim_owner=claim_owner,
             )
+            heartbeat.stop()
             return "screening_rejected"
         screened_content = decision.content
         from gateway.transport_outbox import visible_content_sha256
@@ -801,6 +879,20 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
             "claim_created_at": "1970-01-01T00:00:00+00:00",
             "claim_expires_at": expires_at.isoformat(timespec="microseconds"),
         }
+        existing_request_id = str(claim.get("transport_request_id") or "")
+        if existing_request_id and existing_request_id != transport_request["request_id"]:
+            heartbeat.stop()
+            return "request_conflict"
+        binding = bind_operational_notice_transport_request(
+            str(job.get("id") or ""),
+            notice["idempotency_key"],
+            claim_owner=claim_owner,
+            transport_request_id=transport_request["request_id"],
+        )
+        if binding.get("status") != "bound":
+            heartbeat.stop()
+            return str(binding.get("status") or "ownership_lost")
+        heartbeat.bind_request(transport_request["request_id"])
         result = json.loads(
             send_message_tool(
                 {
@@ -812,23 +904,53 @@ def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loo
                 }
             )
         )
-    except Exception:  # A leased claim may recover with the same outbox request id.
-        return "claimed"
-    outcome = str(result.get("transport_outcome") or "")
-    status = "sent" if result.get("success") is True and outcome == "confirmed" else (
-        "failed" if outcome == "definitively_rejected" else "uncertain"
-    )
+        heartbeat.ensure_owner()
+    except Exception:
+        result = {}
     try:
+        if transport_request is not None:
+            from gateway.transport_outbox import verify_transport_receipt
+
+            verification = verify_transport_receipt(
+                transport_request,
+                home=_get_hermes_home(),
+            )
+        else:
+            verification = {"verified": False, "status": "not_bound"}
+        if verification.get("verified") is True:
+            receipt = verification.get("receipt") or {}
+            terminal = mark_operational_notice_delivery(
+                str(job.get("id") or ""),
+                notice["idempotency_key"],
+                "sent",
+                claim_owner=claim_owner,
+                transport_request_id=str(transport_request["request_id"]),
+                confirmed_transport_receipt_id=str(receipt.get("receipt_id") or ""),
+            )
+            return "sent" if terminal.get("status") == "sent" else str(
+                terminal.get("status") or "ownership_lost"
+            )
+        outcome = str(result.get("transport_outcome") or "")
+        status = "failed" if outcome == "definitively_rejected" else "uncertain"
         terminal = mark_operational_notice_delivery(
             str(job.get("id") or ""),
             notice["idempotency_key"],
             status,
             claim_owner=claim_owner,
+            transport_request_id=(
+                str(transport_request["request_id"])
+                if transport_request is not None
+                else ""
+            ),
         )
+        if terminal.get("status") == "sent":
+            return "sent"
         if terminal.get("status") != status:
-            return "ownership_lost"
+            return str(terminal.get("status") or "ownership_lost")
     except Exception:
         return "uncertain"
+    finally:
+        heartbeat.stop()
     return status
 
 
@@ -5648,7 +5770,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 job.get(field) not in (None, "")
                 for field in ("verification_command", "verification_command_mode")
             )
-            reason_code = (
+            try:
+                cron_creation_profile_identity(job)
+                profile_binding_error = ""
+            except CronCreationProfileBindingError as exc:
+                profile_binding_error = exc.code
+            except Exception:
+                profile_binding_error = "creation_receipt_profile_unverified"
+            reason_code = profile_binding_error or (
                 "unsupported_verification_contract"
                 if verification_declared
                 else "run_outcome_claim_unavailable"

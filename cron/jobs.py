@@ -733,12 +733,24 @@ def _active_cron_profile_id() -> str:
     return _active_cron_profile_identity()["profile_id"]
 
 
+class CronCreationProfileBindingError(ValueError):
+    """A signed Job cannot enter Group C without canonical-home authority."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.migration_action = "refresh_creation_governance_receipt"
+
+
 def cron_creation_profile_identity(job: Dict[str, Any]) -> Dict[str, str]:
     """Read Profile authority from the persisted creation receipt and verify it."""
     receipt = job.get("creation_governance_receipt")
     job_id = str(job.get("id") or "")
     if not isinstance(receipt, dict):
-        raise ValueError("cron creation governance receipt is required")
+        raise CronCreationProfileBindingError(
+            "creation_receipt_missing",
+            "cron creation governance receipt is required",
+        )
     profile_id = str(receipt.get("profile_id") or "").strip()
     if (
         receipt.get("schema_version") != "cron-creation-governance/v1"
@@ -748,13 +760,32 @@ def cron_creation_profile_identity(job: Dict[str, Any]) -> Dict[str, str]:
             r"sha256:[0-9a-f]{64}", str(receipt.get("receipt_id") or "")
         )
     ):
-        raise ValueError("invalid cron creation governance profile binding")
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_binding_invalid",
+            "invalid cron creation governance profile binding",
+        )
     active = _active_cron_profile_identity()
     if profile_id != active["profile_id"]:
-        raise ValueError("cron creation governance profile does not match active Profile")
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_mismatch",
+            "cron creation governance profile does not match active Profile",
+        )
     asserted_home = str(receipt.get("profile_home_sha256") or "").strip()
-    if asserted_home and asserted_home != active["profile_home_sha256"]:
-        raise ValueError("cron creation governance Profile home does not match active Profile")
+    if not asserted_home:
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_home_migration_required",
+            "legacy creation governance receipt must be refreshed with profile_home_sha256",
+        )
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", asserted_home):
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_home_invalid",
+            "creation governance receipt has an invalid profile_home_sha256",
+        )
+    if asserted_home != active["profile_home_sha256"]:
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_home_mismatch",
+            "cron creation governance Profile home does not match active Profile",
+        )
     return active
 
 
@@ -1967,6 +1998,25 @@ def _apply_cron_persist_governance(
         raise CronJobGovernanceError(
             "Cron job persistence needs administrator review (missing governance receipt)."
         )
+    profile_identity = _active_cron_profile_identity()
+    if str(receipt.get("profile_id") or "").strip() != profile_identity["profile_id"]:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(governance receipt Profile mismatch)."
+        )
+    receipt = copy.deepcopy(receipt)
+    asserted_home = str(receipt.get("profile_home_sha256") or "").strip()
+    if asserted_home and asserted_home != profile_identity["profile_home_sha256"]:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(governance receipt Profile home mismatch)."
+        )
+    # Core owns the canonical filesystem boundary. Bind every newly authorized
+    # receipt before persistence so Group C never has to infer a home from a
+    # reusable profile name. Existing unbound receipts fail closed and require
+    # an explicit governance refresh to pass through this migration point.
+    receipt["profile_home_sha256"] = profile_identity["profile_home_sha256"]
+    patch = {**patch, "creation_governance_receipt": receipt}
     if resume is not None:
         resume_id = (
             str(resume.get("receipt_id") or "").strip()
@@ -4698,21 +4748,29 @@ def claim_operational_notice_delivery(
             if isinstance(existing, dict):
                 status = str(existing.get("status") or "claimed")
                 lease_expires = existing.get("lease_expires_at_epoch")
-                if status != "claimed" or (
+                if status not in {"claimed", "uncertain"} or (
+                    status == "claimed"
+                    and
                     isinstance(lease_expires, int) and epoch < lease_expires
                 ):
                     return {"status": status, "claimed": False}
                 recovery_count = int(existing.get("recovery_count") or 0) + 1
+                transport_request_id = str(
+                    existing.get("transport_request_id") or ""
+                )
             else:
                 recovery_count = 0
+                transport_request_id = ""
             now = _hermes_now().isoformat()
             receipts[key] = {
                 "status": "claimed",
                 "claimed_at": now,
                 "updated_at": now,
                 "claim_owner": owner,
+                "claim_heartbeat_at_epoch": epoch,
                 "lease_expires_at_epoch": epoch + lease_seconds,
                 "recovery_count": recovery_count,
+                "transport_request_id": transport_request_id,
                 "caller": "cron_scheduler",
                 "parameters": {"idempotency_key": key},
                 "result": {"status": "claimed"},
@@ -4725,8 +4783,94 @@ def claim_operational_notice_delivery(
                 "claimed": True,
                 "claim_owner": owner,
                 "recovered": recovery_count > 0,
+                "transport_request_id": transport_request_id,
             }
     return {"status": "job_not_found", "claimed": False}
+
+
+def bind_operational_notice_transport_request(
+    job_id: str,
+    idempotency_key: str,
+    *,
+    claim_owner: str,
+    transport_request_id: str,
+) -> Dict[str, Any]:
+    """CAS-bind one stable outbox request to the current notice owner."""
+    key = str(idempotency_key or "").strip()
+    request_id = str(transport_request_id or "").strip()
+    if not key or not request_id or len(request_id) > 512:
+        return {"status": "invalid_request"}
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            receipts = job.get("operational_notice_receipts")
+            if not isinstance(receipts, dict) or not isinstance(receipts.get(key), dict):
+                return {"status": "not_claimed"}
+            current = receipts[key]
+            if current.get("status") != "claimed" or current.get("claim_owner") != claim_owner:
+                return {"status": "ownership_lost"}
+            existing = str(current.get("transport_request_id") or "")
+            if existing and existing != request_id:
+                return {"status": "request_conflict"}
+            current = {
+                **current,
+                "transport_request_id": request_id,
+                "updated_at": _hermes_now().isoformat(),
+            }
+            receipts[key] = current
+            job["operational_notice_receipts"] = receipts
+            _save_jobs_unlocked(jobs)
+            return {"status": "bound", "transport_request_id": request_id}
+    return {"status": "job_not_found"}
+
+
+def heartbeat_operational_notice_delivery(
+    job_id: str,
+    idempotency_key: str,
+    *,
+    claim_owner: str,
+    transport_request_id: str = "",
+    now_epoch: Optional[int] = None,
+    lease_seconds: int = OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
+) -> Dict[str, Any]:
+    """Renew the current owner without permitting request identity drift."""
+    key = str(idempotency_key or "").strip()
+    request_id = str(transport_request_id or "").strip()
+    epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+    if not key or lease_seconds <= 0 or lease_seconds > 86400:
+        return {"status": "invalid_claim"}
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            receipts = job.get("operational_notice_receipts")
+            if not isinstance(receipts, dict) or not isinstance(receipts.get(key), dict):
+                return {"status": "not_claimed"}
+            current = receipts[key]
+            if current.get("status") != "claimed" or current.get("claim_owner") != claim_owner:
+                return {"status": "ownership_lost"}
+            bound_request = str(current.get("transport_request_id") or "")
+            if request_id and bound_request and request_id != bound_request:
+                return {"status": "request_conflict"}
+            current = {
+                **current,
+                "claim_heartbeat_at_epoch": epoch,
+                "lease_expires_at_epoch": epoch + lease_seconds,
+                "updated_at": _hermes_now().isoformat(),
+            }
+            receipts[key] = current
+            job["operational_notice_receipts"] = receipts
+            _save_jobs_unlocked(jobs)
+            return {
+                "status": "claimed",
+                "claim_owner": claim_owner,
+                "lease_expires_at_epoch": current["lease_expires_at_epoch"],
+                "transport_request_id": bound_request,
+            }
+    return {"status": "job_not_found"}
 
 
 def mark_operational_notice_delivery(
@@ -4735,8 +4879,10 @@ def mark_operational_notice_delivery(
     status: str,
     *,
     claim_owner: str,
+    transport_request_id: str = "",
+    confirmed_transport_receipt_id: str = "",
 ) -> Dict[str, Any]:
-    """Record a safe terminal result for an already claimed notice."""
+    """CAS a terminal fact; uncertain remains recoverable and cannot hide sent."""
     if status not in {"sent", "failed", "uncertain"}:
         return {"status": "invalid_status"}
     key = str(idempotency_key or "").strip()
@@ -4749,17 +4895,46 @@ def mark_operational_notice_delivery(
             receipts = job.get("operational_notice_receipts")
             if not isinstance(receipts, dict) or not isinstance(receipts.get(key), dict):
                 return {"status": "not_claimed"}
+            if receipts[key].get("status") == "sent":
+                return {"status": "sent"}
             if (
                 receipts[key].get("status") != "claimed"
                 or receipts[key].get("claim_owner") != claim_owner
             ):
                 return {"status": "ownership_lost"}
+            bound_request = str(receipts[key].get("transport_request_id") or "")
+            supplied_request = str(transport_request_id or "")
+            if status == "sent" and (
+                not bound_request or bound_request != supplied_request
+            ):
+                return {"status": "request_mismatch"}
+            if status != "sent" and (bound_request or supplied_request) and (
+                bound_request != supplied_request
+            ):
+                return {"status": "request_mismatch"}
+            if status == "sent" and not str(confirmed_transport_receipt_id or "").strip():
+                return {"status": "confirmed_receipt_required"}
+            if status == "uncertain":
+                receipts[key] = {
+                    **receipts[key],
+                    "updated_at": _hermes_now().isoformat(),
+                    "result": {"status": "uncertain"},
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                }
+                job["operational_notice_receipts"] = receipts
+                _save_jobs_unlocked(jobs)
+                return {"status": "uncertain", "terminal": False}
             receipts[key] = {
                 **receipts[key],
                 "status": status,
                 "updated_at": _hermes_now().isoformat(),
                 "lease_expires_at_epoch": None,
                 "result": {"status": status},
+                "confirmed_transport_receipt_id": (
+                    str(confirmed_transport_receipt_id)
+                    if status == "sent"
+                    else ""
+                ),
                 "duration_ms": int((time.monotonic() - started) * 1000),
             }
             job["operational_notice_receipts"] = receipts

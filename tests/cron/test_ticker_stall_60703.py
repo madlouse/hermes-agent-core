@@ -163,7 +163,10 @@ class TestHonestRunSkipMessages:
         job = create_job(name="signed manual run", schedule="0 7 * * *", prompt="x")
         job["creation_governance_receipt"] = {
             "schema_version": "cron-creation-governance/v1",
-            "profile_id": "profile-test",
+            "profile_id": "default",
+            "profile_home_sha256": jobs_mod._active_cron_profile_identity()[
+                "profile_home_sha256"
+            ],
             "cron_job_id": job["id"],
             "receipt_id": "sha256:" + "1" * 64,
         }

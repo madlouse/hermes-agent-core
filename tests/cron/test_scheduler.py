@@ -2653,10 +2653,11 @@ def test_run_one_job_real_claim_producer_and_writer_round_trip(tmp_path, monkeyp
         "deliver": "local",
         "last_status": None,
         "last_error": None,
-        "creation_governance_receipt": {
-            "schema_version": "cron-creation-governance/v1",
+            "creation_governance_receipt": {
+                "schema_version": "cron-creation-governance/v1",
                 "profile_id": "default",
-            "cron_job_id": "run-proof-real-writer",
+                "profile_home_sha256": jobs._cron_stable_hash(str(tmp_path.resolve())),
+                "cron_job_id": "run-proof-real-writer",
             "receipt_id": "sha256:" + "1" * 64,
         },
     }
@@ -2706,10 +2707,11 @@ def test_delivery_heartbeat_keeps_second_owner_out_past_original_expiry(
         "deliver": "origin",
         "last_status": None,
         "last_error": None,
-        "creation_governance_receipt": {
-            "schema_version": "cron-creation-governance/v1",
+            "creation_governance_receipt": {
+                "schema_version": "cron-creation-governance/v1",
                 "profile_id": "default",
-            "cron_job_id": "delivery-lease",
+                "profile_home_sha256": jobs._cron_stable_hash(str(tmp_path.resolve())),
+                "cron_job_id": "delivery-lease",
             "receipt_id": "sha256:" + "1" * 64,
         },
     }
@@ -2766,7 +2768,7 @@ def test_signed_job_claim_failure_aborts_before_any_run_side_effect():
     denial_mock.assert_called_once_with(
         job["id"],
         job_revision="sha256:" + "1" * 64,
-        reason_code="run_outcome_claim_unavailable",
+        reason_code="creation_receipt_profile_binding_invalid",
         run_claim=None,
         fire_claim=None,
     )
@@ -2807,10 +2809,11 @@ def test_unsupported_verification_preflight_preserves_finite_oneshot(
         "verification_command": "python verify.py",
         "verification_command_mode": "read_only",
         "run_claim": run_claim,
-        "creation_governance_receipt": {
-            "schema_version": "cron-creation-governance/v1",
-            "profile_id": "profile-custom",
-            "cron_job_id": "unsupported-verifier",
+            "creation_governance_receipt": {
+                "schema_version": "cron-creation-governance/v1",
+                "profile_id": "default",
+                "profile_home_sha256": jobs._cron_stable_hash(str(tmp_path.resolve())),
+                "cron_job_id": "unsupported-verifier",
             "receipt_id": "sha256:" + "1" * 64,
         },
     }

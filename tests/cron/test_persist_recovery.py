@@ -21,6 +21,7 @@ import cron.persist_recovery as persist_recovery
 from agent.skill_resolution import resolve_skill_refs
 from cron.jobs import (
     CronJobGovernanceError,
+    _active_cron_profile_identity,
     _cron_persist_spec_hash,
     _cron_resume_precondition_hash,
     _cron_stable_hash,
@@ -152,10 +153,13 @@ def _report(*results: dict[str, Any]) -> dict[str, Any]:
 
 
 def _allow(*, resume_id: str = "") -> dict[str, Any]:
+    identity = _active_cron_profile_identity()
     patch: dict[str, Any] = {
         "creation_governance_receipt": {
             "schema_version": "cron-creation-governance/v1",
             "receipt_id": "sha256:creation",
+            "profile_id": identity["profile_id"],
+            "profile_home_sha256": identity["profile_home_sha256"],
         }
     }
     if resume_id:

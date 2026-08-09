@@ -5,6 +5,9 @@ import json
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -16,7 +19,17 @@ from gateway.outbound_boundary import BoundaryDecision
 from tools import send_message_tool as send_module
 
 
-def _job(*, profile_id: str = "default") -> dict:
+def _job(*, profile_id: str = "default", profile_home: Path | None = None) -> dict:
+    receipt = {
+        "schema_version": "cron-creation-governance/v1",
+        "profile_id": profile_id,
+        "cron_job_id": "job-1",
+        "receipt_id": "sha256:" + "a" * 64,
+    }
+    if profile_home is not None:
+        receipt["profile_home_sha256"] = jobs._cron_stable_hash(
+            str(profile_home.resolve())
+        )
     return {
         "id": "job-1",
         "profile_id": "untrusted-top-level-value",
@@ -25,12 +38,7 @@ def _job(*, profile_id: str = "default") -> dict:
         "repeat": {"times": None, "completed": 0},
         "enabled": True,
         "state": "scheduled",
-        "creation_governance_receipt": {
-            "schema_version": "cron-creation-governance/v1",
-            "profile_id": profile_id,
-            "cron_job_id": "job-1",
-            "receipt_id": "sha256:" + "a" * 64,
-        },
+        "creation_governance_receipt": receipt,
     }
 
 
@@ -97,7 +105,7 @@ def operational_profile(tmp_path, monkeypatch):
         "gateway.mirror.mirror_to_session", lambda *_args, **_kwargs: False
     )
     with jobs.use_cron_store(tmp_path):
-        jobs.save_jobs([_job()])
+        jobs.save_jobs([_job(profile_home=tmp_path)])
         yield tmp_path
 
 
@@ -126,9 +134,48 @@ def test_operational_notice_claim_has_owner_lease_and_stale_recovery(
     assert duplicate == {"status": "claimed", "claimed": False}
     assert recovered["recovered"] is True
     assert stale_mark == {"status": "ownership_lost"}
-    assert terminal == {"status": "uncertain"}
+    assert terminal == {"status": "uncertain", "terminal": False}
     assert stored["recovery_count"] == 1
+    assert stored["status"] == "claimed"
     assert "admin_content" not in json.dumps(stored)
+
+
+def test_confirmed_sent_truth_cannot_be_overwritten_by_uncertain(
+    operational_profile,
+):
+    key = "confirmed-wins"
+    with jobs.use_cron_store(operational_profile):
+        claim = jobs.claim_operational_notice_delivery("job-1", key)
+        request_id = "transport-request-confirmed-wins"
+        jobs.bind_operational_notice_transport_request(
+            "job-1",
+            key,
+            claim_owner=claim["claim_owner"],
+            transport_request_id=request_id,
+        )
+        sent = jobs.mark_operational_notice_delivery(
+            "job-1",
+            key,
+            "sent",
+            claim_owner=claim["claim_owner"],
+            transport_request_id=request_id,
+            confirmed_transport_receipt_id="transport-receipt-confirmed-wins",
+        )
+        late_uncertain = jobs.mark_operational_notice_delivery(
+            "job-1",
+            key,
+            "uncertain",
+            claim_owner=claim["claim_owner"],
+            transport_request_id=request_id,
+        )
+        stored = jobs.get_job("job-1")["operational_notice_receipts"][key]
+
+    assert sent == {"status": "sent"}
+    assert late_uncertain == {"status": "sent"}
+    assert stored["status"] == "sent"
+    assert stored["confirmed_transport_receipt_id"] == (
+        "transport-receipt-confirmed-wins"
+    )
 
 
 def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
@@ -141,10 +188,10 @@ def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
 
     with jobs.use_cron_store(operational_profile):
         first = scheduler._deliver_operational_notice(
-            _job(), {"operational_notice": _notice()}
+            _job(profile_home=operational_profile), {"operational_notice": _notice()}
         )
         replay = scheduler._deliver_operational_notice(
-            _job(), {"operational_notice": _notice()}
+            _job(profile_home=operational_profile), {"operational_notice": _notice()}
         )
         stored = jobs.load_jobs()[0]["operational_notice_receipts"]
 
@@ -178,17 +225,73 @@ def test_crash_after_confirmed_send_recovers_without_resending(
 
     with jobs.use_cron_store(operational_profile):
         first = scheduler._deliver_operational_notice(
-            _job(), {"operational_notice": _notice()}
+            _job(profile_home=operational_profile), {"operational_notice": _notice()}
         )
         epoch[0] = 1400
         monkeypatch.setattr(scheduler, "mark_operational_notice_delivery", real_mark)
         recovered = scheduler._deliver_operational_notice(
-            _job(), {"operational_notice": _notice()}
+            _job(profile_home=operational_profile), {"operational_notice": _notice()}
         )
 
     assert first == "uncertain"
     assert recovered == "sent"
     provider_send.assert_awaited_once()
+
+
+def test_cross_original_lease_two_thread_probe_converges_confirmed_sent(
+    operational_profile, monkeypatch
+):
+    epoch = [1000]
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+    provider_calls = []
+    monkeypatch.setattr(jobs.time, "time", lambda: epoch[0])
+    monkeypatch.setattr(scheduler, "_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS", 10)
+    monkeypatch.setattr(scheduler, "_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS", 0.01)
+
+    async def provider_send(*args, **kwargs):
+        provider_calls.append((args, kwargs))
+        provider_started.set()
+        while not release_provider.is_set():
+            await asyncio.sleep(0.005)
+        return {"success": True, "message_id": "om-cross-lease"}
+
+    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    results = []
+
+    def deliver():
+        with jobs.use_cron_store(operational_profile):
+            results.append(
+                scheduler._deliver_operational_notice(
+                    _job(profile_home=operational_profile),
+                    {"operational_notice": _notice()},
+                )
+            )
+
+    first = threading.Thread(target=deliver)
+    first.start()
+    assert provider_started.wait(timeout=5)
+    epoch[0] = 1011
+    time.sleep(0.05)
+    second = threading.Thread(target=deliver)
+    second.start()
+    second.join(timeout=5)
+    release_provider.set()
+    first.join(timeout=5)
+
+    assert sorted(results) == ["claimed", "sent"]
+    assert len(provider_calls) == 1
+    with jobs.use_cron_store(operational_profile):
+        stored = jobs.get_job("job-1")["operational_notice_receipts"]
+    assert stored[_notice()["idempotency_key"]]["status"] == "sent"
+    conn = sqlite3.connect(operational_profile / "transport-outbox.sqlite3")
+    try:
+        payload = conn.execute(
+            "SELECT payload_json FROM transport_outbox_receipts"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert json.loads(payload)["status"] == "confirmed"
 
 
 def test_operational_notice_claims_are_not_capacity_evicted(operational_profile):
@@ -198,11 +301,20 @@ def test_operational_notice_claims_are_not_capacity_evicted(operational_profile)
                 "job-1", f"notice-{index}", now_epoch=1000, lease_seconds=10
             )
             assert result["claimed"] is True
+            request_id = f"transport-request-{index}"
+            jobs.bind_operational_notice_transport_request(
+                "job-1",
+                f"notice-{index}",
+                claim_owner=result["claim_owner"],
+                transport_request_id=request_id,
+            )
             jobs.mark_operational_notice_delivery(
                 "job-1",
                 f"notice-{index}",
                 "sent",
                 claim_owner=result["claim_owner"],
+                transport_request_id=request_id,
+                confirmed_transport_receipt_id=f"transport-receipt-{index}",
             )
         receipts = jobs.load_jobs()[0]["operational_notice_receipts"]
 
@@ -245,13 +357,13 @@ def test_operational_notice_rejects_top_level_or_receipt_profile_spoof(
     provider_send = AsyncMock(return_value={"success": True})
     monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
 
-    spoofed = _job(profile_id="atlas")
+    spoofed = _job(profile_id="atlas", profile_home=operational_profile)
     spoofed["profile_id"] = "default"
     result = scheduler._deliver_operational_notice(
         spoofed, {"operational_notice": _notice(profile_id="atlas")}
     )
 
-    assert result == "profile_unverified"
+    assert result == "creation_receipt_profile_mismatch"
     provider_send.assert_not_awaited()
 
 
@@ -259,7 +371,7 @@ def test_named_profile_identity_comes_from_creation_receipt(tmp_path, monkeypatc
     profile = tmp_path / "profiles" / "atlas"
     profile.mkdir(parents=True)
     monkeypatch.setenv("HERMES_PROFILE_ID", "atlas")
-    signed = _job(profile_id="atlas")
+    signed = _job(profile_id="atlas", profile_home=profile)
     signed["profile_id"] = "spoofed-top-level"
 
     with jobs.use_cron_store(profile):
@@ -270,3 +382,42 @@ def test_named_profile_identity_comes_from_creation_receipt(tmp_path, monkeypatc
     assert identity["profile_id"] == "atlas"
     assert claim is not None
     assert claim["profile_id"] == "atlas"
+
+
+def test_legacy_receipt_without_home_digest_requires_explicit_migration(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("HERMES_PROFILE_ID", raising=False)
+    legacy = _job()
+    with jobs.use_cron_store(tmp_path):
+        jobs.save_jobs([legacy])
+        with pytest.raises(jobs.CronCreationProfileBindingError) as caught:
+            jobs.cron_creation_profile_identity(legacy)
+        claim = jobs.begin_job_run_outcome(legacy)
+
+    assert caught.value.code == "creation_receipt_profile_home_migration_required"
+    assert caught.value.migration_action == "refresh_creation_governance_receipt"
+    assert claim is None
+
+
+def test_same_default_profile_name_cannot_cross_canonical_roots(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_PROFILE_ID", raising=False)
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    signed = _job(profile_home=root_a)
+
+    with jobs.use_cron_store(root_b):
+        jobs.save_jobs([signed])
+        with pytest.raises(jobs.CronCreationProfileBindingError) as caught:
+            jobs.cron_creation_profile_identity(signed)
+        claim = jobs.begin_job_run_outcome(signed)
+        notice_status = scheduler._deliver_operational_notice(
+            signed,
+            {"operational_notice": _notice()},
+        )
+
+    assert caught.value.code == "creation_receipt_profile_home_mismatch"
+    assert claim is None
+    assert notice_status == "creation_receipt_profile_home_mismatch"
