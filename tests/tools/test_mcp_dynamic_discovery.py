@@ -28,12 +28,18 @@ class TestRegisterServerTools:
         server.session = MagicMock()
         from toolsets import resolve_toolset, validate_toolset
 
-        with patch("tools.registry.registry", mock_registry):
-            registered = _register_server_tools("my_srv", server, {})
-            assert "mcp__my_srv__my_tool" in registered
-            assert "mcp__my_srv__my_tool" in mock_registry.get_all_tool_names()
-            assert validate_toolset("my_srv") is True
-            assert "mcp__my_srv__my_tool" in resolve_toolset("my_srv")
+        from tools import mcp_tool
+
+        token = mcp_tool._active_mcp_server_keys.set({"my_srv": "my_srv"})
+        try:
+            with patch("tools.registry.registry", mock_registry):
+                registered = _register_server_tools("my_srv", server, {})
+                assert "mcp__my_srv__my_tool" in registered
+                assert "mcp__my_srv__my_tool" in mock_registry.get_all_tool_names()
+                assert validate_toolset("my_srv") is True
+                assert "mcp__my_srv__my_tool" in resolve_toolset("my_srv")
+        finally:
+            mcp_tool._active_mcp_server_keys.reset(token)
 
 
 class TestRefreshTools:
@@ -67,13 +73,19 @@ class TestRefreshTools:
             )
         )
 
-        with patch("tools.registry.registry", mock_registry):
-            await server._refresh_tools()
-            assert "mcp__live_srv__old_tool" not in mock_registry.get_all_tool_names()
-            assert "mcp__live_srv__old_tool" not in resolve_toolset("live_srv")
-            assert "mcp__live_srv__new_tool" in mock_registry.get_all_tool_names()
-            assert "mcp__live_srv__new_tool" in resolve_toolset("live_srv")
-            assert server._registered_tool_names == ["mcp__live_srv__new_tool"]
+        from tools import mcp_tool
+
+        token = mcp_tool._active_mcp_server_keys.set({"live_srv": "live_srv"})
+        try:
+            with patch("tools.registry.registry", mock_registry):
+                await server._refresh_tools()
+                assert "mcp__live_srv__old_tool" not in mock_registry.get_all_tool_names()
+                assert "mcp__live_srv__old_tool" not in resolve_toolset("live_srv")
+                assert "mcp__live_srv__new_tool" in mock_registry.get_all_tool_names()
+                assert "mcp__live_srv__new_tool" in resolve_toolset("live_srv")
+                assert server._registered_tool_names == ["mcp__live_srv__new_tool"]
+        finally:
+            mcp_tool._active_mcp_server_keys.reset(token)
 
 
 class TestMessageHandler:

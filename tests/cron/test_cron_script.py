@@ -152,22 +152,30 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        class FakePopen:
+            returncode = 0
+
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+
+            def communicate(self, timeout=None):
+                return "ok\n", ""
+
+            def poll(self):
+                return 0
 
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakePopen)
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(base_python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == 0x08000000
+        assert captured["kwargs"]["creationflags"] == 0x08000200
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
@@ -182,13 +190,21 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        class FakePopen:
+            returncode = 0
+
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+
+            def communicate(self, timeout=None):
+                return "ok\n", ""
+
+            def poll(self):
+                return 0
 
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakePopen)
 
         success, output = _run_job_script("probe.py")
 
@@ -197,6 +213,7 @@ class TestRunJobScript:
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
+        assert captured["kwargs"]["start_new_session"] is True
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
 

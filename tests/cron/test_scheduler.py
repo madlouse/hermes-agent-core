@@ -1025,6 +1025,51 @@ class TestRunJobSessionPersistence:
             assert elapsed < 2
             stage_release.set()
 
+    def test_no_agent_deadline_kills_process_group_before_late_write(
+        self, tmp_path
+    ):
+        import time
+
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        ready = tmp_path / "child-started"
+        late_write = tmp_path / "late-write"
+        child_code = (
+            "import pathlib,time; "
+            "time.sleep(2); "
+            f"pathlib.Path({str(late_write)!r}).write_text('late')"
+        )
+        (scripts_dir / "spawn_late_writer.py").write_text(
+            "import pathlib,subprocess,sys,time\n"
+            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            f"pathlib.Path({str(ready)!r}).write_text('started')\n"
+            "time.sleep(10)\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "config.yaml").write_text(
+            "cron:\n  run_timeout_seconds: 1\n", encoding="utf-8"
+        )
+        job = {
+            "id": "no-agent-process-group-deadline",
+            "prompt": "run",
+            "no_agent": True,
+            "script": "spawn_late_writer.py",
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), patch(
+            "cron.jobs._apply_cron_runtime_governance", return_value=None
+        ):
+            started = time.monotonic()
+            success, _output, _response, error = run_job(job)
+            elapsed = time.monotonic() - started
+
+        assert success is False
+        assert "total runtime limit" in (error or "")
+        assert elapsed < 2.5
+        assert ready.read_text(encoding="utf-8") == "started"
+        time.sleep(1.5)
+        assert not late_write.exists()
+
 
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):

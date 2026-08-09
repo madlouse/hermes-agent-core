@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -299,6 +300,8 @@ class _CronRunControl:
         self._timeout: Optional[float] = None
         self._configured = False
         self._agent = None
+        self._script_process: Optional[subprocess.Popen] = None
+        self._interrupted = False
 
         raw_override = job.get("run_timeout_seconds")
         if raw_override is not None and not isinstance(raw_override, bool):
@@ -343,6 +346,25 @@ class _CronRunControl:
         with self._condition:
             self._agent = agent
 
+    def attach_script_process(self, process: subprocess.Popen) -> None:
+        """Attach a script process or immediately reap it after revocation."""
+        with self._condition:
+            if not self._interrupted:
+                self._script_process = process
+                return
+        _terminate_cron_process_group(process)
+
+    def detach_script_process(self, process: subprocess.Popen) -> None:
+        with self._condition:
+            if self._script_process is process:
+                self._script_process = None
+
+    def terminate_script_process(self, process: subprocess.Popen) -> None:
+        with self._condition:
+            if self._script_process is process:
+                self._script_process = None
+        _terminate_cron_process_group(process)
+
     def raise_if_expired(self, stage: str) -> None:
         remaining = self.remaining()
         if remaining is not None and remaining <= 0:
@@ -356,7 +378,12 @@ class _CronRunControl:
 
         revoke_cron_runtime_lease(self.lease)
         with self._condition:
+            self._interrupted = True
             agent = self._agent
+            process = self._script_process
+            self._script_process = None
+        if process is not None:
+            _terminate_cron_process_group(process)
         if agent is not None:
             request_hard_interrupt(agent, reason)
 
@@ -2584,9 +2611,70 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+_CRON_SCRIPT_TERMINATE_GRACE_SECONDS = 0.5
+_CRON_SCRIPT_REAP_SECONDS = 1.0
+
+
+def _terminate_cron_process_group(process: subprocess.Popen) -> None:
+    """Terminate one cron script tree and synchronously reap its parent."""
+    if os.name == "nt" and process.poll() is not None:
+        return
+
+    if os.name == "nt":
+        try:
+            process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+        except (OSError, ValueError):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
+    try:
+        process.wait(timeout=_CRON_SCRIPT_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+    if os.name == "nt":
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        # The parent may have exited on SIGTERM while a descendant remains in
+        # its process group. Probe and kill the group, not just the Popen PID.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    try:
+        process.wait(timeout=_CRON_SCRIPT_REAP_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.error("Cron script PID %s could not be reaped after kill", process.pid)
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    run_control: Optional[_CronRunControl] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2683,10 +2771,13 @@ def _run_job_script(
         popen_kwargs = {}
         if sys.platform == "win32":
             popen_kwargs = {
-                "creationflags": windows_hide_flags(),
+                "creationflags": windows_hide_flags()
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200),
                 "encoding": "utf-8",
                 "errors": "replace",
             }
+        else:
+            popen_kwargs = {"start_new_session": True}
         env = build_subprocess_env()
         env.update(env_overlay)
         # Use the job's workdir as the subprocess cwd when configured,
@@ -2694,17 +2785,45 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
-        result = subprocess.run(
+        remaining = run_control.remaining() if run_control is not None else None
+        if remaining is not None and remaining <= 0:
+            return False, f"Cron total runtime limit expired before script start: {path}"
+        effective_timeout = script_timeout
+        deadline_limited = remaining is not None and remaining < script_timeout
+        if deadline_limited:
+            effective_timeout = max(0.001, remaining)
+
+        process = subprocess.Popen(
             argv,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=script_timeout,
             cwd=_script_cwd,
             env=env,
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        if run_control is not None:
+            run_control.attach_script_process(process)
+        try:
+            stdout_raw, stderr_raw = process.communicate(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            if run_control is not None:
+                run_control.terminate_script_process(process)
+            else:
+                _terminate_cron_process_group(process)
+            try:
+                stdout_raw, stderr_raw = process.communicate(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                stdout_raw, stderr_raw = "", ""
+            if deadline_limited:
+                return False, f"Cron total runtime limit expired during script: {path}"
+            return False, f"Script timed out after {script_timeout}s: {path}"
+        finally:
+            if run_control is not None:
+                run_control.detach_script_process(process)
+
+        stdout = (stdout_raw or "").strip()
+        stderr = (stderr_raw or "").strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -2716,8 +2835,8 @@ def _run_job_script(
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        if process.returncode != 0:
+            parts = [f"Script exited with code {process.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -2726,14 +2845,15 @@ def _run_job_script(
 
         return True, stdout
 
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
 
 def _run_job_script_with_claim_heartbeat(
-    job: dict, script_path: str, workdir: Optional[str] = None,
+    job: dict,
+    script_path: str,
+    workdir: Optional[str] = None,
+    run_control: Optional[_CronRunControl] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -2755,7 +2875,9 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, run_control=run_control
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2786,10 +2908,14 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, run_control=run_control
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, run_control=run_control
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -3365,7 +3491,10 @@ def _run_job_impl(
 
         try:
             ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir,
+                job,
+                script_path,
+                workdir=_job_workdir,
+                run_control=_run_control,
             )
         except Exception as exc:
             logger.exception(
@@ -3512,7 +3641,9 @@ def _run_job_impl(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
+        prerun_script = _run_job_script_with_claim_heartbeat(
+            job, script_path, run_control=_run_control
+        )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -4510,12 +4641,6 @@ def run_job(
 
     try:
         while True:
-            if future.done():
-                result = future.result()
-                if collector is not None and defer_agent_teardown is not None:
-                    collector.transfer_to(defer_agent_teardown)
-                return result
-
             remaining = control.remaining()
             if remaining is not None and remaining <= 0:
                 timeout = control.timeout() or 0.0
@@ -4536,6 +4661,12 @@ def run_job(
                     f"```\nTimeoutError: {reason}\n```\n"
                 )
                 return False, output, "", f"TimeoutError: {reason}"
+
+            if future.done():
+                result = future.result()
+                if collector is not None and defer_agent_teardown is not None:
+                    collector.transfer_to(defer_agent_teardown)
+                return result
 
             try:
                 future.result(timeout=control.wait_timeout())

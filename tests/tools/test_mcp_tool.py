@@ -26,8 +26,17 @@ def _isolate_mcp_profile_bindings():
         saved_keys = {
             name: set(keys) for name, keys in mcp_tool._mcp_tool_server_keys.items()
         }
+        saved_schemas = {
+            name: dict(schemas) for name, schemas in mcp_tool._mcp_tool_schemas.items()
+        }
+        saved_raw_names = {
+            name: dict(raw_names)
+            for name, raw_names in mcp_tool._mcp_tool_raw_names.items()
+        }
         mcp_tool._server_logical_names.clear()
         mcp_tool._mcp_tool_server_keys.clear()
+        mcp_tool._mcp_tool_schemas.clear()
+        mcp_tool._mcp_tool_raw_names.clear()
     token = mcp_tool._active_mcp_server_keys.set({})
     try:
         yield
@@ -38,6 +47,10 @@ def _isolate_mcp_profile_bindings():
             mcp_tool._server_logical_names.update(saved_names)
             mcp_tool._mcp_tool_server_keys.clear()
             mcp_tool._mcp_tool_server_keys.update(saved_keys)
+            mcp_tool._mcp_tool_schemas.clear()
+            mcp_tool._mcp_tool_schemas.update(saved_schemas)
+            mcp_tool._mcp_tool_raw_names.clear()
+            mcp_tool._mcp_tool_raw_names.update(saved_raw_names)
 
 
 # ---------------------------------------------------------------------------
@@ -193,13 +206,19 @@ class TestMCPParallelSafetyProvenance:
         try:
             mcp_tool._track_mcp_tool_server(first_tool, "foo-bar")
             mcp_tool._track_mcp_tool_server(second_tool, "foo_bar")
-
-            assert mcp_tool.is_mcp_tool_parallel_safe(first_tool) is True
-            assert mcp_tool.is_mcp_tool_parallel_safe(second_tool) is False
-            assert mcp_tool.get_registered_mcp_server_names() == {
-                "foo-bar",
-                "foo_bar",
-            }
+            token = mcp_tool._active_mcp_server_keys.set({
+                "foo-bar": "foo-bar",
+                "foo_bar": "foo_bar",
+            })
+            try:
+                assert mcp_tool.is_mcp_tool_parallel_safe(first_tool) is True
+                assert mcp_tool.is_mcp_tool_parallel_safe(second_tool) is False
+                assert mcp_tool.get_registered_mcp_server_names() == {
+                    "foo-bar",
+                    "foo_bar",
+                }
+            finally:
+                mcp_tool._active_mcp_server_keys.reset(token)
         finally:
             with mcp_tool._lock:
                 mcp_tool._mcp_tool_server_names.clear()
@@ -1071,6 +1090,169 @@ class TestMCPProfileOwnership:
                 mcp_tool.MCPServerTask._deregister_tools(yuange_server)
                 with mcp_tool._lock:
                     assert "mcp__shared__whoami" not in mcp_tool._mcp_tool_server_keys
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.clear()
+                mcp_tool._servers.update(saved_servers)
+
+    def test_heterogeneous_profile_tools_schema_check_and_call_are_isolated(
+        self, tmp_path
+    ):
+        from contextlib import AbstractAsyncContextManager
+
+        import tools.mcp_tool as mcp_tool
+        import tools.registry as registry_module
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools.registry import ToolRegistry
+
+        class AsyncLock(AbstractAsyncContextManager):
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class Session:
+            def __init__(self, owner):
+                self.owner = owner
+                self.calls = []
+
+            async def call_tool(self, name, arguments):
+                self.calls.append(name)
+                return SimpleNamespace(
+                    content=[SimpleNamespace(text=f"{self.owner}:{name}")],
+                    isError=False,
+                    structuredContent=None,
+                )
+
+        def schema_tool(name, owner):
+            return _make_mcp_tool(
+                name,
+                f"{owner} schema",
+                {
+                    "type": "object",
+                    "properties": {f"{owner}_arg": {"type": "string"}},
+                },
+            )
+
+        def install(profile, owner, tool_names):
+            home_token = set_hermes_home_override(profile)
+            try:
+                runtime = mcp_tool._namespace_mcp_servers({
+                    "shared": {
+                        "command": "shared-mcp",
+                        "env": {"TOKEN": f"{owner}-secret"},
+                    }
+                })
+                server_key, config = next(iter(runtime.items()))
+                session = Session(owner)
+                server = SimpleNamespace(
+                    name=server_key,
+                    session=session,
+                    _rpc_lock=AsyncLock(),
+                    _pending_call_context=None,
+                    _registered_tool_names=[],
+                    _tools=[schema_tool(name, owner) for name in tool_names],
+                    tool_timeout=1,
+                    _is_recycled_stdio=lambda: False,
+                )
+                with mcp_tool._lock:
+                    mcp_tool._servers[server_key] = server
+                registered = mcp_tool._register_server_tools(
+                    server_key, server, config
+                )
+                server._registered_tool_names = registered
+                return (
+                    server_key,
+                    dict(mcp_tool._active_mcp_server_keys.get()),
+                    session,
+                )
+            finally:
+                reset_hermes_home_override(home_token)
+
+        atlas_profile = tmp_path / "profiles" / "atlas"
+        yuange_profile = tmp_path / "profiles" / "yuange"
+        atlas_profile.mkdir(parents=True)
+        yuange_profile.mkdir(parents=True)
+        test_registry = ToolRegistry()
+        with mcp_tool._lock:
+            saved_servers = dict(mcp_tool._servers)
+            mcp_tool._servers.clear()
+
+        try:
+            with patch.object(registry_module, "registry", test_registry), patch.object(
+                mcp_tool,
+                "_run_on_mcp_loop",
+                side_effect=lambda factory, timeout: asyncio.run(factory()),
+            ):
+                atlas_key, atlas_binding, atlas_session = install(
+                    atlas_profile, "atlas", ["common", "atlas_only"]
+                )
+                yuange_key, yuange_binding, yuange_session = install(
+                    yuange_profile, "yuange", ["common", "yuange_only"]
+                )
+
+                common = "mcp__shared__common"
+                atlas_only = "mcp__shared__atlas_only"
+                yuange_only = "mcp__shared__yuange_only"
+                all_names = {common, atlas_only, yuange_only}
+
+                for binding, own_only, hidden, owner, session in (
+                    (
+                        atlas_binding,
+                        atlas_only,
+                        yuange_only,
+                        "atlas",
+                        atlas_session,
+                    ),
+                    (
+                        yuange_binding,
+                        yuange_only,
+                        atlas_only,
+                        "yuange",
+                        yuange_session,
+                    ),
+                ):
+                    token = mcp_tool._active_mcp_server_keys.set(binding)
+                    try:
+                        visible = set(test_registry.get_all_tool_names())
+                        assert visible == {common, own_only}
+                        assert set(mcp_tool._existing_tool_names()) == visible
+
+                        definitions = test_registry.get_definitions(
+                            all_names, quiet=True
+                        )
+                        assert {
+                            item["function"]["name"] for item in definitions
+                        } == visible
+                        common_schema = test_registry.get_schema(common)
+                        assert common_schema["description"] == f"{owner} schema"
+                        assert f"{owner}_arg" in common_schema["parameters"][
+                            "properties"
+                        ]
+                        assert test_registry.get_schema(hidden) is None
+                        assert test_registry.get_entry(own_only).check_fn() is True
+                        assert test_registry.get_entry(hidden).check_fn() is False
+
+                        assert json.loads(test_registry.dispatch(common, {}))[
+                            "result"
+                        ] == f"{owner}:common"
+                        assert json.loads(test_registry.dispatch(own_only, {}))[
+                            "result"
+                        ] == f"{owner}:{own_only.rsplit('__', 1)[-1]}"
+                        hidden_result = json.loads(
+                            test_registry.dispatch(hidden, {})
+                        )
+                        assert hidden_result["error"] == f"Unknown tool: {hidden}"
+                    finally:
+                        mcp_tool._active_mcp_server_keys.reset(token)
+
+                assert atlas_session.calls == ["common", "atlas_only"]
+                assert yuange_session.calls == ["common", "yuange_only"]
+                assert atlas_key != yuange_key
         finally:
             with mcp_tool._lock:
                 mcp_tool._servers.clear()
