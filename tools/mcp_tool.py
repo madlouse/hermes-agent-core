@@ -4229,6 +4229,8 @@ _parallel_safe_servers: set = set()
 # on parsing or re-sanitizing the generated name.
 _mcp_tool_server_names: Dict[str, str] = {}
 _mcp_tool_server_keys: Dict[str, Set[str]] = {}
+_mcp_tool_schemas: Dict[str, Dict[str, dict]] = {}
+_mcp_tool_raw_names: Dict[str, Dict[str, str]] = {}
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -4987,7 +4989,12 @@ def _effective_tool_timeout(server: Any, fallback: float) -> float:
     return timeout if timeout > 0 else fallback
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    registry_name: Optional[str] = None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -5000,6 +5007,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return tool_error(
                 f"MCP server '{server_name}' has no unambiguous Profile binding"
             )
+        resolved_tool_name = tool_name
+        if registry_name is not None:
+            with _lock:
+                resolved_tool_name = _mcp_tool_raw_names.get(
+                    registry_name, {}
+                ).get(server_key, "")
+            if not resolved_tool_name:
+                return tool_error(f"Unknown tool: {registry_name}")
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -5069,7 +5084,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    result = await server.session.call_tool(
+                        resolved_tool_name, arguments=args
+                    )
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
@@ -5181,7 +5198,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # through for non-auth exceptions.
             recovered = _handle_auth_error_and_retry(
                 server_key, exc, _call_once,
-                f"tools/call {tool_name}",
+                f"tools/call {resolved_tool_name}",
             )
             if recovered is not None:
                 return recovered
@@ -5191,7 +5208,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # still valid — only the server-side session is stale.
             recovered = _handle_session_expired_and_retry(
                 server_key, exc, _call_once,
-                f"tools/call {tool_name}",
+                f"tools/call {resolved_tool_name}",
             )
             if recovered is not None:
                 return recovered
@@ -5199,7 +5216,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _bump_server_error(server_key)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
-                server_name, tool_name, exc,
+                server_name, resolved_tool_name, exc,
             )
             return tool_error(_sanitize_error(
                 f"MCP call failed: {type(exc).__name__}: {_exc_str(exc)}"
@@ -5455,7 +5472,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_check_fn(server_name: str):
+def _make_check_fn(server_name: str, tool_name: Optional[str] = None):
     """Return a check function that verifies the MCP connection is alive."""
 
     def _check() -> bool:
@@ -5463,6 +5480,11 @@ def _make_check_fn(server_name: str):
         if server_key is None:
             return False
         with _lock:
+            if (
+                tool_name is not None
+                and server_key not in _mcp_tool_server_keys.get(tool_name, set())
+            ):
+                return False
             server = _servers.get(server_key)
             if server is not None and (
                 server.session is not None or server._is_recycled_stdio()
@@ -5473,6 +5495,40 @@ def _make_check_fn(server_name: str):
             return server_key in _lazy_server_configs
 
     return _check
+
+
+def _make_mcp_visibility_fn(tool_name: str):
+    """Return an exact, non-cached current-identity owner check."""
+
+    def _visible() -> bool:
+        with _lock:
+            logical_name = _mcp_tool_server_names.get(tool_name)
+            owners = set(_mcp_tool_server_keys.get(tool_name, set()))
+        if not logical_name:
+            return False
+        server_key = _resolve_server_key(logical_name)
+        if server_key is None:
+            return False
+        return server_key in owners
+
+    return _visible
+
+
+def _make_mcp_schema_overrides(tool_name: str):
+    """Resolve a registry schema from the current Profile/config owner."""
+
+    def _schema() -> dict:
+        with _lock:
+            logical_name = _mcp_tool_server_names.get(tool_name)
+        if not logical_name:
+            return {}
+        server_key = _resolve_server_key(logical_name)
+        if server_key is None:
+            return {}
+        with _lock:
+            return dict(_mcp_tool_schemas.get(tool_name, {}).get(server_key, {}))
+
+    return _schema
 
 
 # ---------------------------------------------------------------------------
@@ -5841,14 +5897,22 @@ _UTILITY_CAPABILITY_ATTRS = {
 
 
 def _track_mcp_tool_server(
-    tool_name: str, server_name: str, server_key: Optional[str] = None
+    tool_name: str,
+    server_name: str,
+    server_key: Optional[str] = None,
+    *,
+    schema: Optional[dict] = None,
+    raw_name: Optional[str] = None,
 ) -> None:
     """Remember logical provenance and each identity owning *tool_name*."""
+    identity = server_key or server_name
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
-        _mcp_tool_server_keys.setdefault(tool_name, set()).add(
-            server_key or server_name
-        )
+        _mcp_tool_server_keys.setdefault(tool_name, set()).add(identity)
+        if schema is not None:
+            _mcp_tool_schemas.setdefault(tool_name, {})[identity] = dict(schema)
+        if raw_name is not None:
+            _mcp_tool_raw_names.setdefault(tool_name, {})[identity] = raw_name
 
 
 def _forget_mcp_tool_server(
@@ -5859,9 +5923,17 @@ def _forget_mcp_tool_server(
         owners = _mcp_tool_server_keys.get(tool_name)
         if server_key is not None and owners:
             owners.discard(server_key)
+            schemas = _mcp_tool_schemas.get(tool_name)
+            if schemas is not None:
+                schemas.pop(server_key, None)
+            raw_names = _mcp_tool_raw_names.get(tool_name)
+            if raw_names is not None:
+                raw_names.pop(server_key, None)
             if owners:
                 return False
         _mcp_tool_server_keys.pop(tool_name, None)
+        _mcp_tool_schemas.pop(tool_name, None)
+        _mcp_tool_raw_names.pop(tool_name, None)
         _mcp_tool_server_names.pop(tool_name, None)
         return True
 
@@ -5924,15 +5996,21 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
 
 
 def _existing_tool_names() -> List[str]:
-    """Return tool names for all currently connected servers."""
+    """Return MCP tool names owned by the caller's current identity."""
     names: List[str] = []
-    for _sname, server in _servers.items():
+    with _lock:
+        server_items = list(_servers.items())
+        owner_snapshot = {
+            tool_name: set(owners)
+            for tool_name, owners in _mcp_tool_server_keys.items()
+        }
+    for server_key, server in server_items:
         if hasattr(server, "_registered_tool_names"):
             names.extend(server._registered_tool_names)
             continue
         for mcp_tool in server._tools:
             schema = _convert_mcp_schema(
-                _server_logical_names.get(_sname, server.name), mcp_tool
+                _server_logical_names.get(server_key, server.name), mcp_tool
             )
             names.append(schema["name"])
     # Lazy servers registered from the schema cache have no MCPServerTask
@@ -5945,7 +6023,12 @@ def _existing_tool_names() -> List[str]:
             for n in tool_names
         ]
     names.extend(lazy_names)
-    return names
+    return sorted({
+        tool_name
+        for tool_name in names
+        if tool_name not in owner_snapshot
+        or _make_mcp_visibility_fn(tool_name)()
+    })
 
 
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
@@ -5993,7 +6076,6 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             return not matches_name_filter(tool_name, exclude_set)
         return True
 
-    check_fn = _make_check_fn(name)
     candidates: List[dict] = []
 
     for mcp_tool in server._tools:
@@ -6015,9 +6097,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    logical_name, mcp_tool.name, server.tool_timeout
+                    logical_name,
+                    mcp_tool.name,
+                    server.tool_timeout,
+                    schema["name"],
                 ),
-                "check_fn": check_fn,
+                "raw_name": mcp_tool.name,
             }
         )
 
@@ -6040,7 +6125,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "handler": handler_factories[handler_key](
                     logical_name, server.tool_timeout
                 ),
-                "check_fn": check_fn,
+                "raw_name": None,
             }
         )
 
@@ -6113,9 +6198,11 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             toolset=toolset_name,
             schema=candidate["schema"],
             handler=candidate["handler"],
-            check_fn=candidate["check_fn"],
+            check_fn=_make_check_fn(logical_name, registry_name),
             is_async=False,
             description=candidate["schema"]["description"],
+            dynamic_schema_overrides=_make_mcp_schema_overrides(registry_name),
+            visibility_fn=_make_mcp_visibility_fn(registry_name),
         )
 
         # The pre-check above is advisory only. Multiple servers connect in
@@ -6130,7 +6217,13 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
-        _track_mcp_tool_server(registry_name, logical_name, name)
+        _track_mcp_tool_server(
+            registry_name,
+            logical_name,
+            name,
+            schema=candidate["schema"],
+            raw_name=candidate["raw_name"],
+        )
         registered_names.append(registry_name)
 
     if registered_names:
@@ -6214,7 +6307,6 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             return not matches_name_filter(tool_name, exclude_set)
         return True
 
-    check_fn = _make_check_fn(logical_name)
     for raw in tools_from_cache_entry(entry):
         if not isinstance(raw, dict):
             continue
@@ -6246,14 +6338,24 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(logical_name, raw_name, tool_timeout),
-            check_fn=check_fn,
+            handler=_make_tool_handler(
+                logical_name, raw_name, tool_timeout, registry_name
+            ),
+            check_fn=_make_check_fn(logical_name, registry_name),
             is_async=False,
             description=schema["description"],
+            dynamic_schema_overrides=_make_mcp_schema_overrides(registry_name),
+            visibility_fn=_make_mcp_visibility_fn(registry_name),
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
-        _track_mcp_tool_server(registry_name, logical_name, name)
+        _track_mcp_tool_server(
+            registry_name,
+            logical_name,
+            name,
+            schema=schema,
+            raw_name=raw_name,
+        )
         registered_names.append(registry_name)
 
     handler_factories = {
@@ -6280,13 +6382,17 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             toolset=toolset_name,
             schema=schema,
             handler=handler_factories[handler_key](logical_name, tool_timeout),
-            check_fn=check_fn,
+            check_fn=_make_check_fn(logical_name, util_name),
             is_async=False,
             description=schema.get("description") or "",
+            dynamic_schema_overrides=_make_mcp_schema_overrides(util_name),
+            visibility_fn=_make_mcp_visibility_fn(util_name),
         )
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue
-        _track_mcp_tool_server(util_name, logical_name, name)
+        _track_mcp_tool_server(
+            util_name, logical_name, name, schema=schema
+        )
         registered_names.append(util_name)
 
     if registered_names:
@@ -6702,7 +6808,10 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     server_key = _resolve_server_key(server_name)
     with _lock:
         if server_key:
-            return server_key in _parallel_safe_servers
+            return (
+                server_key in _mcp_tool_server_keys.get(tool_name, set())
+                and server_key in _parallel_safe_servers
+            )
         # Compatibility for callers/tests that directly registered legacy
         # raw-name state before Profile identity namespacing existed.
         return server_name in _parallel_safe_servers
@@ -6874,7 +6983,8 @@ def has_registered_mcp_tools() -> bool:
     doesn't keep the hook firing every turn.
     """
     with _lock:
-        return bool(_mcp_tool_server_names)
+        tool_names = list(_mcp_tool_server_names)
+    return any(_make_mcp_visibility_fn(name)() for name in tool_names)
 
 
 def get_registered_mcp_server_names() -> set:
@@ -6888,7 +6998,12 @@ def get_registered_mcp_server_names() -> set:
     platform's capability regardless of what its config key is named.
     """
     with _lock:
-        return set(_mcp_tool_server_names.values())
+        provenance = dict(_mcp_tool_server_names)
+    return {
+        server_name
+        for tool_name, server_name in provenance.items()
+        if _make_mcp_visibility_fn(tool_name)()
+    }
 
 
 
