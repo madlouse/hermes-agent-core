@@ -207,6 +207,65 @@ def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
         conn.close()
 
 
+def test_worker_admission_denial_reaches_notice_outbox_and_terminal_receipt(
+    operational_profile, monkeypatch
+):
+    from cron.jobs import CronRuntimeAdmissionError
+
+    provider_send = AsyncMock(
+        return_value={"success": True, "message_id": "om-worker-denial"}
+    )
+    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    decision = {
+        "action": "block",
+        "reason": "runtime_denied",
+        "state": "review_required",
+        "retryable": False,
+        "operational_notice": _notice(),
+    }
+
+    def deny_in_worker(candidate):
+        raise CronRuntimeAdmissionError(
+            "denied in run_job worker",
+            decision=decision,
+            job=candidate,
+        )
+
+    monkeypatch.setattr(
+        "cron.jobs._apply_cron_runtime_governance",
+        deny_in_worker,
+    )
+    job = _job(profile_home=operational_profile)
+
+    with jobs.use_cron_store(operational_profile):
+        assert scheduler.run_one_job(job) is True
+        stored = jobs.get_job("job-1")
+
+    provider_send.assert_awaited_once()
+    runtime_receipt = stored["last_runtime_admission_receipt"]
+    assert runtime_receipt["status"] == "blocked"
+    assert runtime_receipt["reason_code"] == "runtime_denied"
+    assert stored["last_status"] == "error"
+    assert stored["active_run_outcome_claim"] is None
+    assert stored.get("last_run_outcome_receipt") is None
+    notice_receipt = stored["operational_notice_receipts"][
+        _notice()["idempotency_key"]
+    ]
+    assert notice_receipt["status"] == "sent"
+
+    conn = sqlite3.connect(operational_profile / "transport-outbox.sqlite3")
+    try:
+        assert conn.execute(
+            "SELECT count(*) FROM transport_outbox_requests"
+        ).fetchone()[0] == 1
+        payload = conn.execute(
+            "SELECT payload_json FROM transport_outbox_receipts"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert json.loads(payload)["status"] == "confirmed"
+
+
 def test_crash_after_confirmed_send_recovers_without_resending(
     operational_profile, monkeypatch
 ):

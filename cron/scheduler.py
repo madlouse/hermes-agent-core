@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -61,12 +62,18 @@ from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
 
-_runtime_admission_receipt: contextvars.ContextVar[Optional[dict]] = (
-    contextvars.ContextVar("runtime_admission_receipt", default=None)
-)
-_runtime_admission_decision: contextvars.ContextVar[Optional[dict]] = (
-    contextvars.ContextVar("runtime_admission_decision", default=None)
-)
+
+@dataclass(frozen=True)
+class _RunJobResult:
+    success: bool
+    output: str
+    final_response: str
+    error: Optional[str]
+    runtime_admission_receipt: dict[str, Any] | None = None
+    runtime_admission_decision: dict[str, Any] | None = None
+
+    def legacy_tuple(self) -> tuple[bool, str, str, Optional[str]]:
+        return self.success, self.output, self.final_response, self.error
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -4407,14 +4414,14 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
-def _run_job_impl(
+def _run_job_body(
     job: dict,
     *,
     defer_agent_teardown: Optional[list] = None,
     _run_control: _CronRunControl,
     script_snapshot: bytes | dict[str, Any] | None = None,
     run_outcome_claim: dict[str, Any] | None = None,
-) -> tuple[bool, str, str, Optional[str]]:
+) -> tuple[bool, str, str, Optional[str]] | _RunJobResult:
     """
     Execute a single cron job.
 
@@ -4467,18 +4474,16 @@ def _run_job_impl(
     # durable behavior and cannot bypass its persisted authorization binding.
     from cron.jobs import CronRuntimeAdmissionError, _apply_cron_runtime_governance
 
-    _runtime_admission_receipt.set(None)
-    _runtime_admission_decision.set(None)
     try:
         _apply_cron_runtime_governance(job)
     except CronRuntimeAdmissionError as exc:
-        _runtime_admission_receipt.set(exc.receipt)
-        _runtime_admission_decision.set(exc.decision)
-        return (
-            False,
-            _runtime_admission_failure_document(job, exc.receipt),
-            "",
-            str(exc),
+        return _RunJobResult(
+            success=False,
+            output=_runtime_admission_failure_document(job, exc.receipt),
+            final_response="",
+            error=str(exc),
+            runtime_admission_receipt=exc.receipt,
+            runtime_admission_decision=exc.decision,
         )
     _run_control.raise_if_expired("runtime governance")
 
@@ -5656,13 +5661,35 @@ def _run_job_impl(
             _teardown_cron_agent(agent, job_id)
 
 
-def run_job(
+def _run_job_impl(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    _run_control: _CronRunControl,
+    script_snapshot: bytes | dict[str, Any] | None = None,
+    run_outcome_claim: dict[str, Any] | None = None,
+) -> _RunJobResult:
+    """Execute in the worker and always return typed cross-thread metadata."""
+    result = _run_job_body(
+        job,
+        defer_agent_teardown=defer_agent_teardown,
+        _run_control=_run_control,
+        script_snapshot=script_snapshot,
+        run_outcome_claim=run_outcome_claim,
+    )
+    if isinstance(result, _RunJobResult):
+        return result
+    success, output, final_response, error = result
+    return _RunJobResult(success, output, final_response, error)
+
+
+def _run_job_result(
     job: dict,
     *,
     defer_agent_teardown: Optional[list] = None,
     script_snapshot: bytes | dict[str, Any] | None = None,
     run_outcome_claim: dict[str, Any] | None = None,
-) -> tuple[bool, str, str, Optional[str]]:
+) -> _RunJobResult:
     """Execute a job under one deadline measured from this entry boundary.
 
     The monitored worker includes runtime governance, dotenv/config/provider
@@ -5718,7 +5745,12 @@ def run_job(
                     "## Error\n\n"
                     f"```\nTimeoutError: {reason}\n```\n"
                 )
-                return False, output, "", f"TimeoutError: {reason}"
+                return _RunJobResult(
+                    False,
+                    output,
+                    "",
+                    f"TimeoutError: {reason}",
+                )
 
             if future.done():
                 result = future.result()
@@ -5732,6 +5764,22 @@ def run_job(
                 continue
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+
+
+def run_job(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    script_snapshot: bytes | dict[str, Any] | None = None,
+    run_outcome_claim: dict[str, Any] | None = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Compatibility surface returning the historical four-tuple."""
+    return _run_job_result(
+        job,
+        defer_agent_teardown=defer_agent_teardown,
+        script_snapshot=script_snapshot,
+        run_outcome_claim=run_outcome_claim,
+    ).legacy_tuple()
 
 
 def _teardown_cron_agent(agent, job_id: str) -> None:
@@ -5952,7 +6000,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _scope_token = set_secret_scope(
             build_profile_secret_scope(_get_hermes_home())
         )
-        _admission_token = _runtime_admission_receipt.set(None)
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
         # its finally block; doing that before _deliver_result runs means the
@@ -5969,12 +6016,20 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 run_kwargs["script_snapshot"] = script_snapshot
             if run_outcome_claim is not None:
                 run_kwargs["run_outcome_claim"] = run_outcome_claim
-            success, output, final_response, error = run_job(job, **run_kwargs)
+            run_result = _run_job_result(job, **run_kwargs)
+            if not isinstance(run_result, _RunJobResult):
+                # Test/embedding compatibility for callers that monkeypatch the
+                # internal executor with the historical tuple shape.
+                run_result = _RunJobResult(*run_result)
         finally:
             reset_secret_scope(_scope_token)
 
-        admission_receipt = _runtime_admission_receipt.get()
-        admission_decision = _runtime_admission_decision.get()
+        success = run_result.success
+        output = run_result.output
+        final_response = run_result.final_response
+        error = run_result.error
+        admission_receipt = run_result.runtime_admission_receipt
+        admission_decision = run_result.runtime_admission_decision
         if admission_receipt is not None and admission_decision is not None:
             notice_status = _deliver_operational_notice(
                 job,
@@ -6095,7 +6150,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     runtime_admission_receipt=admission_receipt,
                     **delivery_kwargs,
                 )
-        _runtime_admission_receipt.reset(_admission_token)
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
@@ -6114,7 +6168,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     except CronRunOutcomeOwnershipLost as ownership_error:
         logger.error("Job '%s': %s; stopping without delivery or terminal write", job["id"], ownership_error)
         finish_execution(execution_id, success=False, error=str(ownership_error))
-        _runtime_admission_receipt.reset(_admission_token)
         return False
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
@@ -6169,12 +6222,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                         job["id"],
                         ownership_error,
                     )
-                    if "_admission_token" in locals():
-                        _runtime_admission_receipt.reset(_admission_token)
                     return False
             admission_receipt = (
-                _runtime_admission_receipt.get()
-                if "_admission_token" in locals()
+                run_result.runtime_admission_receipt
+                if "run_result" in locals()
                 else None
             )
             run_outcome_receipt = (
@@ -6211,8 +6262,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     str(e),
                     **outcome_kwargs,
                 )
-        if "_admission_token" in locals():
-            _runtime_admission_receipt.reset(_admission_token)
         finish_execution(execution_id, success=False, error=str(e))
         return False
     finally:

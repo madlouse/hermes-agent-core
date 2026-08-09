@@ -1781,7 +1781,7 @@ class TestSilentDelivery:
 
     def test_silent_response_suppresses_delivery(self, caplog):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT]", None)), \
+             patch("cron.scheduler._run_job_result", return_value=(True, "# output", "[SILENT]", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
@@ -1796,7 +1796,7 @@ class TestSilentDelivery:
         still intentional silence, not an empty-response failure."""
         framed = "## Response\n[SILENT]\n## End Response"
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", framed, None)), \
+             patch("cron.scheduler._run_job_result", return_value=(True, "# output", framed, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
@@ -1812,7 +1812,7 @@ class TestSilentDelivery:
             "## End Response\n```\nThree real changes were found."
         )
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
+             patch("cron.scheduler._run_job_result", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
@@ -1826,7 +1826,7 @@ class TestSilentDelivery:
         be delivered — the old substring check wrongly swallowed it."""
         response = "I considered staying [SILENT] but here is the summary: 3 items merged."
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
+             patch("cron.scheduler._run_job_result", return_value=(True, "# output", response, None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
@@ -1838,7 +1838,7 @@ class TestSilentDelivery:
     def test_failed_job_always_delivers(self):
         """Failed jobs deliver regardless of [SILENT] in output."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(False, "# output", "", "some error")), \
+             patch("cron.scheduler._run_job_result", return_value=(False, "# output", "", "some error")), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run"):
@@ -1850,7 +1850,7 @@ class TestSilentDelivery:
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
         """Whitespace-only final responses should behave like empty responses."""
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
-             patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
+             patch("cron.scheduler._run_job_result", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
              patch("cron.scheduler.mark_job_run") as mark_mock:
@@ -1884,7 +1884,7 @@ class TestOneShotDispatchClaim:
         order = []
         with patch("cron.scheduler.get_due_jobs", return_value=[self._oneshot()]), \
              patch("cron.scheduler.claim_dispatch", side_effect=lambda _id: order.append("claim") or True), \
-             patch("cron.scheduler.run_job", side_effect=lambda _j, **_kw: order.append("run") or (True, "# out", "ok", None)), \
+             patch("cron.scheduler._run_job_result", side_effect=lambda _j, **_kw: order.append("run") or (True, "# out", "ok", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result"), \
              patch("cron.scheduler.mark_job_run"):
@@ -2339,7 +2339,7 @@ class TestParallelTick:
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_runs"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler._run_job_result", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
              patch("cron.scheduler.mark_job_run"):
@@ -2384,7 +2384,7 @@ class TestParallelTick:
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
              patch("cron.scheduler.advance_next_runs"), \
-             patch("cron.scheduler.run_job", side_effect=mock_run_job), \
+             patch("cron.scheduler._run_job_result", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
              patch("cron.scheduler.mark_job_run"):
@@ -2509,7 +2509,7 @@ def test_run_one_job_persists_core_terminal_run_outcome_receipt():
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler.heartbeat_job_run_outcome", return_value=renewed_claim) as heartbeat_mock, \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
-         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler._run_job_result", return_value=(True, "# output", "report", None)), \
          patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
          patch("cron.scheduler._cron_delivery_receipt_summary", return_value=delivery), \
          patch("cron.scheduler._cron_run_outcome_receipt", return_value=receipt) as receipt_mock, \
@@ -2550,7 +2550,7 @@ def test_run_one_job_stops_before_save_when_outcome_ownership_is_lost():
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
-         patch("cron.scheduler.run_job", side_effect=fake_run), \
+         patch("cron.scheduler._run_job_result", side_effect=fake_run), \
          patch("cron.scheduler.heartbeat_job_run_outcome", return_value=None), \
          patch("cron.scheduler.save_job_output") as save_mock, \
          patch("cron.scheduler._deliver_result") as deliver_mock, \
@@ -2577,7 +2577,7 @@ def test_run_one_job_propagates_delivery_ownership_loss_without_terminal_write()
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
-         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler._run_job_result", return_value=(True, "# output", "report", None)), \
          patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda *_args: next(heartbeat_results)), \
          patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
          patch("cron.scheduler._deliver_result", side_effect=lose_in_delivery), \
@@ -2597,7 +2597,7 @@ def test_run_one_job_exception_stops_when_terminal_renewal_loses_owner():
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
-         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler._run_job_result", return_value=(True, "# output", "report", None)), \
          patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda *_args: next(heartbeat_results)), \
          patch("cron.scheduler.save_job_output", side_effect=RuntimeError("disk unavailable")), \
          patch("cron.scheduler._cron_run_outcome_receipt") as receipt_mock, \
@@ -2665,7 +2665,7 @@ def test_run_one_job_real_claim_producer_and_writer_round_trip(tmp_path, monkeyp
     jobs.save_jobs([job])
 
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
-         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler._run_job_result", return_value=(True, "# output", "report", None)), \
          patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "output.md")):
         assert scheduler.run_one_job(job) is True
 
@@ -2736,7 +2736,7 @@ def test_delivery_heartbeat_keeps_second_owner_out_past_original_expiry(
         return None
 
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
-         patch("cron.scheduler.run_job", side_effect=fake_run), \
+         patch("cron.scheduler._run_job_result", side_effect=fake_run), \
          patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "output.md")), \
          patch("cron.scheduler._deliver_result", side_effect=fake_delivery):
         assert scheduler.run_one_job(job) is True
@@ -2761,7 +2761,7 @@ def test_signed_job_claim_failure_aborts_before_any_run_side_effect():
     with patch("cron.scheduler.claim_dispatch", return_value=True) as dispatch_mock, \
          patch("cron.scheduler.begin_job_run_outcome", return_value=None), \
          patch("cron.scheduler.record_job_run_preflight_denial") as denial_mock, \
-         patch("cron.scheduler.run_job") as run_mock, \
+         patch("cron.scheduler._run_job_result") as run_mock, \
          patch("cron.scheduler.mark_job_run") as mark_mock:
         assert scheduler.run_one_job(job) is False
 
@@ -2841,7 +2841,7 @@ def test_script_snapshot_mismatch_abandons_claim_before_side_effect():
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(False, b"drift")), \
          patch("cron.scheduler.abandon_job_run_outcome", return_value=True) as abandon_mock, \
-         patch("cron.scheduler.run_job") as run_mock:
+         patch("cron.scheduler._run_job_result") as run_mock:
         assert scheduler.run_one_job(job) is False
 
     dispatch_mock.assert_not_called()
@@ -3013,7 +3013,7 @@ def test_refused_finite_dispatch_releases_signed_outcome_claim():
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
          patch("cron.scheduler.claim_dispatch", return_value=False), \
          patch("cron.scheduler.abandon_job_run_outcome", return_value=True) as abandon_mock, \
-         patch("cron.scheduler.run_job") as run_mock:
+         patch("cron.scheduler._run_job_result") as run_mock:
         assert scheduler.run_one_job(job) is True
 
     abandon_mock.assert_called_once_with(
@@ -3513,7 +3513,7 @@ def test_run_one_job_passes_claimed_script_snapshot_to_executor():
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, b"claimed")), \
-         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)) as run_mock, \
+         patch("cron.scheduler._run_job_result", return_value=(True, "# output", "report", None)) as run_mock, \
          patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
          patch("cron.scheduler._cron_run_outcome_receipt", return_value=None), \
          patch("cron.scheduler.mark_job_run"):
@@ -3552,7 +3552,7 @@ def test_run_one_job_persists_failed_receipt_when_terminal_pipeline_raises():
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
-         patch("cron.scheduler.run_job", return_value=(True, "# output", "report", None)), \
+         patch("cron.scheduler._run_job_result", return_value=(True, "# output", "report", None)), \
          patch("cron.scheduler.save_job_output", side_effect=RuntimeError("disk unavailable")), \
          patch("cron.scheduler._cron_run_outcome_receipt", return_value=receipt) as receipt_mock, \
          patch("cron.scheduler.mark_job_run") as mark_mock:
@@ -3578,7 +3578,7 @@ def test_run_one_job_clears_stale_receipt_when_exception_has_no_signed_revision(
 
     job = {"id": "legacy-run-failed", "name": "Legacy run", "deliver": "local"}
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
-         patch("cron.scheduler.run_job", side_effect=RuntimeError("model unavailable")), \
+         patch("cron.scheduler._run_job_result", side_effect=RuntimeError("model unavailable")), \
          patch("cron.scheduler.mark_job_run") as mark_mock:
         assert run_one_job(job) is False
 
@@ -3611,14 +3611,20 @@ def test_run_one_job_keeps_admission_denial_distinct_from_failed_run_receipt():
     }
 
     def denied_run(*_args, **_kwargs):
-        scheduler._runtime_admission_receipt.set(admission)
-        return False, "# denied", "", "Cron job was not run: job_paused."
+        return scheduler._RunJobResult(
+            False,
+            "# denied",
+            "",
+            "Cron job was not run: job_paused.",
+            runtime_admission_receipt=admission,
+            runtime_admission_decision={},
+        )
 
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
-         patch("cron.scheduler.run_job", side_effect=denied_run), \
+         patch("cron.scheduler._run_job_result", side_effect=denied_run), \
          patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
          patch("cron.scheduler._deliver_result", return_value=None), \
          patch("cron.scheduler._cron_run_outcome_receipt") as outcome_mock, \
@@ -3636,21 +3642,10 @@ def test_run_one_job_keeps_admission_denial_distinct_from_failed_run_receipt():
     )
 
 
-def test_run_one_job_exception_preserves_admission_fact_without_run_receipt():
+def test_run_one_job_exception_does_not_infer_unreturned_admission_fact():
     import cron.scheduler as scheduler
 
     job = {"id": "run-proof-admission-exception", "name": "Run proof", "deliver": "local"}
-    admission = {
-        "schema_version": "cron-runtime-admission/v1",
-        "receipt_id": "cron-runtime-admission:" + "a" * 32,
-        "stage": "pre_cron_job_run",
-        "status": "blocked",
-        "reason_code": "runtime_governance_unavailable",
-        "state": "review_required",
-        "exception_class": "OSError",
-        "retryable": True,
-        "job_fingerprint": "sha256:" + "b" * 64,
-    }
     claim = {
         "schema_version": "cron-run-claim/v1",
         "profile_id": "profile-custom",
@@ -3662,24 +3657,27 @@ def test_run_one_job_exception_preserves_admission_fact_without_run_receipt():
     }
 
     def raise_after_admission(*_args, **_kwargs):
-        scheduler._runtime_admission_receipt.set(admission)
         raise RuntimeError("admission pipeline failed")
 
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=claim), \
          patch("cron.scheduler.heartbeat_job_run_outcome", side_effect=lambda _job_id, current: dict(current)), \
          patch("cron.scheduler._cron_run_script_snapshot", return_value=(True, None)), \
-         patch("cron.scheduler.run_job", side_effect=raise_after_admission), \
-         patch("cron.scheduler._cron_run_outcome_receipt") as outcome_mock, \
+         patch("cron.scheduler._run_job_result", side_effect=raise_after_admission), \
+         patch("cron.scheduler._cron_run_outcome_receipt", return_value=None) as outcome_mock, \
          patch("cron.scheduler.mark_job_run") as mark_mock:
         assert scheduler.run_one_job(job) is False
 
-    outcome_mock.assert_not_called()
+    outcome_mock.assert_called_once_with(
+        job,
+        success=False,
+        run_outcome_claim=claim,
+        delivery_receipt=None,
+    )
     mark_mock.assert_called_once_with(
         job["id"],
         False,
         "admission pipeline failed",
-        runtime_admission_receipt=admission,
         run_outcome_claim=claim,
     )
 
@@ -3692,7 +3690,7 @@ def test_run_one_job_interrupted_attempt_never_writes_terminal_outcome(raises):
     run_result = RuntimeError("interrupted pipeline") if raises else (True, "# output", "report", None)
     with patch("cron.scheduler.claim_dispatch", return_value=True), \
          patch("cron.scheduler.begin_job_run_outcome", return_value=None), \
-         patch("cron.scheduler.run_job", side_effect=run_result if raises else None, return_value=None if raises else run_result), \
+         patch("cron.scheduler._run_job_result", side_effect=run_result if raises else None, return_value=None if raises else run_result), \
          patch("cron.scheduler.save_job_output", return_value="/tmp/output.md"), \
          patch("cron.scheduler._consume_interrupted_flag", return_value=True), \
          patch("cron.scheduler.mark_job_run") as mark_mock:

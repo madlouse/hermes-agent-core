@@ -429,7 +429,7 @@ class TestRunOneJobHonoursInterruptedFlag:
             "cron.scheduler.mark_job_run",
             return_value=True,
         ) as mark, patch(
-            "cron.scheduler.run_job",
+            "cron.scheduler._run_job_result",
         ) as run:
             assert sched.run_one_job(job) is False
 
@@ -520,7 +520,7 @@ class TestRunOneJobHonoursInterruptedFlag:
             ), patch(
                 "cron.scheduler._set_running_job_state",
                 side_effect=state_with_execution_gate,
-            ), patch("cron.scheduler.run_job") as run_job:
+            ), patch("cron.scheduler._run_job_result") as run_job:
                 run_thread = threading.Thread(target=run)
                 run_thread.start()
                 assert dispatch_persisted.wait(5)
@@ -644,7 +644,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
              patch("agent.secret_scope.reset_secret_scope"), \
              patch(
-                 "cron.scheduler.run_job",
+                 "cron.scheduler._run_job_result",
                  side_effect=finish_after_shutdown,
              ), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -682,7 +682,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
              patch("agent.secret_scope.reset_secret_scope"), \
              patch(
-                 "cron.scheduler.run_job",
+                 "cron.scheduler._run_job_result",
                  side_effect=finish_after_shutdown,
              ), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -715,7 +715,7 @@ class TestRunOneJobHonoursInterruptedFlag:
              patch("agent.secret_scope.set_secret_scope", return_value=None), \
              patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
              patch("agent.secret_scope.reset_secret_scope"), \
-             patch("cron.scheduler.run_job", side_effect=RuntimeError("boom")), \
+             patch("cron.scheduler._run_job_result", side_effect=RuntimeError("boom")), \
              patch("cron.scheduler.mark_job_run") as mock_mark:
             result = sched.run_one_job(job)
 
