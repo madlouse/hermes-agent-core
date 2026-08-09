@@ -412,6 +412,8 @@ _IMMUTABLE_JOB_FIELDS = frozenset({
 _CRON_GOVERNANCE_ENV = "HERMES_CRON_CREATION_GOVERNANCE_REQUIRED"
 _CRON_GOVERNANCE_PLUGIN = "hck-tool-boundary"
 _CRON_RESUME_SCHEMA = "cron-persist-resume/v1"
+_CRON_RESUME_SCHEMA_V2 = "cron-persist-resume/v2"
+_CRON_RECOVERY_SCHEMA = "cron-persist-recovery/v1"
 _CRON_RESUME_RECEIPT_FIELD = "cron_persist_resume_receipt"
 _CRON_RESUME_PACKAGE_FIELDS = frozenset({
     "schema_version",
@@ -442,6 +444,12 @@ _CRON_RESUME_RECEIPT_CORE_FIELDS = (
     "prior_job_hash",
     "issued_at",
     "expires_at",
+)
+_CRON_RESUME_RECEIPT_V2_CORE_FIELDS = (
+    *_CRON_RESUME_RECEIPT_CORE_FIELDS,
+    "request_id",
+    "request_hash",
+    "source_route_hash",
 )
 _CRON_GOVERNANCE_PATCH_FIELDS = frozenset({
     "operation",
@@ -544,6 +552,135 @@ def _cron_persist_spec_hash(operation: str, candidate: Dict[str, Any]) -> str:
     return _cron_stable_hash({"operation": operation, "job": normalized})
 
 
+def _cron_request_material(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Return normalized user intent, excluding mutable and derived state."""
+    fields = (
+        "id",
+        "name",
+        "prompt",
+        "skills",
+        "skill",
+        "model",
+        "provider",
+        "base_url",
+        "script",
+        "no_agent",
+        "context_from",
+        "schedule",
+        "repeat",
+        "deliver",
+        "origin",
+        "enabled_toolsets",
+        "workdir",
+        "attach_to_session",
+        "authorized_behavior_ref",
+        "implementation_categories",
+        "source_route",
+    )
+    material = {
+        field: copy.deepcopy(candidate.get(field))
+        for field in fields
+        if field in candidate
+    }
+    repeat = material.get("repeat")
+    if isinstance(repeat, dict):
+        material["repeat"] = {
+            key: copy.deepcopy(value)
+            for key, value in repeat.items()
+            if key != "completed"
+        }
+    return material
+
+
+def _cron_request_hash(candidate: Dict[str, Any]) -> str:
+    return _cron_stable_hash(_cron_request_material(candidate))
+
+
+def _cron_source_route_hash(candidate: Dict[str, Any]) -> str:
+    return _cron_stable_hash({
+        "source_route": copy.deepcopy(candidate.get("source_route")),
+        "origin": copy.deepcopy(candidate.get("origin")),
+        "deliver": copy.deepcopy(candidate.get("deliver")),
+    })
+
+
+def _cron_candidate_definition_hash(candidate: Dict[str, Any]) -> str:
+    return _cron_stable_hash(_cron_governance_material(candidate))
+
+
+def _active_cron_profile_id() -> str:
+    """Derive the immutable profile identity from the active Cron store path."""
+    home = _active_profile_home()
+    try:
+        resolved = home.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(active profile is unavailable)."
+        ) from exc
+    if not resolved.is_dir():
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(active profile is unavailable)."
+        )
+    profile_id = resolved.name if resolved.parent.name == "profiles" else "default"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile_id):
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(active profile identity is invalid)."
+        )
+    asserted = str(os.environ.get("HERMES_PROFILE_ID") or "").strip()
+    if asserted and asserted != profile_id:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(active profile identity mismatch)."
+        )
+    return profile_id
+
+
+def cron_persist_resume_identity(
+    operation: str,
+    candidate: Dict[str, Any],
+) -> Dict[str, str]:
+    """Return the Core-owned v2 request and route identities for a candidate."""
+    op = str(operation or "").strip().lower()
+    if op not in {"create", "update"} or not isinstance(candidate, dict):
+        raise ValueError("Cron persist resume identity requires create/update candidate")
+    profile_id = _active_cron_profile_id()
+    request_hash = _cron_request_hash(candidate)
+    source_route_hash = _cron_source_route_hash(candidate)
+    request_id = _cron_stable_hash({
+        "profile_id": profile_id,
+        "operation": op,
+        "job_id": str(candidate.get("id") or "").strip(),
+        "request_hash": request_hash,
+    })
+    return {
+        "profile_id": profile_id,
+        "request_id": request_id,
+        "request_hash": request_hash,
+        "source_route_hash": source_route_hash,
+    }
+
+
+@dataclass(frozen=True)
+class CronResumeResolution:
+    """Typed classification of one structurally valid Cron resume package."""
+
+    disposition: str
+    candidate: Dict[str, Any]
+    reason: str = ""
+    recovery_context: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class _ParsedCronResume:
+    schema_version: str
+    operation: str
+    job: Dict[str, Any]
+    receipt: Dict[str, Any]
+
+
 class CronJobGovernanceError(PermissionError):
     """Raised when a cron persistence candidate is not authorized."""
 
@@ -567,6 +704,9 @@ class CronJobGovernanceError(PermissionError):
             payload["callback_failures"] = [
                 copy.deepcopy(item) for item in failures if isinstance(item, dict)
             ]
+        recovery = self.decision.get("recovery")
+        if isinstance(recovery, dict):
+            payload["recovery"] = copy.deepcopy(recovery)
         return payload
 
 
@@ -620,6 +760,8 @@ def _apply_cron_persist_governance(
     operation: str,
     candidate: Dict[str, Any],
     existing_jobs: List[Dict[str, Any]],
+    *,
+    recovery_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Run the generic persistence decision hook inside the jobs lock."""
     expected = (
@@ -630,12 +772,14 @@ def _apply_cron_persist_governance(
         from hermes_cli.plugins import discover_plugins, invoke_mandatory_hook
 
         discover_plugins()
-        report = invoke_mandatory_hook(
-            "pre_cron_job_persist",
-            operation=operation,
-            candidate=copy.deepcopy(candidate),
-            existing_jobs=copy.deepcopy(existing_jobs),
-        )
+        hook_kwargs = {
+            "operation": operation,
+            "candidate": copy.deepcopy(candidate),
+            "existing_jobs": copy.deepcopy(existing_jobs),
+        }
+        if recovery_context is not None:
+            hook_kwargs["recovery_context"] = copy.deepcopy(recovery_context)
+        report = invoke_mandatory_hook("pre_cron_job_persist", **hook_kwargs)
     except Exception as exc:
         if not expected:
             logger.warning("pre_cron_job_persist discovery failed", exc_info=True)
@@ -901,37 +1045,43 @@ def _dispatch_post_cron_persist_effects(
         )
 
 
-def _resume_candidate(package: Dict[str, Any], *, operation: str) -> Dict[str, Any]:
-    """Validate a resume envelope and return its immutable candidate."""
+def _invalid_resume(reason: str) -> CronJobGovernanceError:
+    return CronJobGovernanceError(
+        "Cron job persistence needs administrator review (invalid resume package).",
+        decision={
+            "action": "block",
+            "reason": reason,
+            "state": "resume_review_required",
+        },
+    )
+
+
+def _parse_resume_package(
+    package: Dict[str, Any], *, operation: str
+) -> _ParsedCronResume:
+    """Verify an immutable v1/v2 envelope without consulting mutable state."""
     if not isinstance(package, dict):
-        raise CronJobGovernanceError(
-            "Cron job persistence needs administrator review (invalid resume package)."
-        )
+        raise _invalid_resume("resume_package_invalid")
+    schema = str(package.get("schema_version") or "").strip()
+    receipt_fields = (
+        _CRON_RESUME_RECEIPT_CORE_FIELDS
+        if schema == _CRON_RESUME_SCHEMA
+        else _CRON_RESUME_RECEIPT_V2_CORE_FIELDS
+        if schema == _CRON_RESUME_SCHEMA_V2
+        else ()
+    )
     job = package.get("job")
     receipt = package.get("receipt")
-    job_id = str(job.get("id") or "").strip() if isinstance(job, dict) else ""
-    receipt_id = (
-        str(receipt.get("receipt_id") or "").strip()
-        if isinstance(receipt, dict)
-        else ""
-    )
+    if not receipt_fields or not isinstance(job, dict) or not isinstance(receipt, dict):
+        raise _invalid_resume("resume_package_schema_invalid")
+    job_id = str(job.get("id") or "").strip()
+    receipt_id = str(receipt.get("receipt_id") or "").strip()
     candidate_hash = str(package.get("candidate_hash") or "").strip()
     persist_spec_hash = str(package.get("persist_spec_hash") or "").strip()
     behavior_ref = str(package.get("authorized_behavior_ref") or "").strip()
-    computed_persist_spec_hash = (
-        _cron_persist_spec_hash(operation, job)
-        if isinstance(job, dict)
-        else ""
-    )
-    receipt_core = (
-        {
-            field: copy.deepcopy(receipt.get(field))
-            for field in _CRON_RESUME_RECEIPT_CORE_FIELDS
-        }
-        if isinstance(receipt, dict)
-        else {}
-    )
-    computed_receipt_id = _cron_stable_hash(receipt_core) if receipt_core else ""
+    receipt_core = {
+        field: copy.deepcopy(receipt.get(field)) for field in receipt_fields
+    }
     sha256_pattern = r"sha256:[0-9a-f]{64}"
     safe_job_id = bool(
         job_id
@@ -942,20 +1092,17 @@ def _resume_candidate(package: Dict[str, Any], *, operation: str) -> Dict[str, A
         and not Path(job_id).drive
     )
     valid = (
-        isinstance(job, dict)
-        and isinstance(receipt, dict)
-        and set(package) == _CRON_RESUME_PACKAGE_FIELDS
-        and set(receipt) == {*_CRON_RESUME_RECEIPT_CORE_FIELDS, "receipt_id"}
-        and package.get("schema_version") == _CRON_RESUME_SCHEMA
+        set(package) == _CRON_RESUME_PACKAGE_FIELDS
+        and set(receipt) == {*receipt_fields, "receipt_id"}
+        and receipt.get("schema_version") == schema
         and package.get("scope_immutable") is True
         and isinstance(package.get("instruction"), str)
         and bool(str(package.get("instruction") or "").strip())
         and str(package.get("operation") or "").strip().lower() == operation
         and str(package.get("job_id") or "").strip() == job_id
-        and receipt.get("schema_version") == _CRON_RESUME_SCHEMA
         and all(
             str(receipt.get(field) or "").strip()
-            for field in _CRON_RESUME_RECEIPT_CORE_FIELDS
+            for field in receipt_fields
             if field != "prior_job_hash"
         )
         and str(receipt.get("operation") or "").strip().lower() == operation
@@ -965,18 +1112,343 @@ def _resume_candidate(package: Dict[str, Any], *, operation: str) -> Dict[str, A
         and behavior_ref == str(job.get("authorized_behavior_ref") or "").strip()
         and safe_job_id
         and re.fullmatch(sha256_pattern, receipt_id) is not None
-        and receipt_id == computed_receipt_id
+        and receipt_id == _cron_stable_hash(receipt_core)
         and re.fullmatch(sha256_pattern, candidate_hash) is not None
         and candidate_hash == str(receipt.get("candidate_hash") or "").strip()
         and re.fullmatch(sha256_pattern, persist_spec_hash) is not None
         and persist_spec_hash == str(receipt.get("persist_spec_hash") or "").strip()
-        and persist_spec_hash == computed_persist_spec_hash
+        and persist_spec_hash == _cron_persist_spec_hash(operation, job)
     )
     if not valid:
-        raise CronJobGovernanceError(
-            "Cron job persistence needs administrator review (invalid resume package)."
+        raise _invalid_resume("resume_package_integrity_mismatch")
+    if operation == "update" and not str(receipt.get("prior_job_hash") or "").strip():
+        raise _invalid_resume("resume_update_precondition_missing")
+    if schema == _CRON_RESUME_SCHEMA_V2:
+        identity = cron_persist_resume_identity(operation, job)
+        if any(receipt.get(field) != identity[field] for field in identity):
+            raise _invalid_resume("resume_request_or_route_mismatch")
+        try:
+            issued_at = datetime.fromisoformat(
+                str(receipt["issued_at"]).replace("Z", "+00:00")
+            )
+            expires_at = datetime.fromisoformat(
+                str(receipt["expires_at"]).replace("Z", "+00:00")
+            )
+            now = _hermes_now()
+            if now.tzinfo is None:
+                now = now.astimezone()
+        except (TypeError, ValueError):
+            raise _invalid_resume("resume_receipt_time_invalid") from None
+        if (
+            issued_at.tzinfo is None
+            or expires_at.tzinfo is None
+            or issued_at >= expires_at
+            or issued_at > now
+            or expires_at <= now
+        ):
+            raise _invalid_resume("resume_receipt_expired")
+    return _ParsedCronResume(
+        schema_version=schema,
+        operation=operation,
+        job=copy.deepcopy(job),
+        receipt=copy.deepcopy(receipt),
+    )
+
+
+def _cron_resume_precondition_hash(job: Dict[str, Any]) -> str:
+    return _cron_stable_hash({
+        key: copy.deepcopy(value)
+        for key, value in job.items()
+        if key != _CRON_RESUME_RECEIPT_FIELD
+    })
+
+
+def _recovery_context(
+    parsed: _ParsedCronResume,
+    *,
+    disposition: str,
+    reason: str,
+    fresh_candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    receipt = parsed.receipt
+    fresh_candidate_hash = (
+        _cron_candidate_definition_hash(fresh_candidate) if fresh_candidate else ""
+    )
+    fresh_spec_hash = (
+        _cron_persist_spec_hash(parsed.operation, fresh_candidate)
+        if fresh_candidate
+        else ""
+    )
+    core = {
+        "schema_version": _CRON_RECOVERY_SCHEMA,
+        "disposition": disposition,
+        "reason": reason,
+        "profile_id": str(receipt.get("profile_id") or ""),
+        "operation": parsed.operation,
+        "job_id": str(parsed.job.get("id") or ""),
+        "request_id": str(receipt.get("request_id") or ""),
+        "request_hash": str(receipt.get("request_hash") or ""),
+        "source_route_hash": str(receipt.get("source_route_hash") or ""),
+        "rejected_receipt_id": str(receipt.get("receipt_id") or ""),
+        "rejected_receipt_hash": _cron_stable_hash(receipt),
+        "rejected_frame_id": str(receipt.get("frame_id") or ""),
+        "rejected_pending_id": str(receipt.get("pending_id") or ""),
+        "rejected_candidate_hash": str(receipt.get("candidate_hash") or ""),
+        "rejected_persist_spec_hash": str(receipt.get("persist_spec_hash") or ""),
+        "prior_job_hash": str(receipt.get("prior_job_hash") or ""),
+        "fresh_candidate_hash": fresh_candidate_hash,
+        "fresh_persist_spec_hash": fresh_spec_hash,
+    }
+    core["recovery_id"] = _cron_stable_hash(core)
+    return core
+
+
+def _resolve_resume(
+    parsed: _ParsedCronResume,
+    *,
+    existing_jobs: List[Dict[str, Any]],
+) -> CronResumeResolution:
+    """Classify exact, recoverable drift, and unsafe resume envelopes."""
+    candidate = copy.deepcopy(parsed.job)
+    receipt = parsed.receipt
+    job_id = str(candidate.get("id") or "")
+    matches = [job for job in existing_jobs if str(job.get("id") or "") == job_id]
+    if len(matches) > 1:
+        raise _invalid_resume("resume_job_id_ambiguous")
+    if parsed.operation == "create" and matches:
+        stored_receipt = matches[0].get("creation_governance_receipt")
+        if not (
+            isinstance(stored_receipt, dict)
+            and str(stored_receipt.get("resume_receipt_id") or "")
+            == str(receipt.get("receipt_id") or "")
+        ):
+            raise _invalid_resume("resume_job_id_conflict")
+    if parsed.operation == "update":
+        if len(matches) != 1:
+            raise _invalid_resume("resume_update_target_missing")
+        if matches[0].get("active_run_outcome_claim") is not None:
+            raise CronJobGovernanceError(
+                "Cron job authorization cannot change while a signed run is active."
+            )
+        if parsed.schema_version == _CRON_RESUME_SCHEMA_V2 and (
+            _cron_resume_precondition_hash(matches[0])
+            != str(receipt.get("prior_job_hash") or "")
+        ):
+            raise _invalid_resume("resume_update_precondition_mismatch")
+    if parsed.schema_version == _CRON_RESUME_SCHEMA:
+        return CronResumeResolution(
+            disposition="exact",
+            candidate={
+                **candidate,
+                _CRON_RESUME_RECEIPT_FIELD: copy.deepcopy(receipt),
+            },
         )
-    return {**copy.deepcopy(job), _CRON_RESUME_RECEIPT_FIELD: copy.deepcopy(receipt)}
+
+    selectors = _normalize_skill_list(candidate.get("skill"), candidate.get("skills"))
+    try:
+        normalized_skills, bindings = _resolve_skill_fields(selectors)
+    except Exception as exc:
+        from agent.skill_resolution import SkillResolutionError
+
+        if not isinstance(exc, SkillResolutionError):
+            raise
+        context = _recovery_context(
+            parsed,
+            disposition="blocked_unreconstructable",
+            reason=str(exc.code),
+            fresh_candidate=None,
+        )
+        return CronResumeResolution(
+            disposition="blocked_unreconstructable",
+            candidate=candidate,
+            reason=str(exc.code),
+            recovery_context=context,
+        )
+    fresh = copy.deepcopy(candidate)
+    fresh["skills"] = normalized_skills
+    fresh["skill"] = normalized_skills[0] if normalized_skills else None
+    fresh["skill_bindings"] = bindings
+    fresh_identity = cron_persist_resume_identity(parsed.operation, fresh)
+    if any(
+        fresh_identity[field] != str(receipt.get(field) or "")
+        for field in ("profile_id", "request_id", "request_hash", "source_route_hash")
+    ):
+        raise _invalid_resume("resume_fresh_request_or_route_mismatch")
+    fresh_spec_hash = _cron_persist_spec_hash(parsed.operation, fresh)
+    if fresh_spec_hash == str(receipt.get("persist_spec_hash") or ""):
+        return CronResumeResolution(
+            disposition="exact",
+            candidate={
+                **fresh,
+                _CRON_RESUME_RECEIPT_FIELD: copy.deepcopy(receipt),
+            },
+        )
+    context = _recovery_context(
+        parsed,
+        disposition="fresh_blocked_candidate",
+        reason="resume_persist_spec_drift",
+        fresh_candidate=fresh,
+    )
+    return CronResumeResolution(
+        disposition="recoverable_spec_drift",
+        candidate=fresh,
+        reason="resume_persist_spec_drift",
+        recovery_context=context,
+    )
+
+
+def get_cron_persist_recovery(
+    recovery_id: str, *, profile_home: Optional[Union[str, Path]] = None
+) -> Optional[Dict[str, Any]]:
+    """Return one verified profile-local recovery disposition."""
+    from cron.persist_recovery import get_recovery
+
+    cron_dir = (
+        Path(profile_home).expanduser().resolve(strict=False) / "cron"
+        if profile_home is not None
+        else _current_cron_store().cron_dir
+    )
+    return get_recovery(cron_dir, str(recovery_id or "").strip())
+
+
+def _recovery_store_failure(exc: Exception) -> CronJobGovernanceError:
+    return CronJobGovernanceError(
+        "Cron job persistence needs administrator review "
+        "(resume recovery store unavailable).",
+        decision={
+            "action": "block",
+            "reason": "resume_recovery_store_unavailable",
+            "state": "resume_review_required",
+            "callback_failures": [{
+                "stage": "recovery_store",
+                "exception_class": type(exc).__name__,
+            }],
+        },
+    )
+
+
+def _load_recovery_replay(
+    context: Dict[str, Any], candidate: Dict[str, Any]
+) -> Optional[CronJobGovernanceError]:
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        load_by_rejected_receipt,
+    )
+
+    try:
+        stored = load_by_rejected_receipt(
+            _current_cron_store().cron_dir,
+            str(context["rejected_receipt_id"]),
+        )
+    except CronPersistRecoveryStoreError as exc:
+        raise _recovery_store_failure(exc) from exc
+    if stored is None:
+        return None
+    lineage_fields = (
+        "recovery_id",
+        "disposition",
+        "reason",
+        "profile_id",
+        "operation",
+        "job_id",
+        "request_id",
+        "request_hash",
+        "source_route_hash",
+        "rejected_receipt_id",
+        "rejected_receipt_hash",
+        "rejected_frame_id",
+        "rejected_pending_id",
+        "rejected_candidate_hash",
+        "rejected_persist_spec_hash",
+        "prior_job_hash",
+        "fresh_candidate_hash",
+        "fresh_persist_spec_hash",
+    )
+    if (
+        any(stored.get(field) != context.get(field) for field in lineage_fields)
+        or stored.get("candidate") != candidate
+        or not isinstance(stored.get("decision"), dict)
+    ):
+        raise _invalid_resume("resume_recovery_lineage_conflict")
+    decision = copy.deepcopy(stored["decision"])
+    # Registration and transport are owned by the sealed HAK Frame. Ordinary
+    # replay returns the same pending action without re-emitting its observer.
+    decision.pop("post_persist_effects", None)
+    return CronJobGovernanceError(
+        "Cron job was not saved: stale authorization requires fresh review.",
+        decision=decision,
+    )
+
+
+def _record_recovery_error(
+    resolution: CronResumeResolution,
+    decision: Dict[str, Any],
+) -> CronJobGovernanceError:
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        record_recovery,
+    )
+
+    context = copy.deepcopy(resolution.recovery_context or {})
+    pending = decision.get("pending_action")
+    if resolution.disposition == "recoverable_spec_drift":
+        frame = pending.get("frame") if isinstance(pending, dict) else None
+        pending_id = (
+            str(pending.get("pending_id") or "").strip()
+            if isinstance(pending, dict)
+            else ""
+        )
+        frame_id = (
+            str(frame.get("frame_id") or "").strip()
+            if isinstance(frame, dict)
+            else ""
+        )
+        if (
+            decision.get("action") != "block"
+            or str(decision.get("reason") or "") != "group_source_requires_admin_dm"
+            or not pending_id
+            or not frame_id
+        ):
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(invalid resume recovery governance result)."
+            )
+        context["pending_id"] = pending_id
+        context["frame_id"] = frame_id
+    public_recovery = {
+        key: copy.deepcopy(value)
+        for key, value in context.items()
+        if key not in {"rejected_receipt_hash"}
+    }
+    stored_decision = copy.deepcopy(decision)
+    stored_decision["recovery"] = public_recovery
+    record = {
+        **context,
+        "candidate": copy.deepcopy(resolution.candidate),
+        "decision": stored_decision,
+        "created_at": _hermes_now().isoformat(),
+    }
+    try:
+        record_recovery(_current_cron_store().cron_dir, record)
+    except CronPersistRecoveryStoreError as exc:
+        raise _recovery_store_failure(exc) from exc
+    reason = str(stored_decision.get("reason") or resolution.reason)
+    state = str(stored_decision.get("state") or "resume_review_required")
+    return CronJobGovernanceError(
+        f"Cron job was not saved: {reason} ({state}).",
+        decision=stored_decision,
+    )
+
+
+def _unreconstructable_recovery_error(
+    resolution: CronResumeResolution,
+) -> CronJobGovernanceError:
+    decision = {
+        "action": "block",
+        "reason": resolution.reason or "resume_candidate_unreconstructable",
+        "state": "resume_recovery_unreconstructable",
+    }
+    return _record_recovery_error(resolution, decision)
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -1983,7 +2455,7 @@ def create_job(
         The created job dict
     """
     if governance_resume is not None:
-        candidate = _resume_candidate(governance_resume, operation="create")
+        parsed_resume = _parse_resume_package(governance_resume, operation="create")
         post_effects: List[Dict[str, Any]] = []
         with contextlib.ExitStack() as stack:
             stack.callback(
@@ -1993,13 +2465,36 @@ def create_job(
             )
             stack.enter_context(_jobs_lock(require_cross_process=True))
             jobs = load_jobs(repair_recoverable=False)
+            resolution = _resolve_resume(parsed_resume, existing_jobs=jobs)
+            candidate = resolution.candidate
+            if resolution.recovery_context is not None:
+                replay = _load_recovery_replay(
+                    resolution.recovery_context,
+                    resolution.candidate,
+                )
+                if replay is not None:
+                    raise replay
+            if resolution.disposition == "blocked_unreconstructable":
+                raise _unreconstructable_recovery_error(resolution)
             try:
                 governed, disposition = _apply_cron_persist_governance(
-                    "create", candidate, jobs
+                    "create",
+                    candidate,
+                    jobs,
+                    recovery_context=resolution.recovery_context,
                 )
             except CronJobGovernanceError as exc:
+                if resolution.disposition == "recoverable_spec_drift":
+                    recovery_error = _record_recovery_error(resolution, exc.decision)
+                    post_effects.extend(_post_cron_persist_effects(recovery_error))
+                    raise recovery_error from exc
                 post_effects.extend(_post_cron_persist_effects(exc))
                 raise
+            if resolution.disposition == "recoverable_spec_drift":
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review "
+                    "(resume recovery was not blocked)."
+                )
             if disposition == "already_persisted":
                 return _normalize_job_record(governed)
             if any(
@@ -2269,8 +2764,8 @@ def update_job(
             "(refresh and verification retirement require an otherwise unchanged Job)."
         )
     if governance_resume is not None:
-        candidate = _resume_candidate(governance_resume, operation="update")
-        if str(candidate.get("id") or "") != str(job_id or ""):
+        parsed_resume = _parse_resume_package(governance_resume, operation="update")
+        if str(parsed_resume.job.get("id") or "") != str(job_id or ""):
             raise CronJobGovernanceError(
                 "Cron job persistence needs administrator review "
                 "(resume job id mismatch)."
@@ -2284,6 +2779,17 @@ def update_job(
             )
             stack.enter_context(_jobs_lock(require_cross_process=True))
             jobs = load_jobs(repair_recoverable=False)
+            resolution = _resolve_resume(parsed_resume, existing_jobs=jobs)
+            candidate = resolution.candidate
+            if resolution.recovery_context is not None:
+                replay = _load_recovery_replay(
+                    resolution.recovery_context,
+                    resolution.candidate,
+                )
+                if replay is not None:
+                    raise replay
+            if resolution.disposition == "blocked_unreconstructable":
+                raise _unreconstructable_recovery_error(resolution)
             target = next(
                 (index for index, item in enumerate(jobs) if item.get("id") == job_id),
                 None,
@@ -2296,11 +2802,23 @@ def update_job(
                 )
             try:
                 governed, disposition = _apply_cron_persist_governance(
-                    "update", candidate, jobs
+                    "update",
+                    candidate,
+                    jobs,
+                    recovery_context=resolution.recovery_context,
                 )
             except CronJobGovernanceError as exc:
+                if resolution.disposition == "recoverable_spec_drift":
+                    recovery_error = _record_recovery_error(resolution, exc.decision)
+                    post_effects.extend(_post_cron_persist_effects(recovery_error))
+                    raise recovery_error from exc
                 post_effects.extend(_post_cron_persist_effects(exc))
                 raise
+            if resolution.disposition == "recoverable_spec_drift":
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review "
+                    "(resume recovery was not blocked)."
+                )
             if disposition == "already_persisted":
                 return _normalize_job_record(governed)
             jobs[target] = governed
