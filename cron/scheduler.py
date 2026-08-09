@@ -282,6 +282,32 @@ def _preparse_cron_run_timeout(job: dict) -> object | Optional[float]:
     return parsed if parsed > 0 else _CRON_ENTRY_TIMEOUT_UNSET
 
 
+class _CronScriptCleanup:
+    """Single-owner process cleanup with a completion fence for all callers."""
+
+    def __init__(self, process: subprocess.Popen) -> None:
+        self.process = process
+        self._lock = threading.Lock()
+        self._claimed = False
+        self.done = threading.Event()
+
+    def cleanup(self, *, kill: bool) -> None:
+        with self._lock:
+            owner = not self._claimed
+            if owner:
+                self._claimed = True
+        if not owner:
+            self.done.wait()
+            return
+        try:
+            if kill:
+                _kill_cron_process_group(self.process)
+            else:
+                self.process.wait()
+        finally:
+            self.done.set()
+
+
 class _CronRunControl:
     """Shared deadline, interrupt target, and revocation fence for one run."""
 
@@ -301,6 +327,8 @@ class _CronRunControl:
         self._configured = False
         self._agent = None
         self._script_process: Optional[subprocess.Popen] = None
+        self._script_cleanup: Optional[_CronScriptCleanup] = None
+        self._script_spawn_in_progress = False
         self._interrupted = False
 
         raw_override = job.get("run_timeout_seconds")
@@ -346,24 +374,44 @@ class _CronRunControl:
         with self._condition:
             self._agent = agent
 
-    def attach_script_process(self, process: subprocess.Popen) -> None:
-        """Attach a script process or immediately reap it after revocation."""
+    def begin_script_spawn(self) -> bool:
+        """Fence Popen creation against a concurrent deadline revocation."""
         with self._condition:
-            if not self._interrupted:
-                self._script_process = process
-                return
-        _terminate_cron_process_group(process)
+            if self._interrupted:
+                return False
+            self._script_spawn_in_progress = True
+            return True
 
-    def detach_script_process(self, process: subprocess.Popen) -> None:
+    def cancel_script_spawn(self) -> None:
         with self._condition:
-            if self._script_process is process:
-                self._script_process = None
+            self._script_spawn_in_progress = False
+            self._condition.notify_all()
 
-    def terminate_script_process(self, process: subprocess.Popen) -> None:
+    def attach_script_process(
+        self, process: subprocess.Popen
+    ) -> _CronScriptCleanup:
+        """Publish a Popen and its shared cleanup fence before leaving spawn."""
+        cleanup = _CronScriptCleanup(process)
         with self._condition:
-            if self._script_process is process:
+            self._script_process = process
+            self._script_cleanup = cleanup
+            self._script_spawn_in_progress = False
+            interrupted = self._interrupted
+            self._condition.notify_all()
+        if interrupted:
+            self.cleanup_script_process(cleanup, kill=True)
+        return cleanup
+
+    def cleanup_script_process(
+        self, cleanup: _CronScriptCleanup, *, kill: bool
+    ) -> None:
+        """Run or await the process's one cleanup, then clear published state."""
+        cleanup.cleanup(kill=kill)
+        with self._condition:
+            if self._script_cleanup is cleanup and cleanup.done.is_set():
+                self._script_cleanup = None
                 self._script_process = None
-        _terminate_cron_process_group(process)
+                self._condition.notify_all()
 
     def raise_if_expired(self, stage: str) -> None:
         remaining = self.remaining()
@@ -380,10 +428,11 @@ class _CronRunControl:
         with self._condition:
             self._interrupted = True
             agent = self._agent
-            process = self._script_process
-            self._script_process = None
-        if process is not None:
-            _terminate_cron_process_group(process)
+            while self._script_spawn_in_progress:
+                self._condition.wait()
+            cleanup = self._script_cleanup
+        if cleanup is not None:
+            self.cleanup_script_process(cleanup, kill=True)
         if agent is not None:
             request_hard_interrupt(agent, reason)
 
@@ -2611,64 +2660,28 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
-_CRON_SCRIPT_TERMINATE_GRACE_SECONDS = 0.5
-_CRON_SCRIPT_REAP_SECONDS = 1.0
-
-
-def _terminate_cron_process_group(process: subprocess.Popen) -> None:
-    """Terminate one cron script tree and synchronously reap its parent."""
+def _kill_cron_process_group(process: subprocess.Popen) -> None:
+    """Immediately kill one cron script tree and synchronously reap its parent."""
     if os.name == "nt" and process.poll() is not None:
         return
 
     if os.name == "nt":
         try:
-            process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
-        except (OSError, ValueError):
-            try:
-                process.terminate()
-            except OSError:
-                pass
+            process.kill()
+        except OSError:
+            pass
     else:
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except OSError:
-            try:
-                process.terminate()
-            except OSError:
-                pass
-
-    try:
-        process.wait(timeout=_CRON_SCRIPT_TERMINATE_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        pass
-
-    if os.name == "nt":
-        if process.poll() is None:
             try:
                 process.kill()
             except OSError:
                 pass
-    else:
-        # The parent may have exited on SIGTERM while a descendant remains in
-        # its process group. Probe and kill the group, not just the Popen PID.
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            pass
-        else:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
 
-    try:
-        process.wait(timeout=_CRON_SCRIPT_REAP_SECONDS)
-    except subprocess.TimeoutExpired:
-        logger.error("Cron script PID %s could not be reaped after kill", process.pid)
+    process.wait()
 
 
 def _run_job_script(
@@ -2793,24 +2806,34 @@ def _run_job_script(
         if deadline_limited:
             effective_timeout = max(0.001, remaining)
 
-        process = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=_script_cwd,
-            env=env,
-            **popen_kwargs,
-        )
-        if run_control is not None:
+        if run_control is not None and not run_control.begin_script_spawn():
+            return False, f"Cron total runtime limit expired before script start: {path}"
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=_script_cwd,
+                env=env,
+                **popen_kwargs,
+            )
+        except BaseException:
+            if run_control is not None:
+                run_control.cancel_script_spawn()
+            raise
+        cleanup = (
             run_control.attach_script_process(process)
+            if run_control is not None
+            else None
+        )
         try:
             stdout_raw, stderr_raw = process.communicate(timeout=effective_timeout)
         except subprocess.TimeoutExpired:
-            if run_control is not None:
-                run_control.terminate_script_process(process)
+            if run_control is not None and cleanup is not None:
+                run_control.cleanup_script_process(cleanup, kill=True)
             else:
-                _terminate_cron_process_group(process)
+                _kill_cron_process_group(process)
             try:
                 stdout_raw, stderr_raw = process.communicate(timeout=0.1)
             except subprocess.TimeoutExpired:
@@ -2819,8 +2842,10 @@ def _run_job_script(
                 return False, f"Cron total runtime limit expired during script: {path}"
             return False, f"Script timed out after {script_timeout}s: {path}"
         finally:
-            if run_control is not None:
-                run_control.detach_script_process(process)
+            if run_control is not None and cleanup is not None:
+                run_control.cleanup_script_process(
+                    cleanup, kill=process.poll() is None
+                )
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()

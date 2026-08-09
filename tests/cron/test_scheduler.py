@@ -5,6 +5,7 @@ import itertools
 import json
 import logging
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -1025,50 +1026,118 @@ class TestRunJobSessionPersistence:
             assert elapsed < 2
             stage_release.set()
 
-    def test_no_agent_deadline_kills_process_group_before_late_write(
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX process groups")
+    def test_no_agent_deadline_sigkills_stubborn_process_groups_20_times(
         self, tmp_path
     ):
         import time
 
         scripts_dir = tmp_path / "scripts"
         scripts_dir.mkdir()
-        ready = tmp_path / "child-started"
-        late_write = tmp_path / "late-write"
-        child_code = (
-            "import pathlib,time; "
-            "time.sleep(2); "
-            f"pathlib.Path({str(late_write)!r}).write_text('late')"
-        )
-        (scripts_dir / "spawn_late_writer.py").write_text(
-            "import pathlib,subprocess,sys,time\n"
-            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
-            f"pathlib.Path({str(ready)!r}).write_text('started')\n"
-            "time.sleep(10)\n",
-            encoding="utf-8",
-        )
-        (tmp_path / "config.yaml").write_text(
-            "cron:\n  run_timeout_seconds: 1\n", encoding="utf-8"
-        )
-        job = {
-            "id": "no-agent-process-group-deadline",
-            "prompt": "run",
-            "no_agent": True,
-            "script": "spawn_late_writer.py",
-        }
+        ready_files = []
+        late_writes = []
+        elapsed_runs = []
 
         with patch("cron.scheduler._hermes_home", tmp_path), patch(
             "cron.jobs._apply_cron_runtime_governance", return_value=None
         ):
-            started = time.monotonic()
-            success, _output, _response, error = run_job(job)
-            elapsed = time.monotonic() - started
+            for attempt in range(20):
+                ready = tmp_path / f"child-started-{attempt}"
+                late_write = tmp_path / f"late-write-{attempt}"
+                ready_files.append(ready)
+                late_writes.append(late_write)
+                child_code = (
+                    "import pathlib,signal,time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "time.sleep(0.8); "
+                    f"pathlib.Path({str(late_write)!r}).write_text('late')"
+                )
+                script_name = f"stubborn_group_{attempt}.py"
+                (scripts_dir / script_name).write_text(
+                    "import pathlib,signal,subprocess,sys,time\n"
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                    f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+                    f"pathlib.Path({str(ready)!r}).write_text('started')\n"
+                    "time.sleep(10)\n",
+                    encoding="utf-8",
+                )
+                job = {
+                    "id": f"stubborn-process-group-{attempt}",
+                    "prompt": "run",
+                    "no_agent": True,
+                    "script": script_name,
+                    "run_timeout_seconds": 0.4,
+                }
 
-        assert success is False
-        assert "total runtime limit" in (error or "")
-        assert elapsed < 2.5
-        assert ready.read_text(encoding="utf-8") == "started"
-        time.sleep(1.5)
-        assert not late_write.exists()
+                started = time.monotonic()
+                success, _output, _response, error = run_job(job)
+                elapsed_runs.append(time.monotonic() - started)
+                assert success is False
+                assert "total runtime limit" in (error or "")
+                assert ready.read_text(encoding="utf-8") == "started"
+
+        time.sleep(1.0)
+        assert max(elapsed_runs) < 0.7
+        assert all(path.exists() for path in ready_files)
+        assert not any(path.exists() for path in late_writes)
+
+    def test_watchdog_and_worker_share_script_cleanup_completion_fence(self):
+        import threading
+
+        from cron import scheduler as scheduler_module
+
+        control = scheduler_module._CronRunControl({"id": "cleanup-fence"})
+        process = SimpleNamespace()
+        cleanup_entered = threading.Event()
+        release_cleanup = threading.Event()
+        worker_started = threading.Event()
+        worker_done = threading.Event()
+
+        def blocking_kill(candidate):
+            assert candidate is process
+            with control._condition:
+                assert control._script_process is process
+            cleanup_entered.set()
+            assert release_cleanup.wait(timeout=2)
+
+        assert control.begin_script_spawn() is True
+        cleanup = control.attach_script_process(process)
+
+        def watchdog():
+            control.interrupt("deadline")
+
+        def worker():
+            worker_started.set()
+            control.cleanup_script_process(cleanup, kill=True)
+            worker_done.set()
+
+        with patch(
+            "cron.scheduler._kill_cron_process_group", side_effect=blocking_kill
+        ):
+            watchdog_thread = threading.Thread(target=watchdog)
+            watchdog_thread.start()
+            assert cleanup_entered.wait(timeout=2)
+
+            worker_thread = threading.Thread(target=worker)
+            worker_thread.start()
+            assert worker_started.wait(timeout=2)
+            assert cleanup.done.is_set() is False
+            assert worker_done.is_set() is False
+            with control._condition:
+                assert control._script_process is process
+                assert control._script_cleanup is cleanup
+
+            release_cleanup.set()
+            watchdog_thread.join(timeout=2)
+            worker_thread.join(timeout=2)
+
+        assert not watchdog_thread.is_alive()
+        assert not worker_thread.is_alive()
+        assert cleanup.done.is_set() is True
+        assert worker_done.is_set() is True
+        with control._condition:
+            assert control._script_process is None
+            assert control._script_cleanup is None
 
 
     @contextlib.contextmanager
