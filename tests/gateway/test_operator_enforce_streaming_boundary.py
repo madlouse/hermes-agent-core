@@ -1,6 +1,8 @@
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 from gateway.hooks import HookRegistry
 from gateway import run as gateway_run
 
@@ -98,15 +100,46 @@ def test_operator_enforce_streaming_boundary_ambiguous_armed_channel_buffers_pla
     )
 
 
-def test_operator_enforce_streaming_boundary_missing_or_bad_policy_is_not_armed(tmp_path):
-    assert not gateway_run._operator_enforce_streaming_boundary_source_armed(
-        tmp_path, source()
-    )
+def test_operator_enforce_streaming_boundary_missing_or_bad_policy_fails_closed(tmp_path):
+    assert gateway_run._resolve_output_streaming_modes(
+        tmp_path,
+        source(),
+        streaming_enabled=True,
+        interim_enabled=True,
+        output_screening_required=False,
+    ) == (True, False, False)
 
     write_policy(tmp_path, "not = [valid")
-    assert not gateway_run._operator_enforce_streaming_boundary_source_armed(
-        tmp_path, source()
-    )
+    assert gateway_run._resolve_output_streaming_modes(
+        tmp_path,
+        source(),
+        streaming_enabled=True,
+        interim_enabled=True,
+        output_screening_required=False,
+    ) == (True, False, False)
+
+
+def test_operator_enforce_streaming_boundary_unreadable_policy_fails_closed(
+    tmp_path, monkeypatch
+):
+    policy_path = tmp_path / "channel_policy.toml"
+    policy_path.write_text("operator_enforce_enabled = false\n", encoding="utf-8")
+    original_read_text = gateway_run.Path.read_text
+
+    def unreadable(self, *args, **kwargs):
+        if self == policy_path:
+            raise PermissionError("policy unreadable")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(gateway_run.Path, "read_text", unreadable)
+
+    assert gateway_run._resolve_output_streaming_modes(
+        tmp_path,
+        source(),
+        streaming_enabled=True,
+        interim_enabled=True,
+        output_screening_required=False,
+    ) == (True, False, False)
 
 
 def test_armed_channel_disables_delta_and_interim_consumers_before_creation(tmp_path):
@@ -128,15 +161,31 @@ def test_armed_channel_disables_delta_and_interim_consumers_before_creation(tmp_
         source(platform="feishu", chat_id="grp"),
         streaming_enabled=True,
         interim_enabled=True,
+        output_screening_required=True,
     ) == (True, False, False)
 
 
-def test_unarmed_channel_preserves_configured_streaming_modes(tmp_path):
+def test_mandatory_screening_buffers_even_unarmed_channel(tmp_path):
+    write_policy(tmp_path, "operator_enforce_enabled = false\n")
+
     assert gateway_run._resolve_output_streaming_modes(
         tmp_path,
         source(platform="feishu", chat_id="grp"),
         streaming_enabled=True,
         interim_enabled=True,
+        output_screening_required=True,
+    ) == (True, False, False)
+
+
+def test_non_screened_unarmed_channel_preserves_configured_streaming_modes(tmp_path):
+    write_policy(tmp_path, "operator_enforce_enabled = false\n")
+
+    assert gateway_run._resolve_output_streaming_modes(
+        tmp_path,
+        source(platform="feishu", chat_id="grp"),
+        streaming_enabled=True,
+        interim_enabled=True,
+        output_screening_required=False,
     ) == (False, True, True)
 
 
@@ -248,3 +297,61 @@ def test_operator_enforce_outbound_boundary_holds_armed_reply_without_allow(tmp_
 
     assert allowed is False
     assert content == ""
+
+
+@pytest.mark.parametrize(
+    ("screening_result", "expected_visible"),
+    [
+        ({"decision": "deny", "reason": "unsafe"}, []),
+        (
+            {
+                "decision": "rewrite",
+                "reason": "projected",
+                "content": "safe projection",
+            },
+            ["safe projection"],
+        ),
+    ],
+)
+def test_mandatory_screening_deny_or_rewrite_never_leaks_raw_delta(
+    tmp_path,
+    screening_result,
+    expected_visible,
+):
+    write_policy(tmp_path, "operator_enforce_enabled = false\n")
+    hooks = HookRegistry()
+
+    def screening(_event_type, _context):
+        return screening_result
+
+    hooks._handlers["outbound:before_send"] = [screening]
+    hooks._handler_owners[id(screening)] = "policy-screen"
+    hooks._handler_capabilities[id(screening)] = frozenset({"output-screening"})
+
+    _buffered, stream_deltas, interim_messages = (
+        gateway_run._resolve_output_streaming_modes(
+            tmp_path,
+            source(),
+            streaming_enabled=True,
+            interim_enabled=True,
+            output_screening_required=True,
+        )
+    )
+    visible = []
+    if stream_deltas:
+        visible.append("raw secret delta")
+    if interim_messages:
+        visible.append("raw interim")
+
+    allowed, content, _context = (
+        gateway_run._operator_enforce_outbound_boundary_for_source(
+            tmp_path,
+            source(),
+            "raw secret delta",
+            hooks=hooks,
+        )
+    )
+    if allowed:
+        visible.append(content)
+
+    assert visible == expected_visible

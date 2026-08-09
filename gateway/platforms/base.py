@@ -5789,15 +5789,18 @@ class BasePlatformAdapter(ABC):
         delivery_attempted = False
         delivery_succeeded = False
         last_delivery_result = None
+        confirmed_delivery_result = None
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded, last_delivery_result
+            nonlocal confirmed_delivery_result
             if result is None:
                 return
             last_delivery_result = result
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                confirmed_delivery_result = result
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -6100,6 +6103,7 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -6306,6 +6310,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             await self._notify_media_delivery_failure(
@@ -6335,6 +6340,7 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
@@ -6364,8 +6370,12 @@ class BasePlatformAdapter(ABC):
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
 
-                if outbound_boundary_context is not None and (
-                    delivery_succeeded or _anything_delivered
+                boundary_delivery_result = (
+                    confirmed_delivery_result or last_delivery_result
+                )
+                if (
+                    outbound_boundary_context is not None
+                    and boundary_delivery_result is not None
                 ):
                     try:
                         from gateway.outbound_boundary import (
@@ -6374,7 +6384,7 @@ class BasePlatformAdapter(ABC):
                         )
 
                         boundary_send_payload = send_result_payload(
-                            last_delivery_result
+                            boundary_delivery_result
                         )
                         await outbound_after_send(
                             outbound_hooks,
@@ -6387,7 +6397,9 @@ class BasePlatformAdapter(ABC):
                                     or boundary_send_payload.get("id")
                                     or ""
                                 ),
-                                "success": True,
+                                "success": bool(
+                                    boundary_send_payload.get("success")
+                                ),
                             },
                         )
                     except Exception as boundary_err:
