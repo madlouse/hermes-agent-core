@@ -859,6 +859,7 @@ class TestRunJobSessionPersistence:
             patch("cron.jobs._apply_cron_runtime_governance"),
             patch("cron.scheduler.concurrent.futures.wait", side_effect=pending_once),
             patch("cron.scheduler.time.monotonic", side_effect=advancing_monotonic),
+            patch("cron.scheduler._RUN_CLAIM_HEARTBEAT_SECONDS", 0),
             patch("cron.scheduler.heartbeat_job_run_outcome", heartbeat),
         )
         with self._run_job_patches(tmp_path, extra=extras) as (_db, agent_cls):
@@ -1033,7 +1034,7 @@ class TestRunJobSessionPersistence:
                     "name": "bounded",
                     "prompt": "wait",
                     "max_turns": 7,
-                    "run_timeout_seconds": 0.05,
+                    "run_timeout_seconds": 0.2,
                 }
             )
 
@@ -3438,8 +3439,23 @@ def test_snapshot_without_runtime_lib_stays_on_captured_execution_path(
     scripts.mkdir()
     (scripts / "task.py").write_text("print('live')\n", encoding="utf-8")
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
-    completed = MagicMock(returncode=0, stdout=b"captured\n", stderr=b"")
-    monkeypatch.setattr(scheduler.subprocess, "run", MagicMock(return_value=completed))
+    captured = {}
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+
+        def communicate(self, input=None, timeout=None):
+            captured["input"] = input
+            return b"captured\n", b""
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", FakePopen)
     snapshot = {
         "schema_version": "cron-script-execution-snapshot/v1",
         "script_name": "task.py",
@@ -3460,6 +3476,9 @@ def test_snapshot_without_runtime_lib_stays_on_captured_execution_path(
     success, output = scheduler._run_job_script("task.py", script_snapshot=snapshot)
     assert success is True
     assert output == "captured"
+    assert captured["argv"][0] == captured["kwargs"]["executable"]
+    assert "PYTHONHOME" not in captured["kwargs"]["env"]
+    assert captured["input"] == snapshot["script_bytes"]
 
 
 def test_run_job_routes_no_agent_script_through_optional_snapshot():
@@ -3469,15 +3488,20 @@ def test_run_job_routes_no_agent_script_through_optional_snapshot():
     with patch("cron.jobs._apply_cron_runtime_governance"), \
          patch("cron.scheduler._run_job_script", return_value=(True, "payload")) as script_mock:
         assert scheduler.run_job(job)[0] is True
-        script_mock.assert_called_once_with("task.py", workdir=None)
+        script_mock.assert_called_once()
+        args, kwargs = script_mock.call_args
+        assert args == ("task.py",)
+        assert kwargs["workdir"] is None
+        assert isinstance(kwargs["run_control"], scheduler._CronRunControl)
 
         script_mock.reset_mock()
         assert scheduler.run_job(job, script_snapshot=b"claimed")[0] is True
-        script_mock.assert_called_once_with(
-            "task.py",
-            workdir=None,
-            script_snapshot=b"claimed",
-        )
+        script_mock.assert_called_once()
+        args, kwargs = script_mock.call_args
+        assert args == ("task.py",)
+        assert kwargs["workdir"] is None
+        assert kwargs["script_snapshot"] == b"claimed"
+        assert isinstance(kwargs["run_control"], scheduler._CronRunControl)
 
 
 def test_run_one_job_passes_claimed_script_snapshot_to_executor():

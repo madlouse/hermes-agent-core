@@ -3764,9 +3764,11 @@ def _run_job_script(
                             wait_remaining,
                         )
                     try:
+                        communicate_kwargs = {"timeout": wait_timeout}
+                        if pending_input is not None:
+                            communicate_kwargs["input"] = pending_input
                         stdout_raw, stderr_raw = process.communicate(
-                            input=pending_input,
-                            timeout=wait_timeout,
+                            **communicate_kwargs
                         )
                         break
                     except subprocess.TimeoutExpired:
@@ -4439,7 +4441,7 @@ def _run_job_impl(
     run_claim_owner = (
         str(run_claim.get("by") or "") if isinstance(run_claim, dict) else ""
     )
-    claim_heartbeat_seconds = 60.0
+    claim_heartbeat_seconds = _RUN_CLAIM_HEARTBEAT_SECONDS
     last_claim_heartbeat = time.monotonic()
 
     def _heartbeat_claims_if_due() -> None:
