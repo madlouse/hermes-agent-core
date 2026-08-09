@@ -43,7 +43,7 @@ from cron.jobs import (
 )
 
 
-def _signed_job_revision(job_id="job.receipt", profile_id="profile-custom"):
+def _signed_job_revision(job_id="job.receipt", profile_id="default"):
     return {
         "id": job_id,
         "creation_governance_receipt": {

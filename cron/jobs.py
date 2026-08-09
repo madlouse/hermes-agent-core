@@ -197,7 +197,7 @@ def get_cron_output_dir() -> Path:
 # floor for the derived value so a very short configured timeout can't make the
 # claim expire mid-run.
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
-OPERATIONAL_NOTICE_RECEIPT_LIMIT = 64
+OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS = 300
 
 # The derived TTL is the cron inactivity timeout times this headroom multiplier.
 # A healthy run clears its claim via mark_job_run() long before the TTL; the
@@ -733,6 +733,31 @@ def _active_cron_profile_id() -> str:
     return _active_cron_profile_identity()["profile_id"]
 
 
+def cron_creation_profile_identity(job: Dict[str, Any]) -> Dict[str, str]:
+    """Read Profile authority from the persisted creation receipt and verify it."""
+    receipt = job.get("creation_governance_receipt")
+    job_id = str(job.get("id") or "")
+    if not isinstance(receipt, dict):
+        raise ValueError("cron creation governance receipt is required")
+    profile_id = str(receipt.get("profile_id") or "").strip()
+    if (
+        receipt.get("schema_version") != "cron-creation-governance/v1"
+        or receipt.get("cron_job_id") != job_id
+        or not _safe_run_outcome_identity(profile_id)
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(receipt.get("receipt_id") or "")
+        )
+    ):
+        raise ValueError("invalid cron creation governance profile binding")
+    active = _active_cron_profile_identity()
+    if profile_id != active["profile_id"]:
+        raise ValueError("cron creation governance profile does not match active Profile")
+    asserted_home = str(receipt.get("profile_home_sha256") or "").strip()
+    if asserted_home and asserted_home != active["profile_home_sha256"]:
+        raise ValueError("cron creation governance Profile home does not match active Profile")
+    return active
+
+
 def cron_persist_resume_identity(
     operation: str,
     candidate: Dict[str, Any],
@@ -1208,7 +1233,10 @@ def _cron_run_outcome_claim(
     creation = job.get("creation_governance_receipt")
     if not isinstance(creation, dict):
         return None
-    profile_id = creation.get("profile_id")
+    try:
+        profile_id = cron_creation_profile_identity(job)["profile_id"]
+    except (CronJobGovernanceError, ValueError):
+        return None
     job_id = job.get("id")
     revision = creation.get("receipt_id")
     if (
@@ -4641,12 +4669,24 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
 def claim_operational_notice_delivery(
     job_id: str,
     idempotency_key: str,
+    *,
+    now_epoch: Optional[int] = None,
+    lease_seconds: int = OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
 ) -> Dict[str, Any]:
-    """Durably claim one supplemental notice before its adapter send."""
+    """Claim one notice with cross-process lease recovery and no capacity eviction."""
     key = str(idempotency_key or "").strip()
-    if not key or len(key) > 512:
+    if (
+        not key
+        or len(key) > 512
+        or isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or lease_seconds <= 0
+        or lease_seconds > 86400
+    ):
         return {"status": "invalid_key", "claimed": False}
     started = time.monotonic()
+    epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+    owner = f"operational-notice-owner:{uuid.uuid4().hex}"
     with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
         for job in jobs:
@@ -4656,23 +4696,23 @@ def claim_operational_notice_delivery(
             receipts = dict(receipts) if isinstance(receipts, dict) else {}
             existing = receipts.get(key)
             if isinstance(existing, dict):
-                return {
-                    "status": str(existing.get("status") or "claimed"),
-                    "claimed": False,
-                }
-            if len(receipts) >= OPERATIONAL_NOTICE_RECEIPT_LIMIT:
-                oldest = sorted(
-                    receipts,
-                    key=lambda item: str(receipts[item].get("updated_at") or ""),
-                )
-                trim = len(receipts) - OPERATIONAL_NOTICE_RECEIPT_LIMIT + 1
-                for stale_key in oldest[:trim]:
-                    receipts.pop(stale_key, None)
+                status = str(existing.get("status") or "claimed")
+                lease_expires = existing.get("lease_expires_at_epoch")
+                if status != "claimed" or (
+                    isinstance(lease_expires, int) and epoch < lease_expires
+                ):
+                    return {"status": status, "claimed": False}
+                recovery_count = int(existing.get("recovery_count") or 0) + 1
+            else:
+                recovery_count = 0
             now = _hermes_now().isoformat()
             receipts[key] = {
                 "status": "claimed",
                 "claimed_at": now,
                 "updated_at": now,
+                "claim_owner": owner,
+                "lease_expires_at_epoch": epoch + lease_seconds,
+                "recovery_count": recovery_count,
                 "caller": "cron_scheduler",
                 "parameters": {"idempotency_key": key},
                 "result": {"status": "claimed"},
@@ -4680,7 +4720,12 @@ def claim_operational_notice_delivery(
             }
             job["operational_notice_receipts"] = receipts
             _save_jobs_unlocked(jobs)
-            return {"status": "claimed", "claimed": True}
+            return {
+                "status": "claimed",
+                "claimed": True,
+                "claim_owner": owner,
+                "recovered": recovery_count > 0,
+            }
     return {"status": "job_not_found", "claimed": False}
 
 
@@ -4688,6 +4733,8 @@ def mark_operational_notice_delivery(
     job_id: str,
     idempotency_key: str,
     status: str,
+    *,
+    claim_owner: str,
 ) -> Dict[str, Any]:
     """Record a safe terminal result for an already claimed notice."""
     if status not in {"sent", "failed", "uncertain"}:
@@ -4702,10 +4749,16 @@ def mark_operational_notice_delivery(
             receipts = job.get("operational_notice_receipts")
             if not isinstance(receipts, dict) or not isinstance(receipts.get(key), dict):
                 return {"status": "not_claimed"}
+            if (
+                receipts[key].get("status") != "claimed"
+                or receipts[key].get("claim_owner") != claim_owner
+            ):
+                return {"status": "ownership_lost"}
             receipts[key] = {
                 **receipts[key],
                 "status": status,
                 "updated_at": _hermes_now().isoformat(),
+                "lease_expires_at_epoch": None,
                 "result": {"status": status},
                 "duration_ms": int((time.monotonic() - started) * 1000),
             }

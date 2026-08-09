@@ -224,7 +224,7 @@ class TestMarkRunningJobsInterrupted:
                 "state": "scheduled",
                 "creation_governance_receipt": {
                     "schema_version": "cron-creation-governance/v1",
-                    "profile_id": "profile-test",
+                    "profile_id": "default",
                     "cron_job_id": job_id,
                     "receipt_id": "sha256:" + "1" * 64,
                 },
@@ -459,7 +459,7 @@ class TestRunOneJobHonoursInterruptedFlag:
             "state": "scheduled",
             "creation_governance_receipt": {
                 "schema_version": "cron-creation-governance/v1",
-                "profile_id": "profile-test",
+                "profile_id": "default",
                 "cron_job_id": "dispatch-barrier",
                 "receipt_id": "sha256:" + "4" * 64,
             },
@@ -558,7 +558,7 @@ class TestRunOneJobHonoursInterruptedFlag:
             "repeat": {"times": 1, "completed": 0},
             "creation_governance_receipt": {
                 "schema_version": "cron-creation-governance/v1",
-                "profile_id": "profile-test",
+                "profile_id": "default",
                 "cron_job_id": "lock-order",
                 "receipt_id": "sha256:" + "5" * 64,
             },

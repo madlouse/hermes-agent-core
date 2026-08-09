@@ -13,6 +13,7 @@ import atexit
 import concurrent.futures
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -653,6 +655,7 @@ from cron.jobs import (
     begin_job_run_outcome,
     claim_dispatch,
     claim_operational_notice_delivery,
+    cron_creation_profile_identity,
     get_due_jobs,
     heartbeat_job_run_outcome,
     heartbeat_run_claim,
@@ -709,39 +712,122 @@ def _ready_operational_notice(raw: Any) -> dict | None:
 
 
 def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loop=None) -> str:
-    """Use the normal Cron path once for a final-gated safe admin notice."""
+    """Re-screen one notice, then hand its exact route/content to the outbox sender."""
     notice = _ready_operational_notice(raw_decision)
     if notice is None:
         return "not_available"
-    if str(job.get("profile_id") or "") != notice["profile_id"]:
+    try:
+        profile_id = cron_creation_profile_identity(job)["profile_id"]
+    except Exception:
+        return "profile_unverified"
+    if profile_id != notice["profile_id"]:
         return "profile_mismatch"
+    try:
+        expires_at = datetime.fromisoformat(
+            str(notice["expires_at"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return "notice_expiry_invalid"
+    if datetime.now(timezone.utc) >= expires_at:
+        return "notice_expired"
     try:
         claim = claim_operational_notice_delivery(str(job.get("id") or ""), notice["idempotency_key"])
     except Exception:  # noqa: BLE001 - lack of a durable claim must not send
         return "receipt_unavailable"
     if claim.get("claimed") is not True:
         return str(claim.get("status") or "not_claimed")
-
+    claim_owner = str(claim.get("claim_owner") or "")
     target = notice["target"]
-    supplemental_job = {
-        **job,
-        "deliver": f"{target['transport_id']}:{target['channel_id']}",
-        "_operational_notice_delivery": notice,
-        "_operational_notice_no_wrap": True,
-        "_operational_notice_no_mirror": True,
+    route = {
+        "transport_id": str(target["transport_id"]).lower(),
+        "channel_id": str(target["channel_id"]),
+        "thread_id": "",
     }
     try:
-        error = _deliver_result(supplemental_job, notice["admin_content"], adapters=adapters, loop=loop)
-    except Exception:  # noqa: BLE001 - a post-dispatch fault must not trigger an automatic duplicate
-        try:
-            mark_operational_notice_delivery(str(job.get("id") or ""), notice["idempotency_key"], "uncertain")
-        except Exception:
-            pass
-        return "uncertain"
-    status = "sent" if error is None else "failed"
+        from gateway.outbound_boundary import (
+            build_outbound_context,
+            outbound_before_send_sync,
+        )
+
+        context = build_outbound_context(
+            source_kind="cron",
+            content=notice["admin_content"],
+            platform=route["transport_id"],
+            chat_id=route["channel_id"],
+            profile_id=profile_id,
+            profile_path=str(_get_hermes_home()),
+            producer_id="cron-operational-notice",
+            job_id=str(job.get("id") or ""),
+            target=target,
+            output_screening_required=True,
+            operational_notice_delivery=True,
+            operational_notice=notice,
+            looks_actionable=True,
+        )
+        decision = outbound_before_send_sync(_active_outbound_hooks(), context)
+        if not decision.transmit:
+            mark_operational_notice_delivery(
+                str(job.get("id") or ""),
+                notice["idempotency_key"],
+                "failed",
+                claim_owner=claim_owner,
+            )
+            return "screening_rejected"
+        screened_content = decision.content
+        from gateway.transport_outbox import visible_content_sha256
+        from tools.send_message_tool import send_message_tool
+
+        request_material = json.dumps(
+            {
+                "profile_id": profile_id,
+                "job_id": str(job.get("id") or ""),
+                "idempotency_key": notice["idempotency_key"],
+                "route": route,
+                "content": screened_content,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        request_digest = hashlib.sha256(request_material.encode("utf-8")).hexdigest()
+        transport_request = {
+            "request_id": f"cron-operational-notice:{request_digest}",
+            "profile_id": profile_id,
+            "frame_id": notice["evidence_ref"],
+            "notification_claim_id": notice["idempotency_key"],
+            "decision_route": route,
+            "notification_route": route,
+            "items_content_hash": f"sha256:{request_digest}",
+            "visible_content_sha256": visible_content_sha256(screened_content),
+            "claim_created_at": "1970-01-01T00:00:00+00:00",
+            "claim_expires_at": expires_at.isoformat(timespec="microseconds"),
+        }
+        result = json.loads(
+            send_message_tool(
+                {
+                    "action": "send",
+                    "target": f"{route['transport_id']}:{route['channel_id']}",
+                    "message": screened_content,
+                    "profile_id": profile_id,
+                    "transport_request": transport_request,
+                }
+            )
+        )
+    except Exception:  # A leased claim may recover with the same outbox request id.
+        return "claimed"
+    outcome = str(result.get("transport_outcome") or "")
+    status = "sent" if result.get("success") is True and outcome == "confirmed" else (
+        "failed" if outcome == "definitively_rejected" else "uncertain"
+    )
     try:
-        mark_operational_notice_delivery(str(job.get("id") or ""), notice["idempotency_key"], status)
-    except Exception:  # The durable claim remains, so a replay still cannot duplicate it.
+        terminal = mark_operational_notice_delivery(
+            str(job.get("id") or ""),
+            notice["idempotency_key"],
+            status,
+            claim_owner=claim_owner,
+        )
+        if terminal.get("status") != status:
+            return "ownership_lost"
+    except Exception:
         return "uncertain"
     return status
 
@@ -2088,11 +2174,11 @@ def _cron_delivery_receipt_summary(
         unconfirmed += 1
     required = confirmed + failed + unconfirmed
     status = (
-        "failed"
-        if failed
-        else "unconfirmed"
-        if unconfirmed
-        else "confirmed"
+        "success"
+        if required and confirmed == required
+        else "partial"
+        if confirmed
+        else "failed"
     )
     return {
         "schema_version": "cron-delivery/v1",
@@ -2693,7 +2779,10 @@ def _deliver_result(
                             # adapter_ok=False to fall through if never
                             # dispatched).  send_result is None, so skip the
                             # confirmation/thread-fallback inspection below.
-                            pass
+                            if timed_out:
+                                _append_unconfirmed_delivery_receipt(
+                                    delivery_receipts, kind="payload"
+                                )
                         else:
                             boundary_send_result = send_result
                             # _deliver_to_platform returns either a SendResult
@@ -2733,18 +2822,28 @@ def _deliver_result(
                                     )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
-                            elif (
-                                send_raw_response
-                                and thread_id
-                                and send_raw_response.get("thread_fallback")
-                            ):
-                                requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
-                                msg = (
-                                    f"configured thread_id {requested_thread_id} for "
-                                    f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                            else:
+                                _append_delivery_receipt(
+                                    delivery_receipts,
+                                    send_result,
+                                    kind="payload",
                                 )
-                                logger.warning("Job '%s': %s", job["id"], msg)
-                                delivery_errors.append(msg)
+                                if (
+                                    send_raw_response
+                                    and thread_id
+                                    and send_raw_response.get("thread_fallback")
+                                ):
+                                    requested_thread_id = (
+                                        send_raw_response.get("requested_thread_id")
+                                        or thread_id
+                                    )
+                                    msg = (
+                                        f"configured thread_id {requested_thread_id} for "
+                                        f"{platform_name}:{chat_id} was not found; "
+                                        "delivered without thread_id"
+                                    )
+                                    logger.warning("Job '%s': %s", job["id"], msg)
+                                    delivery_errors.append(msg)
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
@@ -2765,7 +2864,7 @@ def _deliver_result(
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_receipts = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         boundary_media_files,
@@ -2775,6 +2874,8 @@ def _deliver_result(
                         platform=platform,
                         heartbeat=heartbeat,
                     )
+                    if delivery_receipts is not None:
+                        delivery_receipts.extend(media_receipts)
                 elif timed_out and boundary_media_files:
                     msg = (
                         f"{len(boundary_media_files)} media attachment(s) not delivered to "
@@ -2782,6 +2883,10 @@ def _deliver_result(
                     )
                     logger.warning("Job '%s': %s", job["id"], msg)
                     delivery_errors.append(msg)
+                    for _media_path, _is_voice in boundary_media_files:
+                        _append_unconfirmed_delivery_receipt(
+                            delivery_receipts, kind="media"
+                        )
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
@@ -5064,6 +5169,7 @@ def _run_job_impl(
                 _cron_inactivity_limit is None
                 and _cron_run_timeout is None
                 and not _is_oneshot
+                and run_outcome_claim is None
             ):
                 result = _cron_future.result()
             else:
@@ -5084,7 +5190,7 @@ def _run_job_impl(
                     if done:
                         result = _cron_future.result()
                         break
-                    _heartbeat_run_claim_if_due()
+                    _heartbeat_claims_if_due()
                     if (
                         _cron_run_timeout is not None
                         and time.monotonic() - _run_started_at >= _cron_run_timeout

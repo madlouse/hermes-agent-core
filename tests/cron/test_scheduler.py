@@ -15,6 +15,7 @@ import pytest
 from cron.scheduler import (
     SILENT_MARKER,
     _build_job_prompt,
+    _cron_delivery_receipt_summary,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
     _resolve_cron_enabled_toolsets,
@@ -28,6 +29,32 @@ from cron.scheduler import (
 from gateway.hooks import HookRegistry
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+@pytest.mark.parametrize(
+    ("transport_statuses", "aggregate_status"),
+    [
+        (["confirmed"], "success"),
+        (["confirmed", "failed"], "partial"),
+        (["confirmed", "unconfirmed"], "partial"),
+        (["failed"], "failed"),
+        (["unconfirmed"], "failed"),
+    ],
+)
+def test_delivery_producer_and_validator_share_terminal_protocol(
+    transport_statuses, aggregate_status
+):
+    from cron.jobs import _validated_delivery_receipt
+
+    produced = _cron_delivery_receipt_summary(
+        [
+            {"kind": "payload", "required": True, "status": status}
+            for status in transport_statuses
+        ]
+    )
+
+    assert produced["status"] == aggregate_status
+    assert _validated_delivery_receipt(produced) == produced
 
 
 async def _allowing_boundary_handler(_event_type, _context):
@@ -593,6 +620,7 @@ class TestDeliverResultWrapping:
             "deliver": "origin",
             "origin": {"platform": "discord", "chat_id": "9876"},
         }
+        delivery_receipts = []
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
@@ -602,6 +630,7 @@ class TestDeliverResultWrapping:
                 f"Here is TTS\nMEDIA:{media_path}",
                 adapters={Platform.DISCORD: adapter},
                 loop=loop,
+                delivery_receipts=delivery_receipts,
             )
 
         # Text should be sent without the MEDIA tag
@@ -614,6 +643,15 @@ class TestDeliverResultWrapping:
         adapter.send_voice.assert_called_once()
         voice_call = adapter.send_voice.call_args
         assert voice_call[1]["audio_path"] == str(media_path)
+        assert _cron_delivery_receipt_summary(delivery_receipts) == {
+            "schema_version": "cron-delivery/v1",
+            "status": "success",
+            "required_count": 2,
+            "confirmed_count": 2,
+            "failed_count": 0,
+            "unconfirmed_count": 0,
+            "receipts_truncated": False,
+        }
 
     def test_delivery_requires_installed_screening_hook(self, monkeypatch):
         from gateway.config import Platform
@@ -792,6 +830,50 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_agent_execution_heartbeats_run_outcome_claim_while_future_is_active(
+        self, tmp_path
+    ):
+        import concurrent.futures
+
+        real_wait = concurrent.futures.wait
+        wait_calls = 0
+
+        def pending_once(futures, timeout=None):
+            nonlocal wait_calls
+            wait_calls += 1
+            if wait_calls == 1:
+                return set(), set(futures)
+            return real_wait(futures, timeout=timeout)
+
+        monotonic_calls = 0
+
+        def advancing_monotonic():
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            return 0.0 if monotonic_calls == 1 else 61.0
+
+        claim = {"run_id": "cron-run:" + "a" * 32}
+        heartbeat = MagicMock(side_effect=lambda _job_id, current: dict(current))
+        extras = (
+            patch("cron.jobs._apply_cron_runtime_governance"),
+            patch("cron.scheduler.concurrent.futures.wait", side_effect=pending_once),
+            patch("cron.scheduler.time.monotonic", side_effect=advancing_monotonic),
+            patch("cron.scheduler.heartbeat_job_run_outcome", heartbeat),
+        )
+        with self._run_job_patches(tmp_path, extra=extras) as (_db, agent_cls):
+            agent_cls.return_value.get_activity_summary.return_value = {
+                "seconds_since_activity": 0.0
+            }
+            success, _output, final_response, error = run_job(
+                {"id": "agent-heartbeat", "name": "heartbeat", "prompt": "hello"},
+                run_outcome_claim=claim,
+            )
+
+        assert success is True
+        assert final_response == "ok"
+        assert error is None
+        heartbeat.assert_called_with("agent-heartbeat", claim)
 
 
     def test_parallel_jobs_isolate_and_cleanup_authorization_context(
@@ -2392,7 +2474,7 @@ def test_run_one_job_persists_core_terminal_run_outcome_receipt():
     job = {"id": "run-proof-job", "name": "Run proof", "deliver": "local"}
     claim = {
         "schema_version": "cron-run-claim/v1",
-        "profile_id": "profile-custom",
+                "profile_id": "default",
         "job_id": "run-proof-job",
         "job_revision": "sha256:" + "1" * 64,
         "run_id": "cron-run:" + "2" * 32,
@@ -2573,7 +2655,7 @@ def test_run_one_job_real_claim_producer_and_writer_round_trip(tmp_path, monkeyp
         "last_error": None,
         "creation_governance_receipt": {
             "schema_version": "cron-creation-governance/v1",
-            "profile_id": "profile-custom",
+                "profile_id": "default",
             "cron_job_id": "run-proof-real-writer",
             "receipt_id": "sha256:" + "1" * 64,
         },
@@ -2626,7 +2708,7 @@ def test_delivery_heartbeat_keeps_second_owner_out_past_original_expiry(
         "last_error": None,
         "creation_governance_receipt": {
             "schema_version": "cron-creation-governance/v1",
-            "profile_id": "profile-custom",
+                "profile_id": "default",
             "cron_job_id": "delivery-lease",
             "receipt_id": "sha256:" + "1" * 64,
         },
