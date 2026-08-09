@@ -134,6 +134,15 @@ _install_plugin_debug_handler()
 
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
+    # Durable cron create/update authorization. This fires from cron.jobs
+    # inside the jobs.json mutation lock so direct callers cannot bypass it.
+    "pre_cron_job_persist",
+    # Observer-only follow-up for sealed effects from a rejected persistence
+    # decision. cron.jobs dispatches it after releasing the jobs lock.
+    "post_cron_job_persist",
+    # Runtime admission consumer used by governed cron plugins. Its execution
+    # point is supplied by the separate runtime-admission capability.
+    "pre_cron_job_run",
     "post_tool_call",
     "transform_terminal_output",
     "transform_tool_result",
@@ -171,6 +180,10 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Startup transport-history recovery. Callback results may be awaitables;
+    # Gateway awaits them while its existing startup-restore gate is closed.
+    # Kwargs: gateway, adapters, platforms.
+    "gateway_startup_recovery",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -1189,6 +1202,17 @@ class PluginContext:
                 ", ".join(sorted(VALID_HOOKS)),
             )
         self._manager._hooks.setdefault(hook_name, []).append(callback)
+        self._manager._hook_provenance.setdefault(hook_name, []).append({
+            "plugin": self.manifest.key or self.manifest.name,
+            "plugin_name": self.manifest.name,
+            "source": self.manifest.source or "unknown",
+            "callback": getattr(
+                callback,
+                "__qualname__",
+                getattr(callback, "__name__", type(callback).__name__),
+            ),
+            "module": getattr(callback, "__module__", "") or "",
+        })
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1270,6 +1294,7 @@ class PluginManager:
     def __init__(self) -> None:
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._hook_provenance: Dict[str, List[Dict[str, str]]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -1311,6 +1336,7 @@ class PluginManager:
         if force:
             self._plugins.clear()
             self._hooks.clear()
+            self._hook_provenance.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -1945,6 +1971,60 @@ class PluginManager:
                 )
         return results
 
+    def invoke_mandatory_hook(self, hook_name: str, **kwargs: Any) -> Dict[str, Any]:
+        """Invoke every callback and report failures with plugin provenance.
+
+        Ordinary observer hooks intentionally isolate callback failures. A
+        mandatory decision hook cannot use that behavior: silently dropping a
+        failed policy callback could turn an unavailable decision into an
+        authorization. Callers must fail closed whenever ``failures`` is not
+        empty.
+        """
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        callbacks = self._hooks.get(hook_name, [])
+        registered = self._hook_provenance.get(hook_name, [])
+        results: List[Any] = []
+        failures: List[Dict[str, str]] = []
+        for index, callback in enumerate(callbacks):
+            provenance = (
+                dict(registered[index])
+                if index < len(registered)
+                else {
+                    "plugin": "unknown",
+                    "plugin_name": "unknown",
+                    "source": "unknown",
+                    "callback": getattr(
+                        callback,
+                        "__qualname__",
+                        getattr(callback, "__name__", type(callback).__name__),
+                    ),
+                    "module": getattr(callback, "__module__", "") or "",
+                }
+            )
+            try:
+                result = callback(**kwargs)
+                if result is not None:
+                    results.append(result)
+            except Exception as exc:
+                failure = {
+                    **provenance,
+                    "hook": hook_name,
+                    "exception_class": type(exc).__name__,
+                }
+                failures.append(failure)
+                logger.warning(
+                    "Mandatory hook '%s' callback %s from plugin %s raised %s",
+                    hook_name,
+                    provenance["callback"],
+                    provenance["plugin"],
+                    type(exc).__name__,
+                )
+        return {
+            "callback_count": len(callbacks),
+            "results": results,
+            "failures": failures,
+        }
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -2071,6 +2151,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_mandatory_hook(hook_name: str, **kwargs: Any) -> Dict[str, Any]:
+    """Invoke a decision hook without swallowing callback failures."""
+    return get_plugin_manager().invoke_mandatory_hook(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:

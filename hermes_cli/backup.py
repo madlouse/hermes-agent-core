@@ -86,6 +86,10 @@ _EXCLUDED_SUFFIXES = (
 _EXCLUDED_NAMES = {
     "gateway.pid",
     "cron.pid",
+    "transport-outbox.sqlite3",
+    "transport-outbox.sqlite3-wal",
+    "transport-outbox.sqlite3-shm",
+    ".transport-outbox.key",
 }
 
 # File names that ``hermes import`` must never overwrite, matched by basename so
@@ -119,6 +123,10 @@ _IMPORT_SKIP_NAMES = {
     "cron.pid",
     "gateway.lock",
     "processes.json",
+    "transport-outbox.sqlite3",
+    "transport-outbox.sqlite3-wal",
+    "transport-outbox.sqlite3-shm",
+    ".transport-outbox.key",
 }
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.

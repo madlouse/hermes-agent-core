@@ -7,6 +7,7 @@ conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -22,6 +23,56 @@ LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "NO_REPLY",
     "NO REPLY",
 })
+
+_FINAL_RESPONSE_START = re.compile(r"^#{1,3}[ \t]+response\s*$", re.IGNORECASE)
+_FINAL_RESPONSE_END = re.compile(r"^#{1,3}[ \t]+end\s+response\s*$", re.IGNORECASE)
+
+
+def classify_explicit_final_response(response: Any) -> tuple[bool, Any]:
+    """Return whether one closed top-level frame exists and its body.
+
+    Markdown examples inside code fences are ordinary report content and must
+    never become delivery-control markers. A present frame with an empty body
+    is distinct from no frame at all.
+    """
+    if not isinstance(response, str) or not response.strip():
+        return False, response
+    starts: list[tuple[int, int]] = []
+    ends: list[tuple[int, int]] = []
+    fence: str | None = None
+    offset = 0
+    for line in response.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if fence is None:
+            start = _FINAL_RESPONSE_START.fullmatch(body)
+            end = _FINAL_RESPONSE_END.fullmatch(body)
+            if start:
+                starts.append((offset + start.start(), offset + start.end()))
+            elif end:
+                ends.append((offset + end.start(), offset + end.end()))
+        stripped = line.lstrip()
+        fence_match = re.match(r"(```+|~~~+)", stripped)
+        if fence_match:
+            token = fence_match.group(1)
+            if fence is None:
+                fence = token
+            elif (
+                token[0] == fence[0]
+                and len(token) >= len(fence)
+                and not stripped[fence_match.end() :].strip()
+            ):
+                fence = None
+        offset += len(line)
+    if len(starts) != 1 or len(ends) != 1 or ends[0][0] <= starts[0][1]:
+        return False, response
+    body = response[starts[0][1] : ends[0][0]].strip()
+    return True, body
+
+
+def extract_explicit_final_response(response: Any) -> str:
+    """Return a non-empty closed frame body or the historical original text."""
+    frame_present, body = classify_explicit_final_response(response)
+    return body if frame_present and body else response
 
 
 def _canonical_silence_candidate(text: str) -> str:

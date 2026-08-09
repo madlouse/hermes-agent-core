@@ -141,6 +141,13 @@ def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_c
     and cron_rewrites.json."""
     curator = curator_env_with_cron["curator"]
     jobs = curator_env_with_cron["jobs"]
+    for name in ("foo", "foo-umbrella"):
+        skill_dir = curator_env_with_cron["home"] / "skills" / name
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\n",
+            encoding="utf-8",
+        )
 
     # Create a cron job that depends on a soon-to-be-consolidated skill
     job = jobs.create_job(
@@ -202,7 +209,6 @@ def test_curator_rewrites_cron_skills_when_skill_consolidated(curator_env_with_c
     assert "Cron job skill references rewritten" in md
     assert "foo-watcher" in md
     assert "foo-umbrella" in md
-
 
 
 

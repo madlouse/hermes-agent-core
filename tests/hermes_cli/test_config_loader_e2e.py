@@ -158,3 +158,42 @@ def test_writeback_roundtrip_byte_identical_when_unchanged(tmp_path):
     out = _run_py(code, {"HERMES_HOME": str(home)}, tmp_path)
     assert out["identical"] is True
     assert out["parsed"]["custom_prompt"] == "keep ${NOT_SET_VAR}"
+
+
+def test_cron_governance_uses_effective_managed_plugin_config(tmp_path):
+    home = tmp_path / "hermes_home"
+    plugin = home / "plugins" / "hck-tool-boundary"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text("name: hck-tool-boundary\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "plugins:\n  enabled: []\n", encoding="utf-8"
+    )
+
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - hck-tool-boundary\n", encoding="utf-8"
+    )
+
+    code = textwrap.dedent(
+        """
+        import json
+        import os
+        from pathlib import Path
+        from cron.jobs import _cron_creation_governance_expected
+
+        Path(os.environ["E2E_OUT_FILE"]).write_text(json.dumps({
+            "governance_expected": _cron_creation_governance_expected(),
+        }), encoding="utf-8")
+        """
+    )
+    out = _run_py(
+        code,
+        {
+            "HERMES_HOME": str(home),
+            "HERMES_MANAGED_DIR": str(managed_dir),
+        },
+        tmp_path,
+    )
+
+    assert out["governance_expected"] is True

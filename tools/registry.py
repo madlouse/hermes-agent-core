@@ -163,12 +163,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "visibility_fn",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 visibility_fn=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -187,6 +188,9 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Non-cached, exact authorization/ownership gate. Unlike check_fn,
+        # this must never inherit last-good grace across identity changes.
+        self.visibility_fn = visibility_fn
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +407,16 @@ class ToolRegistry:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
 
+    @staticmethod
+    def _entry_visible(entry: ToolEntry) -> bool:
+        if entry.visibility_fn is None:
+            return True
+        try:
+            return bool(entry.visibility_fn())
+        except Exception:
+            logger.exception("Tool %s visibility check failed", entry.name)
+            return False
+
     def _toolset_has_exposable_tools(
         self,
         toolset: str,
@@ -419,6 +433,8 @@ class ToolRegistry:
         for entry in entries:
             if entry.toolset != toolset:
                 continue
+            if not self._entry_visible(entry):
+                continue
             if not entry.check_fn:
                 return True
             if entry.check_fn not in check_results:
@@ -434,13 +450,16 @@ class ToolRegistry:
 
     def get_registered_toolset_names(self) -> List[str]:
         """Return sorted unique toolset names present in the registry."""
-        return sorted({entry.toolset for entry in self._snapshot_entries()})
+        return sorted({
+            entry.toolset for entry in self._snapshot_entries()
+            if self._entry_visible(entry)
+        })
 
     def get_tool_names_for_toolset(self, toolset: str) -> List[str]:
         """Return sorted tool names registered under a given toolset."""
         return sorted(
             entry.name for entry in self._snapshot_entries()
-            if entry.toolset == toolset
+            if entry.toolset == toolset and self._entry_visible(entry)
         )
 
     def register_toolset_alias(self, alias: str, toolset: str) -> None:
@@ -532,6 +551,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        visibility_fn: Callable = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -591,6 +611,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                visibility_fn=visibility_fn,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -694,6 +715,8 @@ class ToolRegistry:
             entry = entries_by_name.get(name)
             if not entry:
                 continue
+            if not self._entry_visible(entry):
+                continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
                     check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
@@ -767,7 +790,7 @@ class ToolRegistry:
           for consistent error format.
         """
         entry = self.get_entry(name)
-        if not entry:
+        if not entry or not self._entry_visible(entry):
             return tool_error(f"Unknown tool: {name}")
         try:
             if entry.is_async:
@@ -804,17 +827,31 @@ class ToolRegistry:
         return DEFAULT_RESULT_SIZE_CHARS
 
     def get_all_tool_names(self) -> List[str]:
-        """Return sorted list of all registered tool names."""
-        return sorted(entry.name for entry in self._snapshot_entries())
+        """Return sorted list of tools visible to the current identity."""
+        return sorted(
+            entry.name for entry in self._snapshot_entries()
+            if self._entry_visible(entry)
+        )
 
     def get_schema(self, name: str) -> Optional[dict]:
-        """Return a tool's raw schema dict, bypassing check_fn filtering.
+        """Return a visible tool's identity-resolved raw schema.
 
-        Useful for token estimation and introspection where availability
-        doesn't matter — only the schema content does.
+        Health ``check_fn`` filtering remains bypassed for token estimation,
+        but exact visibility/ownership is always enforced.
         """
         entry = self.get_entry(name)
-        return entry.schema if entry else None
+        if not entry or not self._entry_visible(entry):
+            return None
+        schema = {**entry.schema, "name": entry.name}
+        if entry.dynamic_schema_overrides is not None:
+            try:
+                overrides = entry.dynamic_schema_overrides()
+                if isinstance(overrides, dict):
+                    schema.update(overrides)
+            except Exception:
+                logger.exception("Tool %s dynamic schema resolution failed", name)
+                return None
+        return schema
 
     def get_toolset_for_tool(self, name: str) -> Optional[str]:
         """Return the toolset a tool belongs to, or None."""
@@ -827,8 +864,11 @@ class ToolRegistry:
         return (entry.emoji if entry and entry.emoji else default)
 
     def get_tool_to_toolset_map(self) -> Dict[str, str]:
-        """Return ``{tool_name: toolset_name}`` for every registered tool."""
-        return {entry.name: entry.toolset for entry in self._snapshot_entries()}
+        """Return the current identity's visible tool-to-toolset map."""
+        return {
+            entry.name: entry.toolset for entry in self._snapshot_entries()
+            if self._entry_visible(entry)
+        }
 
     def is_toolset_available(self, toolset: str) -> bool:
         """Check if a toolset has at least one exposable tool.
@@ -842,7 +882,9 @@ class ToolRegistry:
     def check_toolset_requirements(self) -> Dict[str, bool]:
         """Return ``{toolset: available_bool}`` for every toolset."""
         entries, _ = self._snapshot_state()
-        toolsets = sorted({entry.toolset for entry in entries})
+        toolsets = sorted({
+            entry.toolset for entry in entries if self._entry_visible(entry)
+        })
         return {
             toolset: self._toolset_has_exposable_tools(toolset, entries)
             for toolset in toolsets
@@ -853,6 +895,8 @@ class ToolRegistry:
         toolsets: Dict[str, dict] = {}
         entries, _ = self._snapshot_state()
         for entry in entries:
+            if not self._entry_visible(entry):
+                continue
             ts = entry.toolset
             if ts not in toolsets:
                 toolsets[ts] = {
@@ -873,6 +917,8 @@ class ToolRegistry:
         result: Dict[str, dict] = {}
         entries, toolset_checks = self._snapshot_state()
         for entry in entries:
+            if not self._entry_visible(entry):
+                continue
             ts = entry.toolset
             if ts not in result:
                 result[ts] = {
@@ -894,8 +940,9 @@ class ToolRegistry:
         available = []
         unavailable = []
         entries, _ = self._snapshot_state()
-        for ts in sorted({entry.toolset for entry in entries}):
-            ts_entries = [entry for entry in entries if entry.toolset == ts]
+        visible_entries = [entry for entry in entries if self._entry_visible(entry)]
+        for ts in sorted({entry.toolset for entry in visible_entries}):
+            ts_entries = [entry for entry in visible_entries if entry.toolset == ts]
             if self._toolset_has_exposable_tools(ts, entries):
                 available.append(ts)
             else:

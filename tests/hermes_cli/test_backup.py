@@ -133,12 +133,56 @@ class TestShouldExclude:
         # The .db itself is still included (and safe-copied separately)
         assert not _should_exclude(Path("state.db"))
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "transport-outbox.sqlite3",
+            "transport-outbox.sqlite3-wal",
+            "transport-outbox.sqlite3-shm",
+            ".transport-outbox.key",
+        ],
+    )
+    def test_excludes_transport_outbox_authority_at_any_profile_depth(self, name):
+        from hermes_cli.backup import _should_exclude
+
+        assert _should_exclude(Path(name))
+        assert _should_exclude(Path("profiles") / "atlas" / name)
+
 
 # ---------------------------------------------------------------------------
 # Backup tests
 # ---------------------------------------------------------------------------
 
 class TestBackup:
+
+    def test_all_full_backup_paths_exclude_transport_outbox_authority(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        private_names = {
+            "transport-outbox.sqlite3",
+            "transport-outbox.sqlite3-wal",
+            "transport-outbox.sqlite3-shm",
+            ".transport-outbox.key",
+        }
+        for parent in (hermes_home, hermes_home / "profiles" / "coder"):
+            for name in private_names:
+                (parent / name).write_bytes(b"private authority")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        from hermes_cli import backup as backup_mod
+
+        ordinary = tmp_path / "ordinary.zip"
+        backup_mod.run_backup(Namespace(output=str(ordinary)))
+        preflight = tmp_path / "preflight.zip"
+        assert backup_mod._write_full_zip_backup(preflight, hermes_home) == preflight
+
+        for archive in (ordinary, preflight):
+            with zipfile.ZipFile(archive) as zf:
+                assert not (private_names & {Path(name).name for name in zf.namelist()})
 
 
     def test_db_snapshots_staged_beside_output_zip(self, tmp_path, monkeypatch):
@@ -564,6 +608,34 @@ class TestImportEdgeCases:
 
         assert (hermes_home / "config.yaml").exists()
         assert (hermes_home / "sessions" / "s0599.json").exists()
+
+    def test_import_never_restores_transport_outbox_authority(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        private_names = [
+            "transport-outbox.sqlite3",
+            "transport-outbox.sqlite3-wal",
+            "transport-outbox.sqlite3-shm",
+            ".transport-outbox.key",
+        ]
+        files = {"config.yaml": "model: test\n"}
+        for name in private_names:
+            files[name] = b"forged authority"
+            files[f"profiles/atlas/{name}"] = b"forged profile authority"
+        zip_path = tmp_path / "authority.zip"
+        self._make_backup_zip(zip_path, files)
+
+        from hermes_cli.backup import run_import
+
+        run_import(Namespace(zipfile=str(zip_path), force=True))
+
+        for name in private_names:
+            assert not (hermes_home / name).exists()
+            assert not (hermes_home / "profiles" / "atlas" / name).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1242,7 +1314,6 @@ class TestMemoryProviderExternalPaths:
         assert (restored.stat().st_mode & 0o777) == 0o600
         # External state did NOT leak into HERMES_HOME.
         assert not (hermes_home / "_external").exists()
-
 
 
 

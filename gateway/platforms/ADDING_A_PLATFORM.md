@@ -143,6 +143,17 @@ def check_<platform>_requirements() -> bool:
 - Implement reconnection with exponential backoff + jitter for streaming connections
 - Set `MAX_MESSAGE_LENGTH` if the platform has message size limits
 
+### Optional history recovery
+
+Adapters with an authoritative server-side history API can expose
+`fetch_recovery_history(...)`, `recovery_event(...)`, and
+`commit_recovery_history(...)`. Core owns `RecoveryDeliveryContext`, routes the
+event through the ordinary screened final-send path, and completes recovery
+only after every final `SendResult` succeeds. The adapter maps
+`hermes_delivery_idempotency_key` plus `hermes_delivery_part` to a stable native
+request ID. Telegram, Discord, and other IM adapters can adopt this contract
+without adding transport-specific state or branches to Core.
+
 ---
 
 ## 2. Platform Enum (`gateway/config.py`)

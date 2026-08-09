@@ -59,7 +59,11 @@ def test_slack_send_to_platform_routes_through_send_via_adapter(monkeypatch):
             )
         )
 
-    assert result == {"success": True, "message_id": "live-ts"}
+    assert result == {
+        "success": True,
+        "message_id": "live-ts",
+        "transport_outcome": "confirmed",
+    }
     live_send.assert_awaited_once()
     call = live_send.await_args
     assert call.args[0] == Platform.SLACK

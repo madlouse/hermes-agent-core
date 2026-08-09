@@ -194,6 +194,7 @@ class TestSigkillFallback:
     @pytest.mark.parametrize(
         "module_path, line_pattern",
         [
+            ("cron.scheduler", 'getattr(signal, "SIGKILL", signal.SIGTERM)'),
             ("hermes_cli.kanban_db", 'getattr(signal, "SIGKILL", signal.SIGTERM)'),
         ],
     )

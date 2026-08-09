@@ -8,7 +8,12 @@ Each adapter handles:
 - Message formatting and media handling
 """
 
-from .base import BasePlatformAdapter, MessageEvent, SendResult
+from .base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    RecoveryDeliveryContext,
+    SendResult,
+)
 
 # QQAdapter and YuanbaoAdapter were previously imported eagerly here, but
 # nothing in the codebase consumes ``from gateway.platforms import
@@ -25,6 +30,7 @@ from .base import BasePlatformAdapter, MessageEvent, SendResult
 __all__ = [
     "BasePlatformAdapter",
     "MessageEvent",
+    "RecoveryDeliveryContext",
     "SendResult",
     "QQAdapter",
     "YuanbaoAdapter",

@@ -434,15 +434,30 @@ def _inject_session_context_env(env: dict) -> None:
     """
     try:
         from gateway.session_context import (
+            _CRON_AUTH_VAR_MAP,
             _UNSET,
             _VAR_MAP,
+            get_session_env,
             session_context_engaged,
         )
     except Exception:
         return
 
+    # Cron authorization is never a subprocess capability. Strip both ambient
+    # process values and caller-supplied overrides before bridging ordinary
+    # session routing metadata.
+    for var_name in _CRON_AUTH_VAR_MAP:
+        env.pop(var_name, None)
+
     _engaged = session_context_engaged()
     for var_name, var in _VAR_MAP.items():
+        if var_name == "HERMES_CRON_SESSION":
+            value = get_session_env(var_name, "")
+            if value:
+                env[var_name] = value
+            else:
+                env.pop(var_name, None)
+            continue
         value = var.get()
         if value is not _UNSET:
             # Explicitly bound (including "") — authoritative for this task.

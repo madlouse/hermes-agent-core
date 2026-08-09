@@ -76,8 +76,15 @@ class TestStandaloneDeliverySkipsDuringShutdown:
             "origin": {"platform": "telegram", "chat_id": "123"},
         }
         send_mock = AsyncMock(return_value={"success": True})
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="daily report body",
+            raw={"decision": "allow"},
+        )
         with patch("gateway.config.load_gateway_config", return_value=self._telegram_cfg()), \
              patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
              patch("sys.is_finalizing", return_value=True):
             result = _deliver_result(job, "daily report body")
 
@@ -97,8 +104,16 @@ class TestStandaloneDeliverySkipsDuringShutdown:
             "origin": {"platform": "telegram", "chat_id": "123"},
         }
         send_mock = AsyncMock(return_value={"success": True})
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="daily report body",
+            raw={"decision": "allow"},
+        )
         with patch("gateway.config.load_gateway_config", return_value=self._telegram_cfg()), \
              patch("tools.send_message_tool._send_to_platform", new=send_mock), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("gateway.outbound_boundary.outbound_after_send_sync"), \
              patch("sys.is_finalizing", return_value=False):
             result = _deliver_result(job, "daily report body")
 
@@ -118,5 +133,3 @@ class TestSourceGuardrail:
     def test_helper_defined(self, source):
         assert "def _interpreter_shutting_down(" in source
         assert "#58720" in source
-
-

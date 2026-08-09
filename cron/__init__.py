@@ -17,6 +17,9 @@ duplicate execution if multiple processes overlap.
 
 from cron.jobs import (
     create_job,
+    cron_persist_recovery_dispatch_key,
+    cron_persist_resume_identity,
+    get_cron_persist_recovery,
     get_job,
     list_jobs,
     remove_job,
@@ -30,6 +33,9 @@ from cron.scheduler import tick
 
 __all__ = [
     "create_job",
+    "cron_persist_recovery_dispatch_key",
+    "cron_persist_resume_identity",
+    "get_cron_persist_recovery",
     "get_job", 
     "list_jobs",
     "remove_job",

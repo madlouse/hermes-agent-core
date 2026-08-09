@@ -391,7 +391,14 @@ def test_compute_host_turn_end_updates_metadata_mirror(monkeypatch):
         assert info["tools"] == {"core": ["terminal"]}
         assert info["usage"]["total"] == 140
         assert "credential_warning" not in info
-        assert emitted[-1] == ("session.info", "iso-sid", info)
+        event, emitted_sid, emitted_info = emitted[-1]
+        assert (event, emitted_sid) == ("session.info", "iso-sid")
+        assert emitted_info["model"] == "host-model"
+        assert emitted_info["provider"] == "host-provider"
+        assert emitted_info["system_prompt"] == "host system prompt"
+        assert emitted_info["tools"] == {"core": ["terminal"]}
+        assert emitted_info["usage"]["total"] == 140
+        assert emitted_info["stored_session_id"] == "rotated-session-key"
     finally:
         server._sessions.pop("iso-sid", None)
 

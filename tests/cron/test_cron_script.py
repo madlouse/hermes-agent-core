@@ -152,22 +152,30 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        class FakePopen:
+            returncode = 0
+
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+
+            def communicate(self, timeout=None):
+                return "ok\n", ""
+
+            def poll(self):
+                return 0
 
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakePopen)
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(base_python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == 0x08000000
+        assert captured["kwargs"]["creationflags"] == 0x08000200
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
@@ -182,13 +190,21 @@ class TestRunJobScript:
 
         captured = {}
 
-        def fake_run(argv, **kwargs):
-            captured["argv"] = argv
-            captured["kwargs"] = kwargs
-            return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        class FakePopen:
+            returncode = 0
+
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+
+            def communicate(self, timeout=None):
+                return "ok\n", ""
+
+            def poll(self):
+                return 0
 
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakePopen)
 
         success, output = _run_job_script("probe.py")
 
@@ -197,8 +213,277 @@ class TestRunJobScript:
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
+        assert captured["kwargs"]["start_new_session"] is True
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
+
+    def test_windows_cleanup_uses_taskkill_for_entire_process_tree(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        captured = {}
+
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                raise AssertionError("successful taskkill must not kill parent twice")
+
+            def wait(self):
+                captured["waited"] = True
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
+        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            sched_mod.os,
+            "killpg",
+            lambda *args: (_ for _ in ()).throw(
+                AssertionError("Windows must not call os.killpg")
+            ),
+        )
+
+        sched_mod._kill_cron_process_group(FakeProcess())
+
+        assert captured["args"] == [
+            "taskkill", "/PID", "12345", "/T", "/F",
+        ]
+        assert captured["kwargs"]["timeout"] == 10
+        assert captured["kwargs"]["creationflags"] == 0x08000000
+        assert captured["waited"] is True
+
+    def test_windows_cleanup_falls_back_when_taskkill_is_unavailable(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        calls = {"poll": 0, "kill": 0, "wait": 0}
+
+        class FakeChild:
+            pid = 54322
+
+            def suspend(self):
+                calls["child_suspend"] = calls.get("child_suspend", 0) + 1
+
+            def children(self, recursive=False):
+                assert recursive is False
+                return []
+
+            def kill(self):
+                calls["child_kill"] = calls.get("child_kill", 0) + 1
+
+        child = FakeChild()
+
+        class FakePsutilParent:
+            def __init__(self, pid):
+                assert pid == 54321
+                self.pid = pid
+
+            def suspend(self):
+                calls["parent_suspend"] = calls.get("parent_suspend", 0) + 1
+
+            def children(self, recursive=False):
+                assert recursive is False
+                return [child]
+
+        class FakeProcess:
+            pid = 54321
+
+            def poll(self):
+                calls["poll"] += 1
+                return None
+
+            def kill(self):
+                calls["kill"] += 1
+
+            def wait(self):
+                calls["wait"] += 1
+
+        def missing_taskkill(*args, **kwargs):
+            raise FileNotFoundError(2, "taskkill not found")
+
+        monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(sched_mod.subprocess, "run", missing_taskkill)
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                Process=FakePsutilParent,
+                wait_procs=lambda children, timeout: (children, []),
+            ),
+        )
+
+        sched_mod._kill_cron_process_group(FakeProcess())
+
+        assert calls == {
+            "poll": 1,
+            "kill": 1,
+            "wait": 1,
+            "parent_suspend": 1,
+            "child_suspend": 1,
+            "child_kill": 1,
+        }
+
+    def test_windows_cleanup_fails_closed_when_a_descendant_survives(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        class FakeChild:
+            pid = 65432
+
+            def suspend(self):
+                pass
+
+            def children(self, recursive=False):
+                assert recursive is False
+                return []
+
+            def kill(self):
+                pass
+
+        child = FakeChild()
+
+        class FakePsutilParent:
+            def __init__(self, pid):
+                assert pid == 65431
+                self.pid = pid
+
+            def suspend(self):
+                pass
+
+            def children(self, recursive=False):
+                assert recursive is False
+                return [child]
+
+        class FakeProcess:
+            pid = 65431
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                pass
+
+            def wait(self):
+                pass
+
+        monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            sched_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr="denied"),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                Process=FakePsutilParent,
+                wait_procs=lambda children, timeout: ([], children),
+            ),
+        )
+
+        cleanup = sched_mod._CronScriptCleanup(FakeProcess())
+        with pytest.raises(RuntimeError, match="cleanup is unproven"):
+            cleanup._perform(kill=True)
+
+        assert cleanup.completed is False
+        assert isinstance(cleanup.error, RuntimeError)
+
+    def test_windows_cleanup_freezes_each_generation_before_kill(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        calls = []
+
+        class FakeLateChild:
+            pid = 76543
+
+            def suspend(self):
+                calls.append("late:suspend")
+
+            def children(self, recursive=False):
+                return []
+
+            def kill(self):
+                calls.append("late:kill")
+
+        late_child = FakeLateChild()
+
+        class FakeChild:
+            pid = 76542
+
+            def suspend(self):
+                calls.append("child:suspend")
+
+            def children(self, recursive=False):
+                return [late_child]
+
+            def kill(self):
+                calls.append("child:kill")
+
+        child = FakeChild()
+
+        class FakePsutilParent:
+            pid = 76541
+
+            def __init__(self, pid):
+                assert pid == self.pid
+
+            def suspend(self):
+                calls.append("parent:suspend")
+
+            def children(self, recursive=False):
+                return [child]
+
+        class FakeProcess:
+            pid = 76541
+
+            def poll(self):
+                return None
+
+            def kill(self):
+                calls.append("parent:kill")
+
+            def wait(self):
+                calls.append("parent:wait")
+
+        monkeypatch.setattr(sched_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            sched_mod.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=1, stderr="denied"),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "psutil",
+            SimpleNamespace(
+                Process=FakePsutilParent,
+                wait_procs=lambda processes, timeout: (processes, []),
+            ),
+        )
+
+        sched_mod._kill_cron_process_group(FakeProcess())
+
+        assert calls == [
+            "parent:suspend",
+            "child:suspend",
+            "late:suspend",
+            "late:kill",
+            "child:kill",
+            "parent:kill",
+            "parent:wait",
+        ]
 
 
 class TestBuildJobPromptWithScript:

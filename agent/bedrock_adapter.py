@@ -88,11 +88,27 @@ def _require_boto3():
     return boto3
 
 
-def _get_bedrock_runtime_client(region: str):
+def _get_bedrock_runtime_client(
+    region: str, *, timeout_seconds: float | None = None
+):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
     Uses the default AWS credential chain (env vars → profile → instance role).
     """
+    if timeout_seconds is not None:
+        from botocore.config import Config
+
+        bounded_timeout = max(0.001, float(timeout_seconds))
+        boto3 = _require_boto3()
+        return boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(
+                connect_timeout=bounded_timeout,
+                read_timeout=bounded_timeout,
+                retries={"max_attempts": 0},
+            ),
+        )
     if region not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
         _bedrock_runtime_client_cache[region] = boto3.client(

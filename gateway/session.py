@@ -216,6 +216,11 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Internal and deliberately excluded from to_dict/from_dict. Recovered
+    # history turns must produce one receipt-bearing final delivery instead of
+    # token/interim sends outside the completion boundary.
+    force_final_delivery: bool = False
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -370,12 +375,11 @@ def _slack_tools_loaded() -> bool:
          signal (post-connection, post include/exclude filtering) rather
          than just what's listed in config.yaml -- a configured-but-
          unconnected or zero-tool MCP server must not claim capability.
-         Named MCP servers are process-wide (one gateway connects each MCP
-         server once, not per-session), so this check is intentionally NOT
-         scoped further per-session -- unlike the earlier get_all_tool_names()
-         approach this replaces, which conflated ALL built-in tool names
-         process-wide, this only inspects the small, purpose-built MCP
-         server-name map.
+         The registry filters that signal through the active Profile/config
+         owner, so a Slack MCP connected for another Profile cannot grant this
+         session Slack capability. Unlike the earlier get_all_tool_names()
+         approach this replaces, this only inspects the small, purpose-built
+         MCP server-name map.
 
     Returns False (safe default — keeps the stale-API disclaimer) on any
     error so a bad config can never silently promise tools the agent lacks.

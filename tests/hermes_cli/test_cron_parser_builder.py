@@ -25,8 +25,8 @@ def _build():
 
 def test_cron_subactions_present():
     parser = _build()
-    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "tick"):
-        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "tick")
+    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "migrate-skill-bindings", "tick"):
+        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "migrate-skill-bindings", "tick")
                                else ["cron", action, "jobid"] if action in ("pause", "resume", "run", "remove", "edit")
                                else ["cron", "create", "30m"])
         assert ns.command == "cron"
@@ -41,6 +41,29 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_edit_governance_controls_are_explicit():
+    parser = _build()
+    assert parser.parse_args(["cron", "edit", "j"]).refresh_governance is False
+    assert parser.parse_args([
+        "cron", "edit", "j", "--refresh-governance"
+    ]).refresh_governance is True
+
+    args = parser.parse_args([
+        "cron",
+        "edit",
+        "j",
+        "--retire-verification-profile-id",
+        "default",
+        "--retire-verification-job-revision",
+        "sha256:" + "1" * 64,
+        "--retire-verification-command-sha256",
+        "sha256:" + "2" * 64,
+    ])
+    assert args.retire_verification_profile_id == "default"
+    assert args.retire_verification_job_revision == "sha256:" + "1" * 64
+    assert args.retire_verification_command_sha256 == "sha256:" + "2" * 64
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.
@@ -48,3 +71,12 @@ def test_cron_accept_hooks_flag_on_run_and_tick():
     assert ns.accept_hooks is True
     ns2 = parser.parse_args(["cron", "tick", "--accept-hooks"])
     assert ns2.accept_hooks is True
+
+
+def test_cron_skill_binding_migration_flags():
+    parser = _build()
+    ns = parser.parse_args(
+        ["cron", "migrate-skill-bindings", "--apply", "--json"]
+    )
+    assert ns.apply is True
+    assert ns.json is True

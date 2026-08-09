@@ -27,14 +27,14 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("save", jid))
         return f"/tmp/{jid}.txt"
 
-    def fake_deliver(job, content, adapters=None, loop=None):
+    def fake_deliver(job, content, adapters=None, loop=None, **_kwargs):
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(jid, ok, err=None, delivery_error=None, **_kwargs):
         calls.append(("mark", jid, ok))
 
-    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "_run_job_result", fake_run_job)
     monkeypatch.setattr(s, "save_job_output", fake_save)
     monkeypatch.setattr(s, "_deliver_result", fake_deliver)
     monkeypatch.setattr(s, "mark_job_run", fake_mark)
@@ -90,7 +90,7 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
         scope_during_run["base_url"] = ss.get_secret("OPENROUTER_BASE_URL")
         return (True, "out", "final", None)
 
-    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "_run_job_result", fake_run_job)
     monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
     monkeypatch.setattr(s, "_deliver_result", lambda *a, **k: None)
     monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)

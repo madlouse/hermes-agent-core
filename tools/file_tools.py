@@ -672,6 +672,27 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+_hermes_env_resolved: str | None = None
+_hermes_env_resolved_loaded = False
+
+
+def _get_hermes_env_resolved() -> str | None:
+    """Return the resolved absolute path of the Hermes .env file (cached)."""
+    global _hermes_env_resolved, _hermes_env_resolved_loaded
+    if _hermes_env_resolved_loaded:
+        return _hermes_env_resolved
+    _hermes_env_resolved_loaded = True
+    try:
+        from hermes_constants import get_hermes_home
+        _hermes_env_resolved = str((get_hermes_home() / ".env").resolve())
+    except Exception:
+        try:
+            _hermes_env_resolved = str(Path("~/.hermes/.env").expanduser().resolve())
+        except Exception:
+            _hermes_env_resolved = None
+    return _hermes_env_resolved
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -698,6 +719,17 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+        )
+    # The Hermes .env carries platform credentials and config-path overrides;
+    # a corrupted entry silently disables platforms on the next restart, and a
+    # prompt-injected agent could redirect credentials. Same protection as the
+    # config file above.
+    hermes_env = _get_hermes_env_resolved()
+    if hermes_env and (resolved == hermes_env or normalized == hermes_env):
+        return (
+            f"Refusing to write to Hermes .env file: {filepath}\n"
+            "Agent cannot modify security-sensitive configuration. "
+            "Edit it directly or use 'hermes secrets' instead."
         )
     return None
 

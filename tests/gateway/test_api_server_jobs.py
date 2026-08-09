@@ -139,6 +139,29 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
+    @pytest.mark.asyncio
+    async def test_create_resume_forwards_only_opaque_package(self, adapter):
+        app = _create_app(adapter)
+        resume = {"schema_version": "cron-persist-resume/v1", "opaque": True}
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": ["must", "not", "parse"],
+                    "schedule": {"must": "not parse"},
+                    "prompt": ["must", "not", "parse"],
+                    "governance_resume": resume,
+                })
+
+        assert resp.status == 200
+        assert mock_create.call_args.kwargs == {
+            "prompt": None,
+            "schedule": "",
+            "governance_resume": resume,
+        }
+
 
     @pytest.mark.asyncio
     async def test_create_job_prompt_too_long(self, adapter):
@@ -184,6 +207,70 @@ class TestGetJob:
 # ---------------------------------------------------------------------------
 
 class TestUpdateJob:
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            (
+                {
+                    "governance_resume": {"schema_version": "cron-persist-resume/v1"},
+                    "name": ["must", "not", "parse"],
+                    "prompt": {"must": "not parse"},
+                },
+                {
+                    "governance_resume": {"schema_version": "cron-persist-resume/v1"},
+                    "governance_refresh": False,
+                    "deprecated_verification_retirement": None,
+                },
+            ),
+            (
+                {"governance_refresh": True},
+                {
+                    "governance_resume": None,
+                    "governance_refresh": True,
+                    "deprecated_verification_retirement": None,
+                },
+            ),
+            (
+                {"deprecated_verification_retirement": {"schema_version": "cron-verification-retirement/v1"}},
+                {
+                    "governance_resume": None,
+                    "governance_refresh": False,
+                    "deprecated_verification_retirement": {"schema_version": "cron-verification-retirement/v1"},
+                },
+            ),
+        ],
+    )
+    async def test_update_forwards_governance_controls_separately(
+        self, adapter, body, expected
+    ):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(f"/api/jobs/{VALID_JOB_ID}", json=body)
+
+        assert resp.status == 200
+        assert mock_update.call_args.args == (VALID_JOB_ID, {})
+        assert mock_update.call_args.kwargs == expected
+
+    @pytest.mark.asyncio
+    async def test_update_rejects_truthy_non_boolean_governance_refresh(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_update"
+            ) as mock_update:
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"governance_refresh": "false"},
+                )
+
+        assert resp.status == 400
+        mock_update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
@@ -409,9 +496,10 @@ class TestCronUnavailable:
         captured = {}
         updated_job = {**SAMPLE_JOB, "name": "updated-name"}
 
-        def _plain_update(job_id, updates):
+        def _plain_update(job_id, updates, **governance):
             captured["job_id"] = job_id
             captured["updates"] = updates
+            captured["governance"] = governance
             return updated_job
 
         async with TestClient(TestServer(app)) as cli:
@@ -427,6 +515,11 @@ class TestCronUnavailable:
                 assert data["job"] == updated_job
                 assert captured["job_id"] == VALID_JOB_ID
                 assert captured["updates"] == {"name": "updated-name"}
+                assert captured["governance"] == {
+                    "governance_resume": None,
+                    "governance_refresh": False,
+                    "deprecated_verification_retirement": None,
+                }
 
 
 # ---------------------------------------------------------------------------
@@ -468,5 +561,3 @@ class TestCronPromptScanParity:
                 data = await resp.json()
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
-
-

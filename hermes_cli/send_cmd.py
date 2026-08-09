@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -92,6 +93,29 @@ def _resolve_target(arg_to: Optional[str]) -> Optional[str]:
     if arg_to and arg_to.strip():
         return arg_to.strip()
     return None
+
+
+def _read_transport_request(value: Optional[str]) -> Optional[dict]:
+    """Parse an opt-in trusted request object from JSON or ``@path``."""
+    if value is None:
+        return None
+    raw = value
+    if value.startswith("@"):
+        path = Path(value[1:]).expanduser()
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"hermes send: cannot read transport request {path}: {exc}", file=sys.stderr)
+            sys.exit(_USAGE_EXIT)
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"hermes send: invalid --transport-request-json: {exc}", file=sys.stderr)
+        sys.exit(_USAGE_EXIT)
+    if not isinstance(payload, dict):
+        print("hermes send: --transport-request-json must be a JSON object", file=sys.stderr)
+        sys.exit(_USAGE_EXIT)
+    return payload
 
 
 def _emit_result(
@@ -319,7 +343,16 @@ def cmd_send(args: argparse.Namespace) -> None:
     # Bridge ~/.hermes/.env and ~/.hermes/config.yaml into os.environ so the
     # gateway config loader (invoked downstream by send_message_tool and by
     # the channel directory) can see platform credentials and home channels.
+    owner_context = {
+        key: os.environ.get(key)
+        for key in ("HERMES_HOME", "HERMES_PROFILE_ID")
+    }
     _load_hermes_env()
+    for key, value in owner_context.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
     # --list short-circuits everything else.
     if getattr(args, "list_targets", False):
@@ -373,6 +406,11 @@ def cmd_send(args: argparse.Namespace) -> None:
         "target": target,
         "message": message,
     }
+    transport_request = _read_transport_request(
+        getattr(args, "transport_request_json", None)
+    )
+    if transport_request is not None:
+        tool_args["transport_request"] = transport_request
 
     result = send_message_tool(tool_args)
     exit_code = _emit_result(
@@ -480,6 +518,17 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Emit raw JSON result instead of human-readable output.",
+    )
+
+    parser.add_argument(
+        "--transport-request-json",
+        metavar="JSON_OR_@PATH",
+        default=None,
+        help=(
+            "Commit a claim-bound Core transport request before sending. "
+            "Accepts a JSON object or @path; failed receipt persistence is "
+            "reported as indeterminate."
+        ),
     )
 
     parser.set_defaults(func=cmd_send)

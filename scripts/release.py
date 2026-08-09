@@ -33,6 +33,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
+DESKTOP_PACKAGE_FILE = REPO_ROOT / "apps" / "desktop" / "package.json"
+PACKAGE_LOCK_FILE = REPO_ROOT / "package-lock.json"
+UV_LOCK_FILE = REPO_ROOT / "uv.lock"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -2205,16 +2208,52 @@ def update_version_files(semver: str, calver_date: str):
     # Python package version. The desktop About panel reads the live Hermes
     # version at runtime, but app.getVersion()/packaging metadata still come
     # from this field, so it must track pyproject to avoid drift.
-    desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
-    if desktop_pkg.exists():
-        pkg_text = desktop_pkg.read_text(encoding="utf-8")
+    if DESKTOP_PACKAGE_FILE.exists():
+        pkg_text = DESKTOP_PACKAGE_FILE.read_text(encoding="utf-8")
         pkg_text = re.sub(
             r'("version"\s*:\s*)"[^"]+"',
             rf'\g<1>"{semver}"',
             pkg_text,
             count=1,
         )
-        desktop_pkg.write_text(pkg_text, encoding="utf-8")
+        DESKTOP_PACKAGE_FILE.write_text(pkg_text, encoding="utf-8")
+
+    if PACKAGE_LOCK_FILE.exists():
+        package_lock = json.loads(PACKAGE_LOCK_FILE.read_text(encoding="utf-8"))
+        desktop_entry = package_lock.get("packages", {}).get("apps/desktop")
+        if isinstance(desktop_entry, dict):
+            desktop_entry["version"] = semver
+            PACKAGE_LOCK_FILE.write_text(
+                json.dumps(package_lock, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+    if UV_LOCK_FILE.exists():
+        uv_lock = UV_LOCK_FILE.read_text(encoding="utf-8")
+        uv_lock, replacements = re.subn(
+            r'(?m)(^\[\[package\]\]\nname = "hermes-agent"\nversion = ")[^"]+("$)',
+            rf'\g<1>{semver}\g<2>',
+            uv_lock,
+            count=1,
+        )
+        if replacements != 1:
+            raise RuntimeError("uv.lock is missing the hermes-agent workspace package")
+        UV_LOCK_FILE.write_text(uv_lock, encoding="utf-8")
+
+
+def version_files_to_stage() -> list[str]:
+    """Return every existing file mutated by ``update_version_files``."""
+    return [
+        str(path)
+        for path in (
+            VERSION_FILE,
+            PYPROJECT_FILE,
+            DESKTOP_PACKAGE_FILE,
+            PACKAGE_LOCK_FILE,
+            UV_LOCK_FILE,
+        )
+        if path.exists()
+    ]
 
 
 def resolve_author(name: str, email: str) -> str:
@@ -2554,7 +2593,7 @@ def main():
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
             # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
+            add_files = version_files_to_stage()
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")

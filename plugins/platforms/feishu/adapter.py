@@ -66,7 +66,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -98,6 +98,7 @@ CreateMessageRequestBody = None  # type: ignore[assignment]
 GetChatRequest = None  # type: ignore[assignment]
 GetMessageRequest = None  # type: ignore[assignment]
 GetMessageResourceRequest = None  # type: ignore[assignment]
+ListMessageRequest = None  # type: ignore[assignment]
 P2ImMessageMessageReadV1 = None  # type: ignore[assignment]
 ReplyMessageRequest = None  # type: ignore[assignment]
 ReplyMessageRequestBody = None  # type: ignore[assignment]
@@ -242,6 +243,10 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+_FEISHU_RECOVERY_CURSOR_PREFIX = "feishu:v1:"
+_FEISHU_RECOVERY_PAGE_SIZE = 50
+_FEISHU_RECOVERY_MAX_PAGES = 100
+_FEISHU_RECOVERY_BOOTSTRAP_LOOKBACK_MS = 24 * 60 * 60 * 1000
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
@@ -249,6 +254,20 @@ _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_always": "always",
     "deny": "deny",
 }
+
+
+def _recovery_cursor(position_ms: int, message_id: str = "") -> str:
+    return f"{_FEISHU_RECOVERY_CURSOR_PREFIX}{position_ms:013d}:{message_id}"
+
+
+def _parse_recovery_cursor(value: str) -> tuple[int, str] | None:
+    raw = str(value or "")
+    if not raw.startswith(_FEISHU_RECOVERY_CURSOR_PREFIX):
+        return None
+    pieces = raw[len(_FEISHU_RECOVERY_CURSOR_PREFIX) :].split(":", 1)
+    if len(pieces) != 2 or not pieces[0].isdigit():
+        return None
+    return int(pieces[0]), pieces[1]
 _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "once": "Approved once",
     "session": "Approved for session",
@@ -1401,6 +1420,7 @@ def _load_lark_oapi() -> bool:
                 CreateImageRequest, CreateImageRequestBody,
                 CreateMessageRequest, CreateMessageRequestBody,
                 GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
+                ListMessageRequest,
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
                 UpdateMessageRequest, UpdateMessageRequestBody,
@@ -1428,6 +1448,7 @@ def _load_lark_oapi() -> bool:
             "GetChatRequest": GetChatRequest,
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
+            "ListMessageRequest": ListMessageRequest,
             "P2ImMessageMessageReadV1": P2ImMessageMessageReadV1,
             "ReplyMessageRequest": ReplyMessageRequest,
             "ReplyMessageRequestBody": ReplyMessageRequestBody,
@@ -1506,6 +1527,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
+        self._recovery_state_path = get_hermes_home() / "feishu_recovery_state.json"
+        self._recovery_state_lock = threading.Lock()
+        self._pending_recovery_arms: Dict[str, Dict[str, Any]] = {}
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
@@ -1949,7 +1973,16 @@ class FeishuAdapter(BasePlatformAdapter):
         last_response = None
 
         try:
-            for chunk in chunks:
+            for chunk_index, chunk in enumerate(chunks):
+                chunk_metadata = metadata
+                if (metadata or {}).get("hermes_delivery_idempotency_key"):
+                    chunk_metadata = dict(metadata or {})
+                    base_part = str(
+                        chunk_metadata.get("hermes_delivery_part") or "text"
+                    )
+                    chunk_metadata["hermes_delivery_part"] = (
+                        f"{base_part}:{chunk_index}"
+                    )
                 msg_type, payload = self._build_outbound_payload(
                     chunk, prefer_post=prefer_post,
                 )
@@ -1959,7 +1992,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type=msg_type,
                         payload=payload,
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
                     )
                 except Exception as exc:
                     if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
@@ -1970,7 +2003,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
                     )
                 if (
                     msg_type == "post"
@@ -1983,7 +2016,11 @@ class FeishuAdapter(BasePlatformAdapter):
                         msg_type="text",
                         payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
                         reply_to=reply_to,
-                        metadata=metadata,
+                        metadata=chunk_metadata,
+                    )
+                if not self._response_succeeded(response):
+                    return self._response_error_result(
+                        response, default_message="send failed"
                     )
                 last_response = response
 
@@ -2401,12 +2438,14 @@ class FeishuAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+    async def get_chat_info(
+        self, chat_id: str, *, strict: bool = False
+    ) -> Dict[str, Any]:
         """Return real chat metadata from Feishu when available."""
         fallback = {
             "chat_id": chat_id,
             "name": chat_id,
-            "type": "dm",
+            "type": "unknown" if strict else "dm",
         }
         if not self._client:
             return fallback
@@ -2425,7 +2464,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 return fallback
 
             data = getattr(response, "data", None)
-            raw_chat_type = str(getattr(data, "chat_type", "") or "").strip().lower()
+            raw_chat_type = str(
+                getattr(data, "chat_mode", "") or ""
+            ).strip().lower()
             info = {
                 "chat_id": chat_id,
                 "name": str(getattr(data, "name", None) or chat_id),
@@ -4587,7 +4628,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order = list(reversed(sorted_ids))
         self._seen_message_ids = {k: valid[k] for k in sorted_ids}
 
-    def _persist_seen_message_ids(self) -> None:
+    def _persist_seen_message_ids(self, *, strict: bool = False) -> None:
         try:
             self._dedup_state_path.parent.mkdir(parents=True, exist_ok=True)
             recent = self._seen_message_order[-self._dedup_cache_size:]
@@ -4596,6 +4637,8 @@ class FeishuAdapter(BasePlatformAdapter):
             atomic_json_write(self._dedup_state_path, payload, indent=None)
         except OSError:
             logger.warning("[Feishu] Failed to persist dedup state to %s", self._dedup_state_path, exc_info=True)
+            if strict:
+                raise
 
     def _is_duplicate(self, message_id: str) -> bool:
         now = time.time()
@@ -4612,6 +4655,22 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._seen_message_ids.pop(stale, None)
             self._persist_seen_message_ids()
             return False
+
+    def remember_recovered_message(self, message_id: str) -> None:
+        """Make a confirmed history delivery visible to live-transport dedup."""
+        normalized = str(message_id or "").strip()
+        if not normalized:
+            raise ValueError("recovered message_id is required")
+        now = time.time()
+        with self._dedup_lock:
+            self._seen_message_ids[normalized] = now
+            if normalized in self._seen_message_order:
+                self._seen_message_order.remove(normalized)
+            self._seen_message_order.append(normalized)
+            while len(self._seen_message_order) > self._dedup_cache_size:
+                stale = self._seen_message_order.pop(0)
+                self._seen_message_ids.pop(stale, None)
+            self._persist_seen_message_ids(strict=True)
 
     # =========================================================================
     # Outbound payload construction and send pipeline
@@ -4801,6 +4860,22 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         effective_reply_to = reply_to
+        delivery_key = str(
+            (metadata or {}).get("hermes_delivery_idempotency_key") or ""
+        ).strip()
+        delivery_part = str(
+            (metadata or {}).get("hermes_delivery_part") or ""
+        ).strip()
+        message_uuid = (
+            str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"hermes-recovery:{delivery_key}:{delivery_part}",
+                )
+            )
+            if delivery_key and delivery_part
+            else str(uuid.uuid4())
+        )
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
         reply_in_thread = bool((metadata or {}).get("thread_id"))
@@ -4809,7 +4884,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 content=payload,
                 msg_type=msg_type,
                 reply_in_thread=reply_in_thread,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=message_uuid,
             )
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
@@ -4823,7 +4898,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 receive_id=_thread_id,
                 msg_type=msg_type,
                 content=payload,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=message_uuid,
             )
             request = self._build_create_message_request("thread_id", body)
         else:
@@ -4839,7 +4914,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 receive_id=receive_id,
                 msg_type=msg_type,
                 content=payload,
-                uuid_value=str(uuid.uuid4()),
+                uuid_value=message_uuid,
             )
             request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
@@ -5048,6 +5123,577 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
     # Lark API request builders
     # =========================================================================
+
+    async def fetch_recovery_history(
+        self,
+        *,
+        channel_id: str,
+        after_cursor: str = "",
+        now_ms: Optional[int] = None,
+        profile_id: str,
+        authorization_fingerprint: str,
+    ) -> Dict[str, Any]:
+        """Fetch a complete strict-order window under a source-owned cursor."""
+        channel = str(channel_id or "").strip()
+        requested_cursor = str(after_cursor or "")
+        if (
+            not channel
+            or not str(profile_id or "").strip()
+            or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", str(authorization_fingerprint or "")
+            )
+            or (
+                requested_cursor
+                and _parse_recovery_cursor(requested_cursor) is None
+            )
+        ):
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "invalid_recovery_scope",
+            }
+        if self._client is None:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "feishu_client_unavailable",
+            }
+
+        try:
+            recovery_state = self._read_recovery_state()
+        except ValueError:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "history_baseline_invalid",
+            }
+        channel_key = hashlib.sha256(channel.encode("utf-8")).hexdigest()
+        baseline = dict(recovery_state.get("channels", {}).get(channel_key) or {})
+        baseline_cursor = str(baseline.get("cursor") or "")
+        if requested_cursor and not baseline_cursor:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "history_baseline_unbound",
+            }
+        if requested_cursor and requested_cursor > baseline_cursor:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "history_checkpoint_ahead_of_source",
+            }
+        parsed = _parse_recovery_cursor(baseline_cursor) if baseline_cursor else None
+        end_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        after_position = parsed or (
+            max(0, end_ms - _FEISHU_RECOVERY_BOOTSTRAP_LOOKBACK_MS),
+            "",
+        )
+        start_seconds = max(0, after_position[0] // 1000)
+        end_seconds = max(start_seconds, end_ms // 1000)
+        source_app_id = str(self._app_id or "")
+        if not source_app_id:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "history_source_identity_missing",
+            }
+        config_fingerprint = self._recovery_config_fingerprint()
+        profile_fingerprint = hashlib.sha256(
+            str(profile_id).encode("utf-8")
+        ).hexdigest()
+        source_fingerprint = hashlib.sha256(
+            source_app_id.encode("utf-8")
+        ).hexdigest()
+        bindings = {
+            "profile_fingerprint": profile_fingerprint,
+            "source_instance_fingerprint": source_fingerprint,
+            "config_fingerprint": config_fingerprint,
+            "authorization_fingerprint": authorization_fingerprint,
+        }
+        if baseline:
+            reason_by_field = {
+                "profile_fingerprint": "history_profile_identity_drift",
+                "source_instance_fingerprint": "history_source_identity_drift",
+                "config_fingerprint": "history_source_config_drift",
+                "authorization_fingerprint": "history_authorization_drift",
+            }
+            for field, expected in bindings.items():
+                if str(baseline.get(field) or "") != expected:
+                    return {
+                        "status": "blocked",
+                        "complete": False,
+                        "reason": reason_by_field[field],
+                    }
+
+        chat_info = await self.get_chat_info(channel, strict=True)
+        resolved_chat_type = str(chat_info.get("type") or "").lower()
+        if resolved_chat_type not in {"dm", "group", "forum"}:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "history_chat_type_unavailable",
+            }
+        container_chat_type = "direct" if resolved_chat_type == "dm" else "group"
+        page_token = ""
+        messages: list[dict[str, Any]] = []
+        seen: dict[str, dict[str, Any]] = {}
+        for _page in range(_FEISHU_RECOVERY_MAX_PAGES):
+            request = self._build_list_message_request(
+                channel_id=channel,
+                start_time=start_seconds,
+                end_time=end_seconds,
+                page_token=page_token,
+            )
+            try:
+                response = await self._run_blocking(
+                    self._client.im.v1.message.list, request
+                )
+            except Exception as exc:
+                return {
+                    "status": "blocked",
+                    "complete": False,
+                    "reason": "history_source_error",
+                    "error_type": type(exc).__name__,
+                }
+            if not response or not getattr(response, "success", lambda: False)():
+                return {
+                    "status": "blocked",
+                    "complete": False,
+                    "reason": "history_source_permission_or_api_failure",
+                    "code": getattr(response, "code", None),
+                }
+            data = getattr(response, "data", None)
+            for item in list(getattr(data, "items", None) or []):
+                fact = self._recovery_fact(
+                    item,
+                    expected_channel_id=channel,
+                    container_chat_type=container_chat_type,
+                )
+                if fact is None:
+                    return {
+                        "status": "blocked",
+                        "complete": False,
+                        "reason": "history_item_malformed",
+                    }
+                position = (fact["position_ms"], fact["inbound_uid"])
+                if position <= after_position:
+                    continue
+                prior = seen.get(fact["inbound_uid"])
+                if prior is not None:
+                    if prior != fact:
+                        return {
+                            "status": "blocked",
+                            "complete": False,
+                            "reason": "duplicate_message_conflict",
+                        }
+                    continue
+                seen[fact["inbound_uid"]] = fact
+                messages.append(fact)
+            has_more = bool(getattr(data, "has_more", False))
+            next_token = str(getattr(data, "page_token", "") or "")
+            if not has_more:
+                break
+            if not next_token or next_token == page_token:
+                return {
+                    "status": "blocked",
+                    "complete": False,
+                    "reason": "history_pagination_incomplete",
+                }
+            page_token = next_token
+        else:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "history_page_limit_exceeded",
+            }
+
+        if hashlib.sha256(str(self._app_id or "").encode("utf-8")).hexdigest() != source_fingerprint:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "history_source_identity_drift",
+            }
+        if self._recovery_config_fingerprint() != config_fingerprint:
+            return {
+                "status": "blocked",
+                "complete": False,
+                "reason": "history_source_config_drift",
+            }
+        messages.sort(key=lambda item: (item["position_ms"], item["inbound_uid"]))
+        final_position = (
+            (messages[-1]["position_ms"], messages[-1]["inbound_uid"])
+            if messages
+            else (end_ms, "")
+        )
+        next_cursor = _recovery_cursor(*final_position)
+        receipt = self._build_recovery_admission_receipt(
+            profile_id=profile_id,
+            channel_id=channel,
+            chat_type=container_chat_type,
+            source_app_id=source_app_id,
+            config_fingerprint=config_fingerprint,
+            authorization_fingerprint=authorization_fingerprint,
+            baseline=baseline,
+            baseline_cursor=baseline_cursor,
+            next_cursor=next_cursor,
+            messages=messages,
+            issued_at_ms=end_ms,
+        )
+        execution_id = receipt["evidence"]["execution_id"]
+        self._pending_recovery_arms[execution_id] = {
+            "receipt_sha256": hashlib.sha256(
+                json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+            "channel_key": channel_key,
+            "baseline_cursor": baseline_cursor,
+            "baseline_revision": int(baseline.get("revision") or 0),
+            "next_cursor": next_cursor,
+            "expected": json.loads(json.dumps(receipt)),
+            "consumed_execution_ids": list(
+                baseline.get("consumed_execution_ids") or []
+            ),
+            **bindings,
+        }
+        return {
+            "status": "ok",
+            "complete": True,
+            "source_kind": "feishu_official_im_v1_messages",
+            "source_instance_id": source_fingerprint,
+            "config_fingerprint": config_fingerprint,
+            "channel_id": channel,
+            "chat_type": container_chat_type,
+            "checkpoint_before": baseline_cursor,
+            "next_cursor": next_cursor,
+            "messages": messages,
+            "admission_receipt": receipt,
+        }
+
+    def recovery_admission_facts(
+        self, receipt: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        evidence = receipt.get("evidence") if isinstance(receipt, Mapping) else None
+        execution_id = (
+            str(evidence.get("execution_id") or "")
+            if isinstance(evidence, Mapping)
+            else ""
+        )
+        pending = self._pending_recovery_arms.get(execution_id)
+        receipt_hash = hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if pending is None or pending.get("receipt_sha256") != receipt_hash:
+            return {"status": "blocked", "reason": "history_admission_arm_missing"}
+        return {
+            "status": "ok",
+            "expected_receipt": json.loads(json.dumps(pending["expected"])),
+            "consumed_execution_ids": list(pending["consumed_execution_ids"]),
+        }
+
+    def _read_recovery_state(self) -> Dict[str, Any]:
+        try:
+            payload = json.loads(
+                self._recovery_state_path.read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            return {"schema_version": 1, "channels": {}}
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("recovery state unreadable") from exc
+        if payload.get("schema_version") != 1 or not isinstance(
+            payload.get("channels"), dict
+        ):
+            raise ValueError("recovery state invalid")
+        return payload
+
+    def _build_recovery_admission_receipt(
+        self,
+        *,
+        profile_id: str,
+        channel_id: str,
+        chat_type: str,
+        source_app_id: str,
+        config_fingerprint: str,
+        authorization_fingerprint: str,
+        baseline: Mapping[str, Any],
+        baseline_cursor: str,
+        next_cursor: str,
+        messages: Sequence[Mapping[str, Any]],
+        issued_at_ms: int,
+    ) -> Dict[str, Any]:
+        def fingerprint(value: Any) -> str:
+            serialized = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            return f"sha256:{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
+
+        arm_id = hashlib.sha256(
+            f"{source_app_id}:{channel_id}:feishu-history".encode("utf-8")
+        ).hexdigest()[:32]
+        return {
+            "schema_version": 2,
+            "status": "armed",
+            "scope": {
+                "profile_id": fingerprint(profile_id),
+                "transport_id": "feishu",
+                "channel_id": fingerprint(channel_id),
+                "chat_type": chat_type,
+            },
+            "source": {
+                "source_kind": "feishu_official_im_v1_messages",
+                "source_instance_id": fingerprint(source_app_id),
+                "account_fingerprint": fingerprint(source_app_id),
+                "snapshot_fingerprint": fingerprint(list(messages)),
+            },
+            "position": {
+                "kind": "feishu_history_cursor",
+                "fingerprint": fingerprint(next_cursor),
+                "comparison": "strict_after_total_order",
+                "high_water_mark": True,
+            },
+            "admission": {
+                "eligible": True,
+                "reason_code": "eligible",
+                "config_fingerprint": f"sha256:{config_fingerprint}",
+                "authorization_fingerprint": authorization_fingerprint,
+                "capability_version": 1,
+            },
+            "evidence": {
+                "arm_operation_id": f"arm:{arm_id}",
+                "execution_id": f"recovery:{uuid.uuid4().hex}",
+                "revision": int(baseline.get("revision") or 0) + 1,
+                "issued_at_ms": issued_at_ms,
+                "expires_at_ms": issued_at_ms + 5 * 60 * 1000,
+                "latency_ms": 0,
+                "baseline_fingerprint": fingerprint(baseline_cursor),
+            },
+        }
+
+    def commit_recovery_history(
+        self, receipt: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        evidence = receipt.get("evidence") if isinstance(receipt, Mapping) else None
+        execution_id = (
+            str(evidence.get("execution_id") or "")
+            if isinstance(evidence, Mapping)
+            else ""
+        )
+        pending = self._pending_recovery_arms.get(execution_id)
+        receipt_hash = hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if pending is None or pending.get("receipt_sha256") != receipt_hash:
+            return {"status": "blocked", "reason": "history_admission_arm_missing"}
+
+        with self._recovery_state_lock:
+            try:
+                state = self._read_recovery_state()
+            except ValueError:
+                return {"status": "blocked", "reason": "history_baseline_invalid"}
+            channels = dict(state.get("channels") or {})
+            current = dict(channels.get(pending["channel_key"]) or {})
+            if (
+                str(current.get("cursor") or "") != pending["baseline_cursor"]
+                or int(current.get("revision") or 0)
+                != pending["baseline_revision"]
+            ):
+                return {
+                    "status": "blocked",
+                    "reason": "history_baseline_cas_conflict",
+                }
+            binding_fields = (
+                "profile_fingerprint",
+                "source_instance_fingerprint",
+                "config_fingerprint",
+                "authorization_fingerprint",
+            )
+            if current and any(
+                str(current.get(field) or "") != str(pending[field])
+                for field in binding_fields
+            ):
+                return {
+                    "status": "blocked",
+                    "reason": "history_baseline_binding_drift",
+                }
+            if (
+                hashlib.sha256(str(self._app_id or "").encode("utf-8")).hexdigest()
+                != pending["source_instance_fingerprint"]
+                or self._recovery_config_fingerprint()
+                != pending["config_fingerprint"]
+            ):
+                return {
+                    "status": "blocked",
+                    "reason": "history_source_binding_drift",
+                }
+            consumed = [
+                value
+                for value in current.get("consumed_execution_ids", [])
+                if isinstance(value, str) and value
+            ]
+            consumed.append(execution_id)
+            channels[pending["channel_key"]] = {
+                "cursor": pending["next_cursor"],
+                "revision": pending["baseline_revision"] + 1,
+                "arm_operation_id": receipt["evidence"]["arm_operation_id"],
+                "consumed_execution_ids": consumed[-128:],
+                **{field: pending[field] for field in binding_fields},
+            }
+            self._recovery_state_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_json_write(
+                self._recovery_state_path,
+                {"schema_version": 1, "channels": channels},
+                indent=None,
+                mode=0o600,
+            )
+        self._pending_recovery_arms.pop(execution_id, None)
+        return {"status": "committed", "cursor": pending["next_cursor"]}
+
+    def _recovery_config_fingerprint(self) -> str:
+        safe_config = {
+            "app_id": str(self._app_id or ""),
+            "domain": str(self._domain_name or ""),
+            "group_policy": str(self._group_policy or ""),
+            "default_group_policy": str(self._default_group_policy or ""),
+            "allowed_group_users": sorted(
+                str(value) for value in self._allowed_group_users
+            ),
+            "admins": sorted(str(value) for value in self._admins),
+        }
+        serialized = json.dumps(safe_config, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _recovery_fact(
+        self,
+        item: Any,
+        *,
+        expected_channel_id: str,
+        container_chat_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        message_id = str(getattr(item, "message_id", "") or "").strip()
+        channel_id = str(getattr(item, "chat_id", "") or "").strip()
+        create_time = str(getattr(item, "create_time", "") or "").strip()
+        if (
+            not message_id
+            or channel_id != expected_channel_id
+            or not create_time.isdigit()
+        ):
+            return None
+        position_ms = int(create_time)
+        if position_ms < 10_000_000_000:
+            position_ms *= 1000
+        message_type = str(getattr(item, "msg_type", "") or "").strip().lower()
+        raw_content = str(
+            getattr(getattr(item, "body", None), "content", "") or ""
+        )
+        normalized = normalize_feishu_message(
+            message_type=message_type, raw_content=raw_content
+        )
+        sender = getattr(item, "sender", None)
+        sender_id = str(getattr(sender, "id", "") or "").strip()
+        sender_id_type = str(
+            getattr(sender, "id_type", "") or ""
+        ).strip().lower()
+        sender_type = str(
+            getattr(sender, "sender_type", "") or ""
+        ).strip().lower()
+        is_bot = sender_type in {"app", "bot"} or sender_id_type == "app_id"
+        return {
+            "inbound_uid": message_id,
+            "channel_id": channel_id,
+            "sender_uid": sender_id,
+            "sender_id_type": sender_id_type,
+            "text": normalized.text_content,
+            "message_type": message_type,
+            "position_ms": position_ms,
+            "cursor": _recovery_cursor(position_ms, message_id),
+            "chat_type": container_chat_type,
+            "is_bot": is_bot,
+            "is_bot_self": is_bot and sender_id == self._app_id,
+            "supported": message_type in {"text", "post"},
+            "payload": {
+                "source": "feishu_official_history",
+                "raw_message_type": message_type,
+                "relation_kind": normalized.relation_kind,
+            },
+        }
+
+    async def recovery_event(self, fact: Mapping[str, Any]) -> MessageEvent:
+        """Convert a transport fact into the ordinary Gateway event shape."""
+        payload = fact.get("payload")
+        channel_id = str(
+            fact.get("channel_id")
+            or (payload.get("channel_id") if isinstance(payload, Mapping) else "")
+            or fact.get("recovery_channel_id")
+            or ""
+        )
+        sender_uid = str(fact.get("sender_uid") or "")
+        sender_id_type = str(fact.get("sender_id_type") or "open_id")
+        if sender_id_type not in {"open_id", "user_id", "union_id"}:
+            raise ValueError("unsupported recovered sender id type")
+        sender_values = {"open_id": "", "user_id": "", "union_id": ""}
+        sender_values[sender_id_type] = sender_uid
+        sender_profile = await self._resolve_sender_profile(
+            SimpleNamespace(**sender_values), is_bot=bool(fact.get("is_bot"))
+        )
+        chat_info = await self.get_chat_info(channel_id, strict=True)
+        if not chat_info:
+            raise ValueError("recovered chat identity unavailable")
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_name=chat_info.get("name") or channel_id,
+            chat_type=self._resolve_source_chat_type(
+                chat_info=chat_info,
+                event_chat_type=str(fact.get("chat_type") or "p2p"),
+            ),
+            user_id=sender_profile["user_id"],
+            user_name=sender_profile["user_name"],
+            thread_id=None,
+            user_id_alt=sender_profile["user_id_alt"],
+            is_bot=bool(fact.get("is_bot")),
+        )
+        return MessageEvent(
+            text=str(fact.get("text") or ""),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"_hermes_history_recovery": dict(fact)},
+            message_id=str(fact.get("inbound_uid") or ""),
+            channel_prompt=self._resolve_channel_prompt(channel_id),
+            timestamp=datetime.fromtimestamp(
+                int(fact.get("position_ms") or 0) / 1000
+            ),
+        )
+
+    @staticmethod
+    def _build_list_message_request(
+        *, channel_id: str, start_time: int, end_time: int, page_token: str
+    ) -> Any:
+        request_type = globals().get("ListMessageRequest")
+        if request_type is not None:
+            builder = (
+                request_type.builder()
+                .container_id_type("chat")
+                .container_id(channel_id)
+                .start_time(str(start_time))
+                .end_time(str(end_time))
+                .sort_type("ByCreateTimeAsc")
+                .page_size(_FEISHU_RECOVERY_PAGE_SIZE)
+            )
+            if page_token:
+                builder = builder.page_token(page_token)
+            return builder.build()
+        return SimpleNamespace(
+            container_id_type="chat",
+            container_id=channel_id,
+            start_time=str(start_time),
+            end_time=str(end_time),
+            sort_type="ByCreateTimeAsc",
+            page_size=_FEISHU_RECOVERY_PAGE_SIZE,
+            page_token=page_token,
+        )
 
     @staticmethod
     def _build_get_chat_request(chat_id: str) -> Any:

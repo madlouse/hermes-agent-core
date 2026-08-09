@@ -37,6 +37,7 @@ _CRON_RUN_HEARTBEAT_CEILING = 6 * 3600.0
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import cron.jobs as cron_jobs
 from cron.jobs import (
     AmbiguousJobReference,
     claim_job_for_fire,
@@ -624,6 +625,14 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
 
+        claimed_job = get_job(job_id)
+        if claimed_job is None:
+            return {
+                "claimed": True,
+                "success": False,
+                "error": "Job disappeared after its manual fire claim was committed.",
+            }
+
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
         #
@@ -685,7 +694,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             _heartbeat_thread.start()
 
         try:
-            processed = run_one_job(job)
+            processed = run_one_job(claimed_job)
         finally:
             _heartbeat_stop.set()
             if _heartbeat_thread is not None:
@@ -728,6 +737,11 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    authorized_behavior_ref: Optional[str] = None,
+    implementation_categories: Optional[List[str]] = None,
+    governance_resume: Optional[Dict[str, Any]] = None,
+    governance_refresh: bool = False,
+    deprecated_verification_retirement: Optional[Dict[str, Any]] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -737,7 +751,7 @@ def cronjob(
         normalized = (action or "").strip().lower()
 
         if normalized == "create":
-            if not schedule:
+            if not schedule and governance_resume is None:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
             _no_agent = bool(no_agent)
@@ -746,7 +760,9 @@ def cronjob(
             #     (and irrelevant to execution).
             #   - no_agent=False (default) → at least one of prompt/skills must
             #     be set, same as before.
-            if _no_agent:
+            if governance_resume is not None:
+                pass
+            elif _no_agent:
                 if not script:
                     return tool_error(
                         "create with no_agent=True requires a script — "
@@ -784,24 +800,36 @@ def cronjob(
                             success=False,
                         )
 
-            job = create_job(
-                prompt=prompt or "",
-                schedule=schedule,
-                name=name,
-                repeat=repeat,
-                deliver=_normalize_deliver_param(deliver),
-                origin=_origin_from_env(),
-                skills=canonical_skills,
-                model=_normalize_optional_job_value(model),
-                provider=_normalize_optional_job_value(provider),
-                base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
-                script=_normalize_optional_job_value(script),
-                context_from=context_from,
-                enabled_toolsets=enabled_toolsets or None,
-                workdir=_normalize_optional_job_value(workdir),
-                no_agent=_no_agent,
-                attach_to_session=attach_to_session,
-            )
+            if governance_resume is not None:
+                job = create_job(
+                    prompt=None,
+                    schedule="",
+                    governance_resume=governance_resume,
+                )
+            else:
+                job = create_job(
+                    prompt=prompt or "",
+                    schedule=schedule or "",
+                    name=name,
+                    repeat=repeat,
+                    deliver=_normalize_deliver_param(deliver),
+                    origin=_origin_from_env(),
+                    skills=canonical_skills,
+                    model=_normalize_optional_job_value(model),
+                    provider=_normalize_optional_job_value(provider),
+                    base_url=_normalize_optional_job_value(
+                        base_url,
+                        strip_trailing_slash=True,
+                    ),
+                    script=_normalize_optional_job_value(script),
+                    context_from=context_from,
+                    enabled_toolsets=enabled_toolsets or None,
+                    workdir=_normalize_optional_job_value(workdir),
+                    no_agent=_no_agent,
+                    attach_to_session=attach_to_session,
+                    authorized_behavior_ref=authorized_behavior_ref,
+                    implementation_categories=implementation_categories,
+                )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
@@ -831,8 +859,16 @@ def cronjob(
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
 
+        special_governance_update = normalized == "update" and (
+            governance_resume is not None
+            or governance_refresh
+            or deprecated_verification_retirement is not None
+        )
         try:
-            job = resolve_job_ref(job_id)
+            job = resolve_job_ref(
+                job_id,
+                repair_recoverable=not special_governance_update,
+            )
         except AmbiguousJobReference as exc:
             return json.dumps(
                 {
@@ -912,6 +948,17 @@ def cronjob(
             return json.dumps({"success": True, "job": result}, indent=2)
 
         if normalized == "update":
+            if governance_resume is not None:
+                updated = update_job(
+                    job_id,
+                    {},
+                    governance_resume=governance_resume,
+                )
+                _notify_provider_jobs_changed_safe()
+                return json.dumps(
+                    {"success": True, "job": _format_job(updated)},
+                    indent=2,
+                )
             updates: Dict[str, Any] = {}
             if prompt is not None:
                 scan_error = _scan_cron_prompt(prompt)
@@ -978,6 +1025,16 @@ def cronjob(
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
+            if authorized_behavior_ref is not None:
+                updates["authorized_behavior_ref"] = _normalize_optional_job_value(
+                    authorized_behavior_ref
+                )
+            if implementation_categories is not None:
+                updates["implementation_categories"] = [
+                    str(item).strip()
+                    for item in implementation_categories
+                    if str(item).strip()
+                ]
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
             if workdir is not None:
@@ -1011,14 +1068,33 @@ def cronjob(
                 if job.get("state") != "paused":
                     updates["state"] = "scheduled"
                     updates["enabled"] = True
-            if not updates:
+            if (
+                not updates
+                and governance_resume is None
+                and not governance_refresh
+                and deprecated_verification_retirement is None
+            ):
                 return tool_error("No updates provided.", success=False)
-            updated = update_job(job_id, updates)
-            _notify_provider_jobs_changed_safe()
+            updated = update_job(
+                job_id,
+                updates,
+                governance_resume=governance_resume,
+                governance_refresh=governance_refresh,
+                deprecated_verification_retirement=(
+                    deprecated_verification_retirement
+                ),
+            )
+            if not governance_refresh and deprecated_verification_retirement is None:
+                _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
 
+    except cron_jobs.CronJobGovernanceError as e:
+        return json.dumps(
+            {"success": False, "error": str(e), "governance": e.payload()},
+            indent=2,
+        )
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -1078,6 +1154,27 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Optional ordered list of skill names to load before executing the cron prompt. On update, pass an empty array to clear attached skills."
+            },
+            "authorized_behavior_ref": {
+                "type": "string",
+                "description": "Internal behavior authorization reference produced by the profile authorization flow. Do not invent this value."
+            },
+            "implementation_categories": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Internal implementation categories bound to the authorized behavior."
+            },
+            "governance_resume": {
+                "type": "object",
+                "description": "Opaque cron persistence resume package. Pass it back unchanged; never construct or edit it."
+            },
+            "governance_refresh": {
+                "type": "boolean",
+                "description": "Re-evaluate the unchanged Job through persistence governance. This never authorizes around the governance hook."
+            },
+            "deprecated_verification_retirement": {
+                "type": "object",
+                "description": "Exact precondition for retiring a deprecated verification command. Required keys: schema_version, profile_id, job_revision, command_sha256."
             },
             "script": {
                 "type": "string",
@@ -1184,6 +1281,13 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        authorized_behavior_ref=args.get("authorized_behavior_ref"),
+        implementation_categories=args.get("implementation_categories"),
+        governance_resume=args.get("governance_resume"),
+        governance_refresh=args.get("governance_refresh", False),
+        deprecated_verification_retirement=args.get(
+            "deprecated_verification_retirement"
+        ),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,

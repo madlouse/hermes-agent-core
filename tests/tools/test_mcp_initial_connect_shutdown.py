@@ -76,13 +76,14 @@ def test_initial_connect_failure_is_registry_owned_and_reaped(monkeypatch, tmp_p
         assert mcp_tool.register_mcp_servers({
             "initial-failure": {"command": "unused", "connect_timeout": 5}
         }) == []
+        server_key = mcp_tool._active_mcp_server_keys.get()["initial-failure"]
 
         assert len(created) == 1
         server = created[0]
         with mcp_tool._lock:
-            assert mcp_tool._servers["initial-failure"] is server
+            assert mcp_tool._servers[server_key] is server
             assert "deterministic initial failure" in (
-                mcp_tool._server_connect_errors["initial-failure"]
+                mcp_tool._server_connect_errors[server_key]
             )
         assert server._task is not None
         assert not server._task.done(), "recoverable initial failure was not parked"
@@ -165,12 +166,13 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
 
     try:
         assert mcp_tool.register_mcp_servers(config) == []
+        server_key = mcp_tool._active_mcp_server_keys.get()["recovering"]
         assert len(created) == 1
         server = created[0]
         with mcp_tool._lock:
-            assert mcp_tool._servers["recovering"] is server
+            assert mcp_tool._servers[server_key] is server
             assert "backend still booting" in (
-                mcp_tool._server_connect_errors["recovering"]
+                mcp_tool._server_connect_errors[server_key]
             )
         assert not server._task.done()
 
@@ -180,8 +182,8 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
         assert revived.wait(timeout=5), "cached parked server did not revive"
         assert len(created) == 1, "revival created a duplicate server task"
         with mcp_tool._lock:
-            assert mcp_tool._servers["recovering"] is server
-            assert "recovering" not in mcp_tool._server_connect_errors
+            assert mcp_tool._servers[server_key] is server
+            assert server_key not in mcp_tool._server_connect_errors
         assert state["transport_calls"] == 2
         assert server.session is not None
         assert server._error is None
@@ -222,12 +224,13 @@ def test_terminal_initial_failure_is_not_retained(monkeypatch, tmp_path):
         assert mcp_tool.register_mcp_servers({
             "auth-failure": {"command": "unused", "connect_timeout": 5}
         }) == []
+        server_key = mcp_tool._active_mcp_server_keys.get()["auth-failure"]
         assert len(created) == 1
         assert created[0]._task.done()
         with mcp_tool._lock:
-            assert "auth-failure" not in mcp_tool._servers
+            assert server_key not in mcp_tool._servers
             assert "terminal authentication failure" in (
-                mcp_tool._server_connect_errors["auth-failure"]
+                mcp_tool._server_connect_errors[server_key]
             )
     finally:
         _cleanup_mcp_state(mcp_tool, created)

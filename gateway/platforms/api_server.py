@@ -5363,7 +5363,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name",
+        "schedule",
+        "prompt",
+        "deliver",
+        "skills",
+        "skill",
+        "repeat",
+        "enabled",
+        "authorized_behavior_ref",
+        "implementation_categories",
+        "governance_resume",
+        "governance_refresh",
+        "deprecated_verification_retirement",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -5415,43 +5429,68 @@ class APIServerAdapter(BasePlatformAdapter):
             return cron_err
         try:
             body = await request.json()
-            name = (body.get("name") or "").strip()
-            schedule = (body.get("schedule") or "").strip()
-            prompt = body.get("prompt", "")
-            deliver = body.get("deliver", "local")
-            skills = body.get("skills")
-            repeat = body.get("repeat")
+            if not isinstance(body, dict):
+                return web.json_response({"error": "JSON body must be an object"}, status=400)
+            governance_resume = body.get("governance_resume")
 
-            if not name:
-                return web.json_response({"error": "Name is required"}, status=400)
-            if len(name) > self._MAX_NAME_LENGTH:
-                return web.json_response(
-                    {"error": f"Name must be ≤ {self._MAX_NAME_LENGTH} characters"}, status=400,
-                )
-            if not schedule:
-                return web.json_response({"error": "Schedule is required"}, status=400)
-            if len(prompt) > self._MAX_PROMPT_LENGTH:
-                return web.json_response(
-                    {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
-                )
-            if prompt and _scan_cron_prompt is not None:
-                scan_error = _scan_cron_prompt(prompt)
-                if scan_error:
-                    return web.json_response({"error": scan_error}, status=400)
-            if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
-                return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
-
-            kwargs = {
-                "prompt": prompt,
-                "schedule": schedule,
-                "name": name,
-                "deliver": deliver,
-                "origin": self._cron_origin_from_request(request),
-            }
-            if skills:
-                kwargs["skills"] = skills
-            if repeat is not None:
-                kwargs["repeat"] = repeat
+            if governance_resume is not None:
+                kwargs = {
+                    "prompt": None,
+                    "schedule": "",
+                    "governance_resume": governance_resume,
+                }
+            else:
+                name_value = body.get("name") or ""
+                schedule_value = body.get("schedule") or ""
+                prompt = body.get("prompt", "")
+                deliver = body.get("deliver", "local")
+                skills = body.get("skills")
+                repeat = body.get("repeat")
+                if not isinstance(name_value, str):
+                    return web.json_response({"error": "Name must be a string"}, status=400)
+                if not isinstance(schedule_value, str):
+                    return web.json_response({"error": "Schedule must be a string"}, status=400)
+                name = name_value.strip()
+                schedule = schedule_value.strip()
+                if not name:
+                    return web.json_response({"error": "Name is required"}, status=400)
+                if len(name) > self._MAX_NAME_LENGTH:
+                    return web.json_response(
+                        {"error": f"Name must be ≤ {self._MAX_NAME_LENGTH} characters"}, status=400,
+                    )
+                if not schedule:
+                    return web.json_response({"error": "Schedule is required"}, status=400)
+                if not isinstance(prompt, str):
+                    return web.json_response({"error": "Prompt must be a string"}, status=400)
+                if len(prompt) > self._MAX_PROMPT_LENGTH:
+                    return web.json_response(
+                        {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
+                    )
+                if prompt and _scan_cron_prompt is not None:
+                    scan_error = _scan_cron_prompt(prompt)
+                    if scan_error:
+                        return web.json_response({"error": scan_error}, status=400)
+                if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
+                    return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+                kwargs = {
+                    "prompt": prompt,
+                    "schedule": schedule,
+                    "name": name,
+                    "deliver": deliver,
+                    "origin": self._cron_origin_from_request(request),
+                }
+                if skills:
+                    kwargs["skills"] = skills
+                if repeat is not None:
+                    kwargs["repeat"] = repeat
+                if body.get("authorized_behavior_ref") is not None:
+                    kwargs["authorized_behavior_ref"] = body.get(
+                        "authorized_behavior_ref"
+                    )
+                if body.get("implementation_categories") is not None:
+                    kwargs["implementation_categories"] = body.get(
+                        "implementation_categories"
+                    )
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
@@ -5491,15 +5530,35 @@ class APIServerAdapter(BasePlatformAdapter):
             return id_err
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return web.json_response({"error": "JSON body must be an object"}, status=400)
             # Whitelist allowed fields to prevent arbitrary key injection
             sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
-            if not sanitized:
+            governance_resume = sanitized.pop("governance_resume", None)
+            governance_refresh = sanitized.pop("governance_refresh", False)
+            retirement = sanitized.pop("deprecated_verification_retirement", None)
+            if governance_resume is not None:
+                sanitized = {}
+            if not isinstance(governance_refresh, bool):
+                return web.json_response(
+                    {"error": "governance_refresh must be a boolean"}, status=400,
+                )
+            if (
+                not sanitized
+                and governance_resume is None
+                and not governance_refresh
+                and retirement is None
+            ):
                 return web.json_response({"error": "No valid fields to update"}, status=400)
             # Validate lengths if present
+            if "name" in sanitized and not isinstance(sanitized["name"], str):
+                return web.json_response({"error": "Name must be a string"}, status=400)
             if "name" in sanitized and len(sanitized["name"]) > self._MAX_NAME_LENGTH:
                 return web.json_response(
                     {"error": f"Name must be ≤ {self._MAX_NAME_LENGTH} characters"}, status=400,
                 )
+            if "prompt" in sanitized and not isinstance(sanitized["prompt"], str):
+                return web.json_response({"error": "Prompt must be a string"}, status=400)
             if "prompt" in sanitized and len(sanitized["prompt"]) > self._MAX_PROMPT_LENGTH:
                 return web.json_response(
                     {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
@@ -5508,10 +5567,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
-            job = _cron_update(job_id, sanitized)
+            job = _cron_update(
+                job_id,
+                sanitized,
+                governance_resume=governance_resume,
+                governance_refresh=governance_refresh,
+                deprecated_verification_retirement=retirement,
+            )
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            _notify_cron_provider_jobs_changed()
+            if not governance_refresh and retirement is None:
+                _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
