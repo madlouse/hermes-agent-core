@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -40,6 +41,7 @@ import sys
 import signal
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -2524,6 +2526,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    RecoveryDeliveryContext,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -4636,6 +4639,11 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        force_final_delivery = bool(ctx.source.force_final_delivery)
+        interim_enabled = ctx.interim_assistant_messages_enabled
+        if force_final_delivery:
+            _streaming_enabled = False
+            interim_enabled = False
         try:
             (
                 _operator_streaming_boundary_armed,
@@ -4645,7 +4653,7 @@ class TurnRunner:
                 self._runner._resolve_profile_home_for_source(ctx.source),
                 ctx.source,
                 streaming_enabled=_streaming_enabled,
-                interim_enabled=ctx.interim_assistant_messages_enabled,
+                interim_enabled=interim_enabled,
                 # Every GatewayRunner final reply is screened before Base sends
                 # it. Buffer here, before installing any delta consumer, so the
                 # final deny/rewrite decision owns all user-visible content.
@@ -4661,7 +4669,7 @@ class TurnRunner:
             _want_interim_messages = False
         _streaming_boundary_buffered = bool(
             _operator_streaming_boundary_armed
-            and (_streaming_enabled or ctx.interim_assistant_messages_enabled)
+            and (_streaming_enabled or interim_enabled)
         )
         if _streaming_boundary_buffered:
             logger.info(
@@ -10471,6 +10479,107 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if (_pre_state.turn.agent if _pre_state else None) is _AGENT_PENDING_SENTINEL:
                 self._release_running_agent_state(session_key)
 
+    async def dispatch_recovered_message(
+        self,
+        adapter: BasePlatformAdapter,
+        event: MessageEvent,
+        *,
+        on_delivery_complete: Callable[[], Any],
+    ) -> Dict[str, Any]:
+        """Run a recovered inbound through the ordinary, screened send path."""
+        source = event.source
+        message_id = str(event.message_id or "").strip()
+        if not callable(on_delivery_complete):
+            return {
+                "status": "blocked",
+                "reason": "history_delivery_completion_missing",
+            }
+        if source is None or not message_id:
+            return {"status": "blocked", "reason": "history_delivery_context_invalid"}
+        expected_adapter = self._adapter_for_source(source)
+        if expected_adapter is not adapter or adapter.platform != source.platform:
+            return {"status": "blocked", "reason": "history_delivery_owner_mismatch"}
+
+        profile_home = self._resolve_profile_home_for_source(source).resolve()
+        profile_id = (
+            source.profile
+            or self._profile_name_for_source(source)
+            or self._active_profile_name()
+        )
+        profile_home_sha256 = hashlib.sha256(
+            str(profile_home).encode("utf-8")
+        ).hexdigest()
+        transport_id = str(
+            getattr(source.platform, "value", source.platform)
+        ).lower()
+        channel_id = str(source.chat_id or "").strip()
+        if not profile_id or not channel_id or transport_id != adapter.platform.value:
+            return {"status": "blocked", "reason": "history_delivery_owner_invalid"}
+
+        loop = asyncio.get_running_loop()
+        delivery_future: asyncio.Future[Dict[str, Any]] = loop.create_future()
+        idempotency_key = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                ":".join(
+                    (
+                        "hermes-recovery-delivery-v1",
+                        profile_home_sha256,
+                        transport_id,
+                        channel_id,
+                        message_id,
+                    )
+                ),
+            )
+        )
+        event.recovery_delivery = RecoveryDeliveryContext(
+            profile_id=str(profile_id),
+            profile_home_sha256=profile_home_sha256,
+            transport_id=transport_id,
+            channel_id=channel_id,
+            inbound_id=message_id,
+            idempotency_key=idempotency_key,
+            complete=on_delivery_complete,
+            future=delivery_future,
+        )
+        setattr(event, "_hermes_startup_restore_replay", True)
+        source.force_final_delivery = True
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=adapter.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=adapter.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+        )
+        await adapter.handle_message(event)
+        session_tasks = getattr(adapter, "_session_tasks", {})
+        task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
+        if task is None:
+            return {"status": "blocked", "reason": "recovered_turn_not_started"}
+        await asyncio.shield(task)
+        if not delivery_future.done():
+            return {"status": "blocked", "reason": "recovered_delivery_not_confirmed"}
+        return {**delivery_future.result(), "message_id": message_id}
+
+    async def _run_startup_recovery_hooks(self) -> None:
+        """Await plugin recovery work inside the existing startup gate."""
+        try:
+            from hermes_cli.plugins import invoke_hook
+
+            results = invoke_hook(
+                "gateway_startup_recovery",
+                gateway=self,
+                adapters=self.adapters,
+                platforms=[platform.value for platform in self.adapters],
+            )
+            for result in results:
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            logger.warning("Gateway startup history recovery failed: %s", exc)
+
     def _queue_startup_restore_event(self, event: MessageEvent) -> None:
         queue = getattr(self, "_startup_restore_queue", None)
         if queue is None:
@@ -11615,6 +11724,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._loop_heartbeat_task.add_done_callback(_bg.discard)
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
+
+        # Reconcile transport history before the startup gate releases queued
+        # live inbound messages.
+        await self._run_startup_recovery_hooks()
 
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -24047,6 +24160,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if source.force_final_delivery:
+            _streaming_enabled = False
         _streaming_requested = _streaming_enabled
         try:
             (
