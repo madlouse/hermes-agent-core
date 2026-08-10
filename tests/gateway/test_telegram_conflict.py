@@ -1,5 +1,7 @@
 import asyncio
 import sys
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -361,6 +363,67 @@ async def test_connect_does_not_block_on_post_connect_housekeeping(monkeypatch):
     await adapter.disconnect()
     assert adapter._post_connect_task is None
     await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
+async def test_post_connect_skill_scan_does_not_block_event_loop(monkeypatch):
+    """A large skill tree must not starve gateway liveness or other connects."""
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._bot = SimpleNamespace(set_my_commands=AsyncMock())
+    monkeypatch.setattr(adapter, "_set_status_indicator", AsyncMock())
+    monkeypatch.setattr(adapter, "_setup_dm_topics", AsyncMock())
+
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+    scan_started_at = 0.0
+
+    def _slow_menu_scan(*, max_commands):
+        nonlocal scan_started_at
+        scan_started_at = time.monotonic()
+        scan_started.set()
+        release_scan.wait(timeout=0.75)
+        return [], 0
+
+    monkeypatch.setattr("hermes_cli.commands.telegram_menu_commands", _slow_menu_scan)
+
+    task = asyncio.create_task(adapter._run_post_connect_housekeeping())
+    try:
+        assert await asyncio.to_thread(scan_started.wait, 1)
+        await asyncio.sleep(0.05)
+        assert time.monotonic() - scan_started_at < 0.25
+    finally:
+        release_scan.set()
+        await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_menu_scan_is_reused_by_next_caller(monkeypatch):
+    """Cancellation must not orphan a worker and launch a concurrent rescan."""
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+    calls = 0
+
+    def _slow_menu_scan(*, max_commands):
+        nonlocal calls
+        calls += 1
+        scan_started.set()
+        release_scan.wait(timeout=2)
+        return [("status", "Status")], 0
+
+    monkeypatch.setattr("hermes_cli.commands.telegram_menu_commands", _slow_menu_scan)
+
+    first = asyncio.create_task(adapter._command_menu_off_loop(max_commands=60))
+    assert await asyncio.to_thread(scan_started.wait, 1)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    second = asyncio.create_task(adapter._command_menu_off_loop(max_commands=60))
+    await asyncio.sleep(0.05)
+    assert calls == 1
+    release_scan.set()
+    assert await asyncio.wait_for(second, timeout=1) == ([("status", "Status")], 0)
 
 
 @pytest.mark.asyncio

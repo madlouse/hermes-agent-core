@@ -11,16 +11,22 @@ runs at a time if multiple processes overlap.
 import asyncio
 import atexit
 import concurrent.futures
+import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -32,14 +38,18 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     _expand_env_vars,
@@ -48,8 +58,25 @@ from hermes_cli.config import (
 )
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
+from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
+_IS_WINDOWS = sys.platform == "win32"
+
+
+@dataclass(frozen=True)
+class _RunJobResult:
+    success: bool
+    output: str
+    final_response: str
+    error: Optional[str]
+    runtime_admission_receipt: dict[str, Any] | None = None
+    runtime_admission_decision: dict[str, Any] | None = None
+    cleanup_incomplete: bool = False
+    delivery_frame: str | None = None
+
+    def legacy_tuple(self) -> tuple[bool, str, str, Optional[str]]:
+        return self.success, self.output, self.final_response, self.error
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -144,6 +171,18 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return f"⚠️ Cron '{job_name}' failed: {cleaned}"
 
 
+def _runtime_admission_failure_document(job: dict, receipt: dict) -> str:
+    """Render a safe local audit document for a denied runtime admission."""
+    return (
+        "# Cron run blocked before execution\n\n"
+        f"- job id: {job.get('id', '')}\n"
+        f"- reason: {receipt.get('reason_code', 'runtime_binding_required')}\n"
+        f"- state: {receipt.get('state', 'review_required')}\n"
+        f"- retryable: {str(bool(receipt.get('retryable'))).lower()}\n"
+        f"- receipt id: {receipt.get('receipt_id', '')}\n"
+    )
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -155,6 +194,29 @@ class CronPromptInjectionBlocked(Exception):
     malicious skill could carry an injection payload that reached the
     non-interactive (auto-approve) cron agent.
     """
+
+
+class CronRunOutcomeOwnershipLost(RuntimeError):
+    """The current worker no longer owns its persisted run-outcome claim."""
+
+
+def _renew_run_outcome_claim_or_raise(
+    job_id: str,
+    claim: dict[str, Any],
+) -> None:
+    """Refresh one exact claim in place, failing closed on any ownership doubt."""
+    try:
+        refreshed = heartbeat_job_run_outcome(job_id, claim)
+    except Exception as exc:
+        raise CronRunOutcomeOwnershipLost(
+            f"Cron job '{job_id}' lost run-outcome ownership during renewal"
+        ) from exc
+    if refreshed is None:
+        raise CronRunOutcomeOwnershipLost(
+            f"Cron job '{job_id}' no longer owns its run-outcome claim"
+        )
+    claim.clear()
+    claim.update(refreshed)
 
 
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
@@ -178,6 +240,579 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
         if name and name not in disabled:
             disabled.append(name)
     return disabled
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    """Return a positive integer setting, rejecting booleans and invalid values."""
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _resolve_cron_max_iterations(job: dict, cfg: dict) -> int:
+    """Resolve the bounded turn budget for a scheduled execution."""
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    for candidate in (
+        job.get("max_turns"),
+        cron_cfg.get("max_turns"),
+        agent_cfg.get("max_turns"),
+        cfg.get("max_turns"),
+        90,
+    ):
+        resolved = _positive_int(candidate)
+        if resolved is not None:
+            return resolved
+    return 90
+
+
+def _resolve_cron_run_timeout_seconds(job: dict, cfg: dict) -> Optional[float]:
+    """Resolve one run's total deadline; zero is an explicit opt-out."""
+    cron_cfg = cfg.get("cron") if isinstance(cfg.get("cron"), dict) else {}
+    for candidate in (
+        job.get("run_timeout_seconds"),
+        cron_cfg.get("run_timeout_seconds"),
+    ):
+        if isinstance(candidate, bool) or candidate is None:
+            continue
+        try:
+            resolved = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if resolved == 0:
+            return None
+        if resolved > 0:
+            return resolved
+    return None
+
+
+def _cron_timeout_cleanup_grace(run_timeout: Optional[float]) -> float:
+    """Reserve a bounded tail of the total deadline for cancellation cleanup."""
+    if run_timeout is None:
+        return 5.0
+    return min(5.0, max(0.05, float(run_timeout) * 0.1))
+
+
+_CRON_ENTRY_TIMEOUT_UNSET = object()
+_CRON_ENTRY_CONFIG_MAX_BYTES = 1024 * 1024
+
+
+def _preparse_cron_run_timeout(job: dict) -> object | Optional[float]:
+    """Read only the entry deadline from trusted Profile-local config.yaml.
+
+    This deliberately avoids dotenv, managed overlays, plugin discovery, and
+    the full config/default pipeline: those are inside the deadline boundary.
+    The file must be regular and bounded before parsing. A valid per-job value
+    remains authoritative, including zero as an explicit opt-out.
+    """
+    raw_job = job.get("run_timeout_seconds")
+    if raw_job is not None and not isinstance(raw_job, bool):
+        try:
+            parsed = float(raw_job)
+        except (TypeError, ValueError):
+            parsed = -1
+        if parsed >= 0:
+            return None if parsed == 0 else parsed
+
+    config_path = _get_hermes_home() / "config.yaml"
+    try:
+        stat_result = config_path.stat()
+        if not config_path.is_file() or stat_result.st_size > _CRON_ENTRY_CONFIG_MAX_BYTES:
+            return _CRON_ENTRY_TIMEOUT_UNSET
+        with open(config_path, "rb") as handle:
+            payload = handle.read(_CRON_ENTRY_CONFIG_MAX_BYTES + 1)
+        if len(payload) > _CRON_ENTRY_CONFIG_MAX_BYTES:
+            return _CRON_ENTRY_TIMEOUT_UNSET
+        from utils import fast_safe_load
+
+        cfg = fast_safe_load(payload) or {}
+    except Exception:
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    if not isinstance(cfg, dict):
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    cron_cfg = cfg.get("cron")
+    if not isinstance(cron_cfg, dict):
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    raw_timeout = cron_cfg.get("run_timeout_seconds")
+    if raw_timeout is None or isinstance(raw_timeout, bool):
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    try:
+        parsed = float(raw_timeout)
+    except (TypeError, ValueError):
+        return _CRON_ENTRY_TIMEOUT_UNSET
+    if parsed == 0:
+        return None
+    return parsed if parsed > 0 else _CRON_ENTRY_TIMEOUT_UNSET
+
+
+_CRON_INTERRUPT_WORKER_LIMIT = 4
+_CRON_INTERRUPT_THREAD_PREFIX = "cron-bounded-interrupt"
+
+
+class _CronBoundedInterruptRunner:
+    """Run interrupt work only when a process-wide worker slot is available."""
+
+    def __init__(self, max_workers: int) -> None:
+        self.max_workers = max_workers
+        self._slots = threading.BoundedSemaphore(max_workers)
+        self._lock = threading.Lock()
+        self._active = 0
+        self._next_worker_id = 1
+
+    def submit(self, task: Callable[[], None], *, operation: str) -> bool:
+        """Start immediately or reject; this runner never queues work."""
+        if not self._slots.acquire(blocking=False):
+            return False
+        with self._lock:
+            worker_id = self._next_worker_id
+            self._next_worker_id += 1
+            self._active += 1
+
+        def _run() -> None:
+            try:
+                task()
+            finally:
+                with self._lock:
+                    self._active -= 1
+                    self._slots.release()
+
+        worker = threading.Thread(
+            target=_run,
+            name=f"{_CRON_INTERRUPT_THREAD_PREFIX}-{operation}-{worker_id}",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            with self._lock:
+                self._active -= 1
+                self._slots.release()
+            return False
+        return True
+
+    def active_count(self) -> int:
+        with self._lock:
+            return self._active
+
+
+_cron_bounded_interrupt_runner = _CronBoundedInterruptRunner(
+    _CRON_INTERRUPT_WORKER_LIMIT
+)
+
+
+@dataclass(frozen=True)
+class _CronInterruptResult:
+    cleanup_complete: bool
+    agent_interrupt_complete: bool = True
+
+    @property
+    def cleanup_incomplete(self) -> bool:
+        return not (self.cleanup_complete and self.agent_interrupt_complete)
+
+
+class _CronScriptCleanup:
+    """Single-owner process cleanup with a completion fence for all callers."""
+
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        *,
+        on_finished: Optional[Callable[["_CronScriptCleanup"], None]] = None,
+    ) -> None:
+        self.process = process
+        self._lock = threading.Lock()
+        self._claimed = False
+        self._completed = False
+        self._error: Optional[BaseException] = None
+        self._on_finished = on_finished
+        self.done = threading.Event()
+
+    @property
+    def completed(self) -> bool:
+        with self._lock:
+            return self._completed
+
+    @property
+    def error(self) -> Optional[BaseException]:
+        with self._lock:
+            return self._error
+
+    def _perform(self, *, kill: bool) -> None:
+        error = None
+        try:
+            if kill:
+                _kill_cron_process_group(self.process)
+            else:
+                self.process.wait()
+        except BaseException as exc:
+            error = exc
+        finally:
+            with self._lock:
+                self._completed = error is None
+                self._error = error
+            self.done.set()
+            if self._on_finished is not None:
+                try:
+                    self._on_finished(self)
+                except Exception:
+                    logger.debug(
+                        "Cron script cleanup completion callback failed",
+                        exc_info=True,
+                    )
+        if error is not None:
+            raise error
+
+    def _perform_in_background(self, *, kill: bool) -> None:
+        try:
+            self._perform(kill=kill)
+        except BaseException:
+            logger.warning("Cron script cleanup failed", exc_info=True)
+
+    def cleanup(self, *, kill: bool, timeout: Optional[float] = None) -> bool:
+        """Run/await the single cleanup, bounded when ``timeout`` is supplied."""
+        with self._lock:
+            owner = not self._claimed
+            if owner:
+                self._claimed = True
+        if owner:
+            accepted = _cron_bounded_interrupt_runner.submit(
+                lambda: self._perform_in_background(kill=kill),
+                operation="script-cleanup",
+            )
+            if not accepted:
+                with self._lock:
+                    self._error = RuntimeError(
+                        "Cron interrupt worker capacity exhausted"
+                    )
+                self.done.set()
+                return False
+        finished = self.done.wait(timeout=timeout)
+        if owner and timeout is None and finished:
+            error = self.error
+            if error is not None:
+                raise error
+        return bool(finished and self.completed)
+
+
+class _CronRunControl:
+    """Shared deadline, interrupt target, and revocation fence for one run."""
+
+    def __init__(
+        self,
+        job: dict,
+        *,
+        started_at: Optional[float] = None,
+        entry_timeout: object | Optional[float] = _CRON_ENTRY_TIMEOUT_UNSET,
+    ) -> None:
+        from gateway.session_context import new_cron_runtime_lease
+
+        self.started_at = started_at if started_at is not None else time.monotonic()
+        self.lease = new_cron_runtime_lease()
+        self._condition = threading.Condition()
+        self._timeout: Optional[float] = None
+        self._configured = False
+        self._agent = None
+        self._script_process: Optional[subprocess.Popen] = None
+        self._script_cleanup: Optional[_CronScriptCleanup] = None
+        self._script_spawn_in_progress = False
+        self._interrupted = False
+        self._interrupt_reason = ""
+        self._cleanup_incomplete = False
+        self._agent_interrupt_started = False
+        self._agent_interrupt_done = threading.Event()
+        self._agent_interrupt_failed = False
+
+        raw_override = job.get("run_timeout_seconds")
+        if raw_override is not None and not isinstance(raw_override, bool):
+            try:
+                parsed = float(raw_override)
+            except (TypeError, ValueError):
+                parsed = -1
+            if parsed >= 0:
+                self.configure(None if parsed == 0 else parsed)
+        if not self._configured and entry_timeout is not _CRON_ENTRY_TIMEOUT_UNSET:
+            self.configure(entry_timeout)
+
+    def configure(self, timeout: Optional[float]) -> None:
+        """Publish the effective timeout once; per-job values stay authoritative."""
+        with self._condition:
+            if self._configured:
+                return
+            self._timeout = timeout
+            self._configured = True
+            self._condition.notify_all()
+
+    def wait_timeout(self, maximum: float = 0.05) -> float:
+        with self._condition:
+            if not self._configured:
+                return maximum
+            if self._timeout is None:
+                return maximum
+            remaining = self._timeout - (time.monotonic() - self.started_at)
+            return max(0.0, min(maximum, remaining))
+
+    def remaining(self) -> Optional[float]:
+        with self._condition:
+            if not self._configured or self._timeout is None:
+                return None
+            return self._timeout - (time.monotonic() - self.started_at)
+
+    def cleanup_grace(self) -> float:
+        with self._condition:
+            return _cron_timeout_cleanup_grace(
+                self._timeout if self._configured else None
+            )
+
+    def hard_deadline(self) -> Optional[float]:
+        with self._condition:
+            if not self._configured or self._timeout is None:
+                return None
+            return self.started_at + self._timeout
+
+    def provider_deadline(self) -> Optional[float]:
+        hard_deadline = self.hard_deadline()
+        if hard_deadline is None:
+            return None
+        return hard_deadline - self.cleanup_grace()
+
+    def execution_remaining(self) -> Optional[float]:
+        provider_deadline = self.provider_deadline()
+        if provider_deadline is None:
+            return None
+        return provider_deadline - time.monotonic()
+
+    def timeout(self) -> Optional[float]:
+        with self._condition:
+            return self._timeout if self._configured else None
+
+    def set_agent(self, agent: Any) -> None:
+        start_agent_interrupt = False
+        interrupt_reason = ""
+        with self._condition:
+            self._agent = agent
+            if self._interrupted and not self._agent_interrupt_started:
+                self._agent_interrupt_started = True
+                start_agent_interrupt = True
+                interrupt_reason = self._interrupt_reason or "Cron run interrupted"
+        if start_agent_interrupt:
+            self._start_agent_interrupt(agent, interrupt_reason)
+
+    def _start_agent_interrupt(self, agent: Any, reason: str) -> None:
+        """Start the single claimed agent interrupt without queuing work."""
+        def _interrupt_agent() -> None:
+            try:
+                accepted = request_hard_interrupt(agent, reason)
+                if not accepted:
+                    with self._condition:
+                        self._agent_interrupt_failed = True
+                        self._cleanup_incomplete = True
+            except BaseException:
+                with self._condition:
+                    self._agent_interrupt_failed = True
+                    self._cleanup_incomplete = True
+            finally:
+                self._agent_interrupt_done.set()
+
+        accepted = _cron_bounded_interrupt_runner.submit(
+            _interrupt_agent,
+            operation="agent-interrupt",
+        )
+        if not accepted:
+            with self._condition:
+                self._agent_interrupt_failed = True
+                self._cleanup_incomplete = True
+            self._agent_interrupt_done.set()
+
+    def begin_script_spawn(self) -> bool:
+        """Fence Popen creation against a concurrent deadline revocation."""
+        with self._condition:
+            if self._interrupted:
+                return False
+            self._script_spawn_in_progress = True
+            return True
+
+    def cancel_script_spawn(self) -> None:
+        with self._condition:
+            self._script_spawn_in_progress = False
+            self._condition.notify_all()
+
+    def attach_script_process(
+        self, process: subprocess.Popen
+    ) -> _CronScriptCleanup:
+        """Publish a Popen and its shared cleanup fence before leaving spawn."""
+        cleanup = _CronScriptCleanup(
+            process, on_finished=self._script_cleanup_finished
+        )
+        with self._condition:
+            self._script_process = process
+            self._script_cleanup = cleanup
+            self._script_spawn_in_progress = False
+            interrupted = self._interrupted
+            self._condition.notify_all()
+        if interrupted:
+            self.cleanup_script_process(cleanup, kill=True, timeout=0.0)
+        return cleanup
+
+    def _script_cleanup_finished(self, cleanup: _CronScriptCleanup) -> None:
+        """Clear only a genuinely completed late cleanup from published state."""
+        with self._condition:
+            if self._script_cleanup is cleanup and cleanup.completed:
+                self._script_cleanup = None
+                self._script_process = None
+                self._condition.notify_all()
+
+    def cleanup_script_process(
+        self,
+        cleanup: _CronScriptCleanup,
+        *,
+        kill: bool,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        """Run or await the process's one cleanup, then clear published state."""
+        completed = cleanup.cleanup(kill=kill, timeout=timeout)
+        with self._condition:
+            if self._script_cleanup is cleanup and completed:
+                self._script_cleanup = None
+                self._script_process = None
+                self._condition.notify_all()
+            elif not completed:
+                self._cleanup_incomplete = True
+        return completed
+
+    def cleanup_incomplete(self) -> bool:
+        """Return the sticky cleanup-deadline failure state for this run."""
+        with self._condition:
+            return self._cleanup_incomplete
+
+    def raise_if_expired(self, stage: str) -> None:
+        remaining = self.remaining()
+        if remaining is not None and remaining <= 0:
+            timeout = self.timeout() or 0.0
+            raise TimeoutError(
+                f"Cron total runtime limit of {timeout:g}s expired during {stage}"
+            )
+
+    def interrupt(
+        self,
+        reason: str,
+        *,
+        cleanup_timeout: Optional[float] = None,
+    ) -> _CronInterruptResult:
+        from gateway.session_context import revoke_cron_runtime_lease
+
+        revoke_cron_runtime_lease(self.lease)
+        if cleanup_timeout is None:
+            cleanup_timeout = self.cleanup_grace()
+        cleanup_timeout = max(0.0, float(cleanup_timeout))
+        cleanup_deadline = time.monotonic() + cleanup_timeout
+        script_spawn_incomplete = False
+        with self._condition:
+            self._interrupted = True
+            if not self._interrupt_reason:
+                self._interrupt_reason = reason
+            agent = self._agent
+            start_agent_interrupt = agent is not None and not self._agent_interrupt_started
+            if start_agent_interrupt:
+                self._agent_interrupt_started = True
+            while self._script_spawn_in_progress:
+                remaining = cleanup_deadline - time.monotonic()
+                if remaining <= 0.0:
+                    self._cleanup_incomplete = True
+                    script_spawn_incomplete = True
+                    break
+                self._condition.wait(timeout=remaining)
+            cleanup = self._script_cleanup
+        if start_agent_interrupt:
+            self._start_agent_interrupt(agent, self._interrupt_reason)
+        cleanup_complete = cleanup is None and not script_spawn_incomplete
+        if cleanup is not None:
+            cleanup_complete = self.cleanup_script_process(
+                cleanup,
+                kill=True,
+                timeout=max(0.0, cleanup_deadline - time.monotonic()),
+            )
+        agent_interrupt_complete = True
+        if agent is not None:
+            remaining = max(0.0, cleanup_deadline - time.monotonic())
+            if remaining > 0.0:
+                self._agent_interrupt_done.wait(timeout=remaining)
+            with self._condition:
+                agent_interrupt_complete = bool(
+                    self._agent_interrupt_done.is_set()
+                    and not self._agent_interrupt_failed
+                )
+                if not agent_interrupt_complete:
+                    self._cleanup_incomplete = True
+        return _CronInterruptResult(
+            cleanup_complete=cleanup_complete,
+            agent_interrupt_complete=agent_interrupt_complete,
+        )
+
+
+class _DeferredCronAgentCollector:
+    """Close agents that finish after their owning run already timed out."""
+
+    def __init__(self, job_id: str) -> None:
+        self._job_id = job_id
+        self._lock = threading.Lock()
+        self._agents: list[Any] = []
+        self._revoked = False
+
+    def append(self, agent: Any) -> None:
+        with self._lock:
+            if not self._revoked:
+                self._agents.append(agent)
+                return
+        _teardown_cron_agent(agent, self._job_id)
+
+    def transfer_to(self, target: list) -> None:
+        with self._lock:
+            agents, self._agents = self._agents, []
+        target.extend(agents)
+
+    def revoke(self) -> None:
+        with self._lock:
+            self._revoked = True
+            agents, self._agents = self._agents, []
+        for agent in agents:
+            _teardown_cron_agent(agent, self._job_id)
+
+
+def _cron_authorization_values(job: dict) -> dict[str, str]:
+    """Project a persisted job into the in-process authorization context."""
+    categories = job.get("implementation_categories")
+    if isinstance(categories, (list, tuple, set)):
+        category_items = [
+            str(item).strip() for item in categories if str(item or "").strip()
+        ]
+        if isinstance(categories, set):
+            category_items.sort()
+        categories_text = json.dumps(category_items)
+    else:
+        categories_text = str(categories or "")
+    join_keys = job.get("join_keys") if isinstance(job.get("join_keys"), dict) else {}
+    return {
+        "HERMES_CRON_JOB_ID": str(job.get("id") or ""),
+        "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": str(
+            job.get("authorized_behavior_ref") or ""
+        ),
+        "HERMES_CRON_PROCESS_CHARTER_REF": str(job.get("process_charter_ref") or ""),
+        "HERMES_CRON_RISK_TIER": str(job.get("risk_tier") or ""),
+        "HERMES_CRON_IMPLEMENTATION_CATEGORIES": categories_text,
+        "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": str(
+            job.get("implementation_path_evidence_ref") or ""
+        ),
+        "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": str(
+            job.get("observed_scope_evidence_ref") or ""
+        ),
+        "HERMES_CRON_CANDIDATE_HASH": str(
+            job.get("candidate_hash") or join_keys.get("candidate_hash") or ""
+        ),
+    }
 
 
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
@@ -281,13 +916,354 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    _CRON_TRUSTED_BASH_PATHS,
+    _cron_run_outcome_receipt,
+    _cron_run_script_snapshot,
+    abandon_job_run_outcome,
+    advance_next_runs,
+    begin_job_run_outcome,
+    bind_operational_notice_transport_request,
+    claim_dispatch,
+    claim_operational_notice_delivery,
+    CronCreationProfileBindingError,
+    cron_creation_profile_identity,
+    get_due_jobs,
+    get_cron_profile_home,
+    heartbeat_operational_notice_delivery,
+    heartbeat_job_run_outcome,
+    heartbeat_run_claim,
+    mark_job_run,
+    mark_operational_notice_delivery,
+    record_job_run_preflight_denial,
+    save_job_output,
+    use_cron_store,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS = 300
+_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS = 60.0
+
+_OPERATIONAL_NOTICE_FIELDS = {
+    "status",
+    "schema_version",
+    "purpose",
+    "profile_id",
+    "classification",
+    "evidence_ref",
+    "fingerprint",
+    "persist",
+    "local_retrieval",
+    "expires_at",
+    "source_target",
+    "target",
+    "target_source",
+    "idempotency_key",
+    "admin_content",
+    "user_content",
+}
+
+
+class _OperationalNoticeHeartbeat:
+    """Keep one notice owner alive across screening, outbox, and transport."""
+
+    def __init__(self, job_id: str, key: str, owner: str, profile_home: Path):
+        self.job_id = job_id
+        self.key = key
+        self.owner = owner
+        self.profile_home = profile_home
+        self.request_id = ""
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"cron-notice-heartbeat-{job_id}",
+            daemon=True,
+        )
+
+    def _pulse(self) -> None:
+        with _operational_notice_profile_scope(self.profile_home):
+            result = heartbeat_operational_notice_delivery(
+                self.job_id,
+                self.key,
+                claim_owner=self.owner,
+                transport_request_id=self.request_id,
+                lease_seconds=_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
+            )
+        if result.get("status") != "claimed":
+            self._lost.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS):
+            try:
+                self._pulse()
+            except Exception:
+                self._lost.set()
+                return
+
+    def start(self) -> None:
+        self._pulse()
+        self._thread.start()
+
+    def bind_request(self, request_id: str) -> None:
+        self.request_id = request_id
+        self.ensure_owner()
+
+    def ensure_owner(self) -> None:
+        if self._lost.is_set():
+            raise RuntimeError("operational notice claim ownership lost")
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=max(_OPERATIONAL_NOTICE_HEARTBEAT_SECONDS * 2, 1.0))
+
+
+@contextlib.contextmanager
+def _operational_notice_profile_scope(profile_home: Path):
+    """Pin notice state and profile-scoped dependencies to one owning home."""
+    token = set_hermes_home_override(profile_home)
+    try:
+        with use_cron_store(profile_home):
+            yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _ready_operational_notice(raw: Any) -> dict | None:
+    """Return a strictly shaped, safe plan from an already denied decision."""
+    notice = raw.get("operational_notice") if isinstance(raw, dict) else None
+    if not isinstance(notice, dict) or set(notice) - _OPERATIONAL_NOTICE_FIELDS:
+        return None
+    target = notice.get("target")
+    if (
+        notice.get("status") != "ready"
+        or notice.get("schema_version") != "operational-notice/v1"
+        or notice.get("purpose") != "operational_notification"
+        or notice.get("classification") not in {"credential_secret", "restricted_operational_raw", "internal_detail"}
+        or not isinstance(target, dict)
+        or set(target) != {"transport_id", "channel_id", "chat_type"}
+        or target.get("chat_type") != "dm"
+        or not all(isinstance(notice.get(key), str) and notice[key] for key in ("profile_id", "evidence_ref", "idempotency_key", "admin_content"))
+    ):
+        return None
+    return dict(notice)
+
+
+def _deliver_operational_notice(job: dict, raw_decision: Any, adapters=None, loop=None) -> str:
+    """Re-screen one notice, then hand its exact route/content to the outbox sender."""
+    notice = _ready_operational_notice(raw_decision)
+    if notice is None:
+        return "not_available"
+    try:
+        owning_profile_home = get_cron_profile_home().resolve(strict=True)
+        if not owning_profile_home.is_dir():
+            return "profile_unverified"
+    except (OSError, RuntimeError):
+        return "profile_unverified"
+    with _operational_notice_profile_scope(owning_profile_home):
+        return _deliver_operational_notice_in_profile(
+            job,
+            notice,
+            owning_profile_home=owning_profile_home,
+            adapters=adapters,
+            loop=loop,
+        )
+
+
+def _deliver_operational_notice_in_profile(
+    job: dict,
+    notice: dict,
+    *,
+    owning_profile_home: Path,
+    adapters=None,
+    loop=None,
+) -> str:
+    """Deliver with every stateful operation pinned to ``owning_profile_home``."""
+    try:
+        profile_id = cron_creation_profile_identity(job)["profile_id"]
+    except CronCreationProfileBindingError as exc:
+        return exc.code
+    except Exception:
+        return "profile_unverified"
+    if profile_id != notice["profile_id"]:
+        return "profile_mismatch"
+    try:
+        expires_at = datetime.fromisoformat(
+            str(notice["expires_at"]).replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return "notice_expiry_invalid"
+    if datetime.now(timezone.utc) >= expires_at:
+        return "notice_expired"
+    try:
+        claim = claim_operational_notice_delivery(
+            str(job.get("id") or ""),
+            notice["idempotency_key"],
+            lease_seconds=_OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - lack of a durable claim must not send
+        return "receipt_unavailable"
+    if claim.get("claimed") is not True:
+        return str(claim.get("status") or "not_claimed")
+    claim_owner = str(claim.get("claim_owner") or "")
+    heartbeat = _OperationalNoticeHeartbeat(
+        str(job.get("id") or ""),
+        notice["idempotency_key"],
+        claim_owner,
+        owning_profile_home,
+    )
+    try:
+        heartbeat.start()
+    except Exception:
+        return "ownership_lost"
+    target = notice["target"]
+    route = {
+        "transport_id": str(target["transport_id"]).lower(),
+        "channel_id": str(target["channel_id"]),
+        "thread_id": "",
+    }
+    transport_request: dict[str, Any] | None = None
+    result: dict[str, Any] = {}
+    try:
+        from gateway.outbound_boundary import (
+            build_outbound_context,
+            outbound_before_send_sync,
+        )
+
+        context = build_outbound_context(
+            source_kind="cron",
+            content=notice["admin_content"],
+            platform=route["transport_id"],
+            chat_id=route["channel_id"],
+            profile_id=profile_id,
+            profile_path=str(owning_profile_home),
+            producer_id="cron-operational-notice",
+            job_id=str(job.get("id") or ""),
+            target=target,
+            output_screening_required=True,
+            operational_notice_delivery=True,
+            operational_notice=notice,
+            looks_actionable=True,
+        )
+        decision = outbound_before_send_sync(_active_outbound_hooks(), context)
+        heartbeat.ensure_owner()
+        if not decision.transmit:
+            mark_operational_notice_delivery(
+                str(job.get("id") or ""),
+                notice["idempotency_key"],
+                "failed",
+                claim_owner=claim_owner,
+            )
+            heartbeat.stop()
+            return "screening_rejected"
+        screened_content = decision.content
+        from gateway.transport_outbox import visible_content_sha256
+        from tools.send_message_tool import send_message_tool
+
+        request_material = json.dumps(
+            {
+                "profile_id": profile_id,
+                "job_id": str(job.get("id") or ""),
+                "idempotency_key": notice["idempotency_key"],
+                "route": route,
+                "content": screened_content,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        request_digest = hashlib.sha256(request_material.encode("utf-8")).hexdigest()
+        transport_request = {
+            "request_id": f"cron-operational-notice:{request_digest}",
+            "profile_id": profile_id,
+            "frame_id": notice["evidence_ref"],
+            "notification_claim_id": notice["idempotency_key"],
+            "decision_route": route,
+            "notification_route": route,
+            "items_content_hash": f"sha256:{request_digest}",
+            "visible_content_sha256": visible_content_sha256(screened_content),
+            "claim_created_at": "1970-01-01T00:00:00+00:00",
+            "claim_expires_at": expires_at.isoformat(timespec="microseconds"),
+        }
+        existing_request_id = str(claim.get("transport_request_id") or "")
+        if existing_request_id and existing_request_id != transport_request["request_id"]:
+            heartbeat.stop()
+            return "request_conflict"
+        binding = bind_operational_notice_transport_request(
+            str(job.get("id") or ""),
+            notice["idempotency_key"],
+            claim_owner=claim_owner,
+            transport_request_id=transport_request["request_id"],
+        )
+        if binding.get("status") != "bound":
+            heartbeat.stop()
+            return str(binding.get("status") or "ownership_lost")
+        heartbeat.bind_request(transport_request["request_id"])
+        result = json.loads(
+            send_message_tool(
+                {
+                    "action": "send",
+                    "target": f"{route['transport_id']}:{route['channel_id']}",
+                    "message": screened_content,
+                    "profile_id": profile_id,
+                    "transport_request": transport_request,
+                }
+            )
+        )
+        heartbeat.ensure_owner()
+    except Exception:
+        result = {}
+    try:
+        if transport_request is not None:
+            from gateway.transport_outbox import verify_transport_receipt
+
+            verification = verify_transport_receipt(
+                transport_request,
+                home=owning_profile_home,
+            )
+        else:
+            verification = {"verified": False, "status": "not_bound"}
+        if verification.get("verified") is True:
+            receipt = verification.get("receipt") or {}
+            terminal = mark_operational_notice_delivery(
+                str(job.get("id") or ""),
+                notice["idempotency_key"],
+                "sent",
+                claim_owner=claim_owner,
+                transport_request_id=str(transport_request["request_id"]),
+                confirmed_transport_receipt_id=str(receipt.get("receipt_id") or ""),
+            )
+            return "sent" if terminal.get("status") == "sent" else str(
+                terminal.get("status") or "ownership_lost"
+            )
+        outcome = str(result.get("transport_outcome") or "")
+        status = "failed" if outcome == "definitively_rejected" else "uncertain"
+        terminal = mark_operational_notice_delivery(
+            str(job.get("id") or ""),
+            notice["idempotency_key"],
+            status,
+            claim_owner=claim_owner,
+            transport_request_id=(
+                str(transport_request["request_id"])
+                if transport_request is not None
+                else ""
+            ),
+        )
+        if terminal.get("status") == "sent":
+            return "sent"
+        if terminal.get("status") != status:
+            return str(terminal.get("status") or "ownership_lost")
+    except Exception:
+        return "uncertain"
+    finally:
+        heartbeat.stop()
+    return status
+
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -317,6 +1293,56 @@ def _is_cron_silence_response(text: str) -> bool:
 
     return is_autonomous_silence_response(text)
 
+
+def _extract_cron_final_response(text: str) -> str:
+    """Unwrap the canonical explicit frame used by autonomous lanes."""
+    from gateway.response_filters import extract_explicit_final_response
+
+    return extract_explicit_final_response(text)
+
+
+def _cron_final_response_parts(text: str) -> tuple[str, str | None]:
+    """Return control body and original frame, preserving present-empty."""
+    from gateway.response_filters import classify_explicit_final_response
+
+    frame_present, body = classify_explicit_final_response(text)
+    if frame_present:
+        return body, text
+    return text, None
+
+
+def _closed_cron_final_response_frame(text: str) -> str | None:
+    """Return the original closed frame, without treating examples as frames."""
+    _, frame = _cron_final_response_parts(text)
+    return frame
+
+
+def _strip_cron_silence_markers_from_report(text: str) -> str:
+    """Remove report markers without altering examples inside code fences."""
+    if not isinstance(text, str):
+        return text
+    tokens = {"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"}
+    retained = []
+    fence: str | None = None
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        fence_match = re.match(r"(```+|~~~+)", stripped)
+        in_fence = fence is not None
+        if fence_match:
+            token = fence_match.group(1)
+            if fence is None:
+                fence = token
+                in_fence = True
+            elif (
+                token[0] == fence[0]
+                and len(token) >= len(fence)
+                and not stripped[fence_match.end() :].strip()
+            ):
+                fence = None
+        if in_fence or " ".join(line.strip().upper().split()) not in tokens:
+            retained.append(line)
+    return "\n".join(retained).strip()
+
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
 # The tick function submits jobs here and returns immediately so the ticker
@@ -327,6 +1353,16 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
+# Serializes the narrow durable-dispatch -> phase-publication transition with
+# shutdown without holding ``_running_lock`` across the jobs store lock.
+_dispatch_transition_lock = threading.Lock()
+
+# Per-run state guarded by ``_running_lock``. The shutdown path uses the exact
+# signed claim and dispatch phase to distinguish an unexecuted preflight claim
+# (abandon it) from a committed run (persist an interrupted terminal state).
+_running_job_states: dict[str, dict[str, Any]] = {}
+_RUNNING_STATE_UNSET = object()
+
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
 # below). ``run_one_job``'s own completion path checks this set before
@@ -335,6 +1371,54 @@ _running_lock = threading.Lock()
 # plausible-looking final response from truncated output — can never
 # overwrite the interrupted status with a false "ok" (#60432).
 _interrupted_job_ids: set = set()
+
+
+def _set_running_job_state(
+    job_id: str,
+    phase: str,
+    *,
+    run_outcome_claim: Any = _RUNNING_STATE_UNSET,
+    run_claim: Any = _RUNNING_STATE_UNSET,
+    fire_claim: Any = _RUNNING_STATE_UNSET,
+) -> bool:
+    """Record one run phase and return whether shutdown already claimed it."""
+    with _running_lock:
+        state = _running_job_states.setdefault(job_id, {})
+        state["phase"] = phase
+        if run_outcome_claim is not _RUNNING_STATE_UNSET:
+            state["run_outcome_claim"] = run_outcome_claim
+        if run_claim is not _RUNNING_STATE_UNSET:
+            state["run_claim"] = run_claim
+        if fire_claim is not _RUNNING_STATE_UNSET:
+            state["fire_claim"] = fire_claim
+        return job_id in _interrupted_job_ids
+
+
+def _claim_dispatch_with_running_state(
+    job_id: str,
+    run_outcome_claim: Optional[dict[str, Any]],
+) -> tuple[bool, bool]:
+    """Claim a dispatch while its shutdown-visible phase changes atomically."""
+    with _dispatch_transition_lock:
+        if _set_running_job_state(job_id, "attempting"):
+            return False, True
+        try:
+            allowed = (
+                claim_dispatch(job_id)
+                if run_outcome_claim is None
+                else claim_dispatch(
+                    job_id,
+                    run_outcome_claim=run_outcome_claim,
+                )
+            )
+        except BaseException:
+            _set_running_job_state(job_id, "ambiguous")
+            raise
+        interrupted = _set_running_job_state(
+            job_id,
+            "committed" if allowed else "refused",
+        )
+        return allowed, interrupted
 
 
 def get_running_job_ids() -> "frozenset[str]":
@@ -380,14 +1464,35 @@ def mark_running_jobs_interrupted(reason: str) -> list:
 
     Returns the list of job IDs marked, for the caller to log.
     """
-    with _running_lock:
-        job_ids = list(_running_job_ids)
-        _interrupted_job_ids.update(job_ids)
+    with _dispatch_transition_lock:
+        with _running_lock:
+            job_ids = list(_running_job_ids)
+            _interrupted_job_ids.update(job_ids)
+            states = {
+                job_id: dict(_running_job_states.get(job_id, {}))
+                for job_id in job_ids
+            }
     marked = []
     for job_id in job_ids:
+        state = states[job_id]
+        phase = state.get("phase", "executing")
+        claim = state.get("run_outcome_claim")
         try:
-            mark_job_run(job_id, False, reason)
-            marked.append(job_id)
+            if phase in {"queued", "ambiguous"}:
+                continue
+            if phase in {"preflight", "attempting", "refused"}:
+                if claim is not None:
+                    abandon_job_run_outcome(
+                        job_id,
+                        claim,
+                        reason_code="run_outcome_interrupted_before_dispatch",
+                        run_claim=state.get("run_claim"),
+                        fire_claim=state.get("fire_claim"),
+                    )
+                continue
+            kwargs = {"run_outcome_claim": claim} if claim is not None else {}
+            if mark_job_run(job_id, False, reason, **kwargs):
+                marked.append(job_id)
         except Exception as e:
             logger.warning("Failed to mark job %s interrupted: %s", job_id, e)
     return marked
@@ -818,9 +1923,19 @@ def _seed_cron_thread_session(
             except (ValueError, KeyError):
                 platform_enum = None
             if platform_enum is not None:
+                # Discord thread destinations must key on the thread's OWN id
+                # to match how the Discord adapter keys organic in-thread
+                # messages (chat_id == thread_id). Other platforms (Slack,
+                # Telegram) use chat_id == parent_channel for thread messages,
+                # so the parent chat_id is correct for them. See the matching
+                # guard in GatewayRunner._process_handoff.
+                if platform_enum == Platform.DISCORD:
+                    seed_chat_id = str(thread_id)
+                else:
+                    seed_chat_id = str(chat_id)
                 dest_source = SessionSource(
                     platform=platform_enum,
-                    chat_id=str(chat_id),
+                    chat_id=seed_chat_id,
                     chat_name=chat_name,
                     chat_type="thread",
                     user_id="system:cron",
@@ -1322,7 +2437,8 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+    heartbeat: Callable[[], None] | None = None,
+) -> list[dict[str, Any]]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -1334,9 +2450,12 @@ def _send_media_via_adapter(
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    receipts: list[dict[str, Any]] = []
 
     for media_path, _is_voice in media_files:
         try:
+            if heartbeat is not None:
+                heartbeat()
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
@@ -1355,19 +2474,30 @@ def _send_media_via_adapter(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
                     job.get("id", "?"), media_path,
                 )
-                return
+                _append_failed_delivery_receipt(receipts, kind="media", error_kind="loop_unavailable")
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
-                future.cancel()
-                raise
+                if future.cancel():
+                    _append_failed_delivery_receipt(receipts, kind="media", error_kind="delivery_timeout")
+                else:
+                    _append_unconfirmed_delivery_receipt(receipts, kind="media")
+                continue
+            if heartbeat is not None:
+                heartbeat()
+            _append_delivery_receipt(receipts, result, kind="media")
             if result and not getattr(result, "success", True):
                 logger.warning(
                     "Job '%s': media send failed for %s: %s",
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
+        except CronRunOutcomeOwnershipLost:
+            raise
         except Exception as e:
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            _append_failed_delivery_receipt(receipts, kind="media")
+    return receipts
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1389,6 +2519,140 @@ def _confirm_adapter_delivery(send_result) -> bool:
     if not hasattr(send_result, "success"):
         return False
     return bool(getattr(send_result, "success"))
+
+
+def _active_outbound_hooks():
+    """Return the live gateway hook registry, if cron shares its process."""
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        return getattr(runner, "hooks", None) if runner is not None else None
+    except Exception:
+        return None
+
+
+def _record_confirmed_outbound_send(hooks, context, send_result) -> None:
+    """Emit after-send evidence without changing an already confirmed send."""
+    try:
+        from gateway.outbound_boundary import (
+            outbound_after_send_sync,
+            send_result_payload,
+        )
+
+        payload = send_result_payload(send_result)
+        outbound_after_send_sync(
+            hooks,
+            {
+                **context,
+                "send_result": payload,
+                "source_outbox_id": (
+                    payload.get("outbox_id")
+                    or payload.get("message_id")
+                    or payload.get("id")
+                    or ""
+                ),
+                "success": True,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': outbound after-send audit failed after confirmed delivery: %s",
+            context.get("job_id", "?"),
+            exc,
+        )
+
+
+
+
+def _append_delivery_receipt(
+    receipts: list[dict[str, Any]] | None,
+    result: Any,
+    *,
+    kind: str,
+) -> None:
+    """Record one transport outcome for the durable Cron delivery fact."""
+    if receipts is None:
+        return
+    if isinstance(result, dict):
+        success = result.get("success") is True
+    else:
+        success = getattr(result, "success", None) is True
+    receipts.append({
+        "kind": kind,
+        "required": True,
+        "status": "confirmed" if success else "failed",
+        **({} if success else {"error_kind": "delivery_failed"}),
+    })
+
+
+def _append_failed_delivery_receipt(
+    receipts: list[dict[str, Any]] | None,
+    *,
+    kind: str = "delivery",
+    error_kind: str = "delivery_failed",
+) -> None:
+    """Record a terminal failure without retaining target or provider detail."""
+    if receipts is not None:
+        receipts.append(
+            {
+                "kind": kind,
+                "required": True,
+                "status": "failed",
+                "error_kind": error_kind,
+            }
+        )
+
+
+def _append_unconfirmed_delivery_receipt(
+    receipts: list[dict[str, Any]] | None,
+    *,
+    kind: str,
+) -> None:
+    """A send already in flight is neither a failure nor terminal proof."""
+    if receipts is not None:
+        receipts.append({"kind": kind, "required": True, "status": "unconfirmed"})
+
+
+def _cron_delivery_receipt_summary(
+    receipts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Reduce transport receipts to the redacted record safe for ``jobs.json``."""
+    if not receipts:
+        return None
+    confirmed = failed = unconfirmed = 0
+    normalized = [item for item in receipts if isinstance(item, dict)]
+    truncated = len(receipts) != len(normalized)
+    for receipt in normalized:
+        if not receipt.get("required", True):
+            continue
+        status = receipt.get("status")
+        if status == "confirmed":
+            confirmed += 1
+        elif status == "failed":
+            failed += 1
+        else:
+            unconfirmed += 1
+    if truncated:
+        unconfirmed += 1
+    required = confirmed + failed + unconfirmed
+    status = (
+        "success"
+        if required and confirmed == required
+        else "partial"
+        if confirmed
+        else "failed"
+    )
+    return {
+        "schema_version": "cron-delivery/v1",
+        "status": status,
+        "required_count": required,
+        "confirmed_count": confirmed,
+        "failed_count": failed,
+        "unconfirmed_count": unconfirmed,
+        "receipts_truncated": truncated,
+    }
+
 
 
 def _is_channel_dm_topic(
@@ -1447,7 +2711,24 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS = 60.0
+
+
+def _run_coro_in_new_loop(coro):
+    """Run one delivery coroutine in the caller's fresh event loop."""
+    return asyncio.run(coro)
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    delivery_receipts: list[dict[str, Any]] | None = None,
+    heartbeat: Callable[[], None] | None = None,
+    delivery_projection: str | None = None,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1457,6 +2738,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the adapter path fails or is unavailable.
 
     Returns None on success, or an error string on failure.
+
+    ``delivery_projection`` is supplied only with a closed autonomous response
+    frame. The trusted body is used to build the exact final candidate before
+    screening; the original frame is attached as structured provenance only.
     """
     targets = _resolve_delivery_targets(job)
     if not targets:
@@ -1494,37 +2779,60 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
+    def _wrap_delivery(candidate: str) -> str:
+        if wrap_response and not job.get("_operational_notice_no_wrap"):
+            task_name = job.get("name", job["id"])
+            job_id = job.get("id", "")
+            return (
+                f"Cronjob Response: {task_name}\n"
+                f"(job_id: {job_id})\n"
+                f"-------------\n\n"
+                f"{candidate}\n\n"
+                "To stop or manage this job, send me a new message "
+                f"(e.g. \"stop reminder {task_name}\")."
+            )
+        return candidate
 
-    # Extract MEDIA: tags so attachments are forwarded as files, not raw text
+    trusted_visible_content = (
+        delivery_projection
+        if delivery_projection is not None
+        else content
+    )
+    # This is the exact final text candidate. Every dynamic wrapper field is
+    # present before screening, and no text is appended or replaced afterwards.
+    delivery_content = _wrap_delivery(trusted_visible_content)
+    closed_frame_provenance: dict[str, Any] = {}
+    if delivery_projection is not None:
+        closed_frame_provenance = {
+            "closed_delivery_frame": content,
+            "closed_delivery_frame_sha256": hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest(),
+            "closed_delivery_frame_classification": {
+                "schema_version": "cron-closed-delivery-frame/v1",
+                "present": True,
+                "body_empty": not bool(delivery_projection.strip()),
+                "body_sha256": hashlib.sha256(
+                    delivery_projection.encode("utf-8")
+                ).hexdigest(),
+            },
+        }
+
+    # Media is extracted only after the mandatory output boundary so the Hook
+    # screens the exact candidate that can reach the sender.
     from gateway.platforms.base import BasePlatformAdapter
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
     # Resolve the delivery-mirror gate ONCE (default off). When on, each
     # successful delivery is also appended to the target chat's gateway session
     # transcript so a user reply in that chat sees the cron output in context.
     # Mirror the CLEAN, unwrapped output (not the cron header/footer).
     try:
-        mirror_enabled = _cron_mirror_delivery_enabled(job, user_cfg)
+        mirror_enabled = (
+            not job.get("_operational_notice_no_mirror")
+            and _cron_mirror_delivery_enabled(job, user_cfg)
+        )
     except Exception:
         mirror_enabled = False
-    mirror_text = ""
-    if mirror_enabled:
-        _, mirror_text = BasePlatformAdapter.extract_media(content)
-        mirror_text = (mirror_text or "").strip()
-
     try:
         config = load_gateway_config()
     except Exception as e:
@@ -1535,6 +2843,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     delivery_errors = []
 
     for target in targets:
+        if heartbeat is not None:
+            heartbeat()
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
@@ -1681,6 +2991,81 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         )
         inchannel_seeded = False
 
+        try:
+            from gateway.outbound_boundary import (
+                build_outbound_context,
+                outbound_before_send_sync,
+            )
+
+            outbound_hooks = _active_outbound_hooks()
+            boundary_context = build_outbound_context(
+                source_kind="cron",
+                content=delivery_content,
+                platform=platform_name,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                profile_id=str(job.get("profile_id") or ""),
+                profile_path=str(job.get("profile_path") or _get_hermes_home()),
+                producer_id="cron",
+                job_id=str(job.get("id", "")),
+                run_id=str(job.get("last_run_id") or job.get("id", "")),
+                target={
+                    "transport_id": platform_name,
+                    "channel_id": chat_id,
+                    "thread_id": thread_id or "",
+                },
+                action_spec=job.get("action_spec") or job.get("cron_action_spec"),
+                action_specs=(
+                    job.get("action_specs") or job.get("cron_action_specs")
+                ),
+                actionability=job.get("actionability"),
+                gate_mode=job.get("actionable_gate_mode"),
+                decision_route=job.get("decision_route"),
+                result_route=job.get("result_route"),
+                continuation_evidence=job.get("continuation_evidence"),
+                output_screening_required=True,
+                **closed_frame_provenance,
+            )
+            boundary_decision = outbound_before_send_sync(
+                outbound_hooks,
+                boundary_context,
+            )
+            boundary_context["before_send_decision"] = boundary_decision.raw
+            if not boundary_decision.transmit:
+                msg = (
+                    f"outbound boundary {boundary_decision.decision}: "
+                    f"{boundary_decision.reason}"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+            boundary_media_files, boundary_delivery_content = (
+                BasePlatformAdapter.extract_media(boundary_decision.content)
+            )
+            boundary_media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                boundary_media_files
+            )
+            boundary_context["content"] = boundary_delivery_content
+            boundary_unchanged = (
+                boundary_decision.decision == "allow"
+                and boundary_decision.content == delivery_content
+            )
+            if boundary_unchanged:
+                _, boundary_mirror_text = BasePlatformAdapter.extract_media(
+                    trusted_visible_content
+                )
+            else:
+                _, boundary_mirror_text = BasePlatformAdapter.extract_media(
+                    boundary_decision.content
+                )
+            boundary_mirror_text = (boundary_mirror_text or "").strip()
+            boundary_send_result = None
+        except Exception as exc:
+            msg = f"outbound boundary failed: {exc}"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
         # Continuable cron (thread-preferred): when mirroring is enabled for the
         # origin target and the gateway is live, try to open a DEDICATED thread
         # for this job and deliver the brief into it. On thread-capable
@@ -1780,10 +3165,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = boundary_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
+                    if heartbeat is not None:
+                        heartbeat()
                     from agent.async_utils import safe_schedule_threadsafe
 
                     router = DeliveryRouter(config, adapters)
@@ -1813,7 +3200,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         send_result = None
                         timeout_handled = False
                         try:
-                            send_result = future.result(timeout=60)
+                            send_result = future.result(
+                                timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
+                            )
                         except TimeoutError:
                             # #38922: a slow confirmation does NOT necessarily
                             # mean the send failed — but we must distinguish two
@@ -1822,9 +3211,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             #   cancel() == False -> the coroutine was already
                             #     running on the gateway loop when the timeout
                             #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
+                            #     cannot be un-sent. Signed runs retain their
+                            #     claim until confirmation; legacy callers keep
+                            #     the historical assume-delivered behavior.
                             #
                             #   cancel() == True -> the scheduled callback never
                             #     started executing (loop wedged/backlogged for
@@ -1845,15 +3234,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
                                 timeout_handled = True
+                            elif heartbeat is not None:
+                                logger.warning(
+                                    "Job '%s': live adapter send to %s:%s timed out "
+                                    "after %.0fs; already dispatched (in flight), "
+                                    "waiting under the active run claim",
+                                    job["id"], platform_name, chat_id,
+                                    _CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS,
+                                )
+                                while True:
+                                    heartbeat()
+                                    try:
+                                        send_result = future.result(
+                                            timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
+                                        )
+                                        break
+                                    except TimeoutError:
+                                        continue
                             else:
                                 timed_out = True
                                 timeout_handled = True
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
-                                    "after 60s; already dispatched (in flight), "
+                                    "after %.0fs; already dispatched (in flight), "
                                     "assuming delivered (skipping standalone fallback "
                                     "to avoid duplicate)",
                                     job["id"], platform_name, chat_id,
+                                    _CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS,
                                 )
                         except Exception as ex:
                             # A real send error (not a slow confirmation) — fall
@@ -1862,14 +3269,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             target_errors.append(f"live adapter send failed: {ex}")
                             raise
 
+                        if heartbeat is not None:
+                            heartbeat()
+
                         if timeout_handled:
                             # The timeout branch above already decided the
                             # outcome (assume-delivered if in flight, or
                             # adapter_ok=False to fall through if never
                             # dispatched).  send_result is None, so skip the
                             # confirmation/thread-fallback inspection below.
-                            pass
+                            if timed_out:
+                                _append_unconfirmed_delivery_receipt(
+                                    delivery_receipts, kind="payload"
+                                )
                         else:
+                            boundary_send_result = send_result
                             # _deliver_to_platform returns either a SendResult
                             # (.success attr) or, when the silence-narration
                             # filter drops the message, a plain dict
@@ -1907,18 +3321,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     )
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
-                            elif (
-                                send_raw_response
-                                and thread_id
-                                and send_raw_response.get("thread_fallback")
-                            ):
-                                requested_thread_id = send_raw_response.get("requested_thread_id") or thread_id
-                                msg = (
-                                    f"configured thread_id {requested_thread_id} for "
-                                    f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                            else:
+                                _append_delivery_receipt(
+                                    delivery_receipts,
+                                    send_result,
+                                    kind="payload",
                                 )
-                                logger.warning("Job '%s': %s", job["id"], msg)
-                                delivery_errors.append(msg)
+                                if (
+                                    send_raw_response
+                                    and thread_id
+                                    and send_raw_response.get("thread_fallback")
+                                ):
+                                    requested_thread_id = (
+                                        send_raw_response.get("requested_thread_id")
+                                        or thread_id
+                                    )
+                                    msg = (
+                                        f"configured thread_id {requested_thread_id} for "
+                                        f"{platform_name}:{chat_id} was not found; "
+                                        "delivered without thread_id"
+                                    )
+                                    logger.warning("Job '%s': %s", job["id"], msg)
+                                    delivery_errors.append(msg)
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
@@ -1929,7 +3353,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
-                if adapter_ok and not timed_out and media_files:
+                if adapter_ok and not timed_out and boundary_media_files:
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
@@ -1939,32 +3363,44 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_receipts = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
-                        media_files,
+                        boundary_media_files,
                         routed_media_metadata or None,
                         loop,
                         job,
                         platform=platform,
+                        heartbeat=heartbeat,
                     )
-                elif timed_out and media_files:
+                    if delivery_receipts is not None:
+                        delivery_receipts.extend(media_receipts)
+                elif timed_out and boundary_media_files:
                     msg = (
-                        f"{len(media_files)} media attachment(s) not delivered to "
+                        f"{len(boundary_media_files)} media attachment(s) not delivered to "
                         f"{platform_name}:{chat_id} (live adapter confirmation timed out)"
                     )
                     logger.warning("Job '%s': %s", job["id"], msg)
                     delivery_errors.append(msg)
+                    for _media_path, _is_voice in boundary_media_files:
+                        _append_unconfirmed_delivery_receipt(
+                            delivery_receipts, kind="media"
+                        )
 
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
+                    _record_confirmed_outbound_send(
+                        outbound_hooks,
+                        boundary_context,
+                        boundary_send_result,
+                    )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
                         _seed_cron_thread_session(
                             job, runtime_adapter, platform_name, chat_id,
-                            opened_thread_id, mirror_text,
+                            opened_thread_id, boundary_mirror_text,
                             chat_name=origin.get("chat_name"),
                         )
                         thread_seeded = True
@@ -1975,15 +3411,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     if in_channel_surface and mirror_this_target and not thread_seeded:
                         inchannel_seeded = _seed_cron_channel_session(
                             job, runtime_adapter, platform_name, chat_id,
-                            mirror_text, is_dm=is_dm_target,
+                            boundary_mirror_text, is_dm=is_dm_target,
                             user_id=origin_user_id,
                             chat_name=origin.get("chat_name"),
                         )
                     _maybe_mirror_cron_delivery(
-                        job, platform_name, chat_id, mirror_text,
+                        job, platform_name, chat_id, boundary_mirror_text,
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
+            except CronRunOutcomeOwnershipLost:
+                raise
             except Exception as e:
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
@@ -2019,10 +3457,43 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
-            # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            # Standalone delivery remains owned by the active run claim while the
+            # async transport is in flight.
+            def _standalone_delivery():
+                return _send_to_platform(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    boundary_delivery_content,
+                    thread_id=thread_id,
+                    media_files=boundary_media_files,
+                )
+
+            async def _standalone_delivery_with_heartbeat():
+                task = asyncio.create_task(_standalone_delivery())
+                try:
+                    while True:
+                        done, _ = await asyncio.wait({task}, timeout=60)
+                        if done:
+                            return task.result()
+                        heartbeat()
+                except BaseException:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    raise
+
+            if heartbeat is not None:
+                heartbeat()
+            coro = (
+                _standalone_delivery()
+                if heartbeat is None
+                else _standalone_delivery_with_heartbeat()
+            )
             try:
                 result = asyncio.run(coro)
+            except CronRunOutcomeOwnershipLost:
+                raise
             except RuntimeError as run_err:
                 # asyncio.run() checks for a running loop before awaiting the coroutine;
                 # when it raises, the original coro was never started — close it to
@@ -2049,10 +3520,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        fallback_coro = (
+                            _standalone_delivery()
+                            if heartbeat is None
+                            else _standalone_delivery_with_heartbeat()
+                        )
+                        future = pool.submit(_run_coro_in_new_loop, fallback_coro)
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
+                except CronRunOutcomeOwnershipLost:
+                    raise
                 except Exception as e:
                     # A shutdown-race here is expected during teardown; downgrade
                     # to a warning so it doesn't read as a genuine failure.
@@ -2074,16 +3552,33 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
 
+            if heartbeat is not None:
+                heartbeat()
             if result and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
+                _append_failed_delivery_receipt(delivery_receipts)
+                continue
+
+            if not isinstance(result, dict) or result.get("success") is not True:
+                msg = "delivery returned an unconfirmed result"
+                logger.error("Job '%s': %s", job["id"], msg)
+                target_errors.append(msg)
+                delivery_errors.extend(target_errors)
+                _append_failed_delivery_receipt(delivery_receipts)
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            _record_confirmed_outbound_send(
+                outbound_hooks,
+                boundary_context,
+                result,
+            )
+            _append_delivery_receipt(delivery_receipts, result, kind="payload")
             _maybe_mirror_cron_delivery(
-                job, platform_name, chat_id, mirror_text,
+                job, platform_name, chat_id, boundary_mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
@@ -2096,6 +3591,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
+_CRON_SNAPSHOT_ENV_ALLOWLIST = frozenset({
+    "HOME", "HERMES_HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME",
+    "REQUESTS_CA_BUNDLE", "SSL_CERT_DIR", "SSL_CERT_FILE", "SYSTEMROOT",
+    "TEMP", "TMP", "TMPDIR", "TZ", "USER", "WINDIR",
+})
+_CRON_SNAPSHOT_EXECUTION_PATH = os.pathsep.join((
+    str(Path(sys.executable).resolve().parent),
+    "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+    "/usr/sbin", "/sbin", "C:/Windows/System32", "C:/Windows",
+))
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 
 
@@ -2190,9 +3695,246 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _kill_cron_process_group(process: subprocess.Popen) -> None:
+    """Immediately kill one cron script tree and synchronously reap its parent."""
+    if _IS_WINDOWS:
+        if process.poll() is not None:
+            raise RuntimeError(
+                "Cannot prove Windows cron process-tree cleanup after parent exit"
+            )
+        taskkill_succeeded = False
+        taskkill_failure = "taskkill returned a non-zero status"
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                creationflags=windows_hide_flags(),
+            )
+            taskkill_succeeded = completed.returncode == 0
+            if not taskkill_succeeded:
+                taskkill_failure = (
+                    f"taskkill exited {completed.returncode}: "
+                    f"{completed.stderr.strip()}"
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            taskkill_failure = f"taskkill failed: {exc}"
+            logger.debug(
+                "Windows taskkill failed for cron process tree %s",
+                process.pid,
+                exc_info=True,
+            )
+        if not taskkill_succeeded:
+            try:
+                import psutil
+
+                parent = psutil.Process(process.pid)
+                frozen_tree = [parent]
+                known_pids = {parent.pid}
+                cursor = 0
+                while cursor < len(frozen_tree):
+                    current = frozen_tree[cursor]
+                    cursor += 1
+                    current.suspend()
+                    for child in current.children(recursive=False):
+                        if child.pid not in known_pids:
+                            known_pids.add(child.pid)
+                            frozen_tree.append(child)
+                for child in reversed(frozen_tree[1:]):
+                    child.kill()
+                process.kill()
+                _, alive = psutil.wait_procs(frozen_tree, timeout=5)
+                if alive:
+                    raise RuntimeError(
+                        "psutil could not terminate every cron descendant: "
+                        + ", ".join(str(child.pid) for child in alive)
+                    )
+            except BaseException as exc:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                process.wait()
+                raise RuntimeError(
+                    f"Windows cron process-tree cleanup is unproven ({taskkill_failure})"
+                ) from exc
+    else:
+        hard_kill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        try:
+            os.killpg(process.pid, hard_kill)  # windows-footgun: ok - POSIX branch
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    process.wait()
+
+
+@contextlib.contextmanager
+def _materialized_cron_execution_snapshot(snapshot: dict[str, Any]):
+    """Materialize one owner-captured Profile script tree for one subprocess."""
+    required = {
+        "schema_version",
+        "script_name",
+        "script_suffix",
+        "script_bytes",
+        "interpreter_path",
+        "interpreter_bytes",
+        "support_files",
+    }
+    if (
+        set(snapshot) != required
+        or snapshot.get("schema_version") != "cron-script-execution-snapshot/v1"
+        or not isinstance(snapshot.get("script_name"), str)
+        or Path(snapshot["script_name"]).name != snapshot["script_name"]
+        or not isinstance(snapshot.get("script_suffix"), str)
+        or not isinstance(snapshot.get("script_bytes"), bytes)
+        or not isinstance(snapshot.get("interpreter_path"), str)
+        or not isinstance(snapshot.get("interpreter_bytes"), bytes)
+        or not isinstance(snapshot.get("support_files"), list)
+    ):
+        raise ValueError("invalid cron script execution snapshot")
+
+    with tempfile.TemporaryDirectory(prefix="hermes-cron-snapshot-") as raw_temp:
+        snapshot_root = Path(raw_temp)
+        roots = {"script_root": snapshot_root / "script_root"}
+        for root in roots.values():
+            root.mkdir(mode=0o700)
+        for item in snapshot["support_files"]:
+            if not isinstance(item, dict) or set(item) != {
+                "root",
+                "path",
+                "content",
+                "mode",
+            }:
+                raise ValueError("invalid cron support snapshot")
+            root = roots.get(item.get("root"))
+            relative = Path(str(item.get("path") or ""))
+            content = item.get("content")
+            mode = item.get("mode")
+            if (
+                root is None
+                or relative.is_absolute()
+                or not relative.parts
+                or ".." in relative.parts
+                or not isinstance(content, bytes)
+                or not isinstance(mode, int)
+                or isinstance(mode, bool)
+                or not 0 <= mode <= 0o777
+            ):
+                raise ValueError("invalid cron support snapshot")
+            target = root.joinpath(*relative.parts)
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if target.exists():
+                if (
+                    not target.is_file()
+                    or target.read_bytes() != content
+                    or target.stat().st_mode & 0o777 != mode
+                ):
+                    raise ValueError("conflicting cron support snapshot")
+            else:
+                target.write_bytes(content)
+                target.chmod(mode)
+
+        script_target = roots["script_root"] / snapshot["script_name"]
+        script_target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if script_target.exists() and script_target.read_bytes() != snapshot["script_bytes"]:
+            raise ValueError("script bytes disagree with cron support snapshot")
+        script_target.write_bytes(snapshot["script_bytes"])
+
+        interpreter_suffix = ".exe" if sys.platform == "win32" else ""
+        interpreter_target = snapshot_root / f"interpreter{interpreter_suffix}"
+        interpreter_target.write_bytes(snapshot["interpreter_bytes"])
+        interpreter_target.chmod(0o700)
+        yield script_target, interpreter_target, list(roots.values())
+
+
+def _trusted_snapshot_shell_interpreter(snapshot: dict[str, Any]) -> Path | None:
+    try:
+        selected = Path(snapshot["interpreter_path"]).resolve(strict=True)
+        trusted = {
+            Path(candidate).resolve(strict=True)
+            for candidate in _CRON_TRUSTED_BASH_PATHS
+            if Path(candidate).is_file()
+        }
+        if selected not in trusted:
+            return None
+        if selected.read_bytes() != snapshot["interpreter_bytes"]:
+            return None
+        return selected
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+_CRON_SCRIPT_HEARTBEAT_POLL_SECONDS = 5.0
+
+
+def _run_subprocess_with_heartbeat(
+    argv: list[str],
+    run_kwargs: dict[str, Any],
+    heartbeat: Callable[[], None],
+) -> subprocess.CompletedProcess:
+    """Wait for a script while letting the existing claim owner renew."""
+    options = dict(run_kwargs)
+    timeout = float(options.pop("timeout"))
+    input_data = options.pop("input", None)
+    options.pop("capture_output", None)
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **options,
+    )
+    deadline = time.monotonic() + timeout
+    pending_input = input_data
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(
+                    argv,
+                    timeout,
+                    output=stdout,
+                    stderr=stderr,
+                )
+            try:
+                stdout, stderr = process.communicate(
+                    input=pending_input,
+                    timeout=min(_CRON_SCRIPT_HEARTBEAT_POLL_SECONDS, remaining),
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    process.returncode,
+                    stdout,
+                    stderr,
+                )
+            except subprocess.TimeoutExpired:
+                pending_input = None
+                heartbeat()
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+        raise
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    run_control: Optional[_CronRunControl] = None,
+    *,
+    script_snapshot: bytes | dict[str, Any] | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2250,67 +3992,215 @@ def _run_job_script(
             f"({scripts_dir_resolved}): {script_path!r}"
         )
 
-    if not path.exists():
+    if not isinstance(script_snapshot, dict) and not path.exists():
         return False, f"Script not found: {path}"
-    if not path.is_file():
+    if not isinstance(script_snapshot, dict) and not path.is_file():
         return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
 
-    # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
-    # everything else.  We deliberately do NOT honour the file's own
-    # shebang: the scripts dir is trusted, but keeping the interpreter
-    # choice explicit here keeps the allowed surface small and auditable.
-    suffix = path.suffix.lower()
-    if suffix in {".sh", ".bash"}:
-        # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
-        # all work.  On native Windows without Git for Windows installed
-        # shutil.which returns None — fall back to a clear error rather
-        # than a FileNotFoundError with a confusing "[WinError 2]"
-        # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
-        if _bash is None:
-            return False, (
-                f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
-                "On Windows, install Git for Windows (which ships Git Bash) "
-                "or rewrite the script as Python (.py)."
-        )
-        argv = [_bash, str(path)]
-        env_overlay: dict[str, str] = {}
-    else:
-        python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
-        argv = [python_exe, str(path)]
-
     try:
-        from tools.environments.local import build_subprocess_env
+        from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {}
-        if sys.platform == "win32":
-            popen_kwargs = {
-                "creationflags": windows_hide_flags(),
-                "encoding": "utf-8",
-                "errors": "replace",
-            }
-        env = build_subprocess_env()
-        env.update(env_overlay)
-        # Use the job's workdir as the subprocess cwd when configured,
-        # otherwise default to the scripts-dir parent (back-compat).
-        # NEVER mutate the Python process cwd — that would leak into
-        # concurrent gateway sessions (#69396).
-        _script_cwd = workdir or str(path.parent)
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=script_timeout,
-            cwd=_script_cwd,
-            env=env,
-            **popen_kwargs,
+        snapshot_context = (
+            _materialized_cron_execution_snapshot(script_snapshot)
+            if isinstance(script_snapshot, dict)
+            else contextlib.nullcontext((path, None, []))
         )
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
+        with snapshot_context as (execution_path, captured_interpreter, snapshot_roots):
+            input_bytes = (
+                script_snapshot["script_bytes"]
+                if isinstance(script_snapshot, dict)
+                else script_snapshot
+            )
+            suffix = (
+                script_snapshot["script_suffix"]
+                if isinstance(script_snapshot, dict)
+                else path.suffix.lower()
+            )
+            popen_kwargs = {}
+            if sys.platform == "win32":
+                popen_kwargs["creationflags"] = windows_hide_flags() | getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+                )
+            else:
+                popen_kwargs["start_new_session"] = True
+            python_env_overlay: dict[str, str] = {}
+            if suffix in {".sh", ".bash"}:
+                trusted_bash = (
+                    _trusted_snapshot_shell_interpreter(script_snapshot)
+                    if isinstance(script_snapshot, dict)
+                    else None
+                )
+                bash_path = (
+                    str(trusted_bash)
+                    if trusted_bash
+                    else shutil.which("bash")
+                    or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
+                )
+                if bash_path is None:
+                    return False, (
+                        f"Cannot run .sh/.bash script {execution_path.name!r}: "
+                        "bash not found on PATH. On Windows, install Git for "
+                        "Windows (which ships Git Bash) or rewrite the script as Python (.py)."
+                    )
+                snapshot_bash = input_bytes is not None
+                argv = (
+                    [str(execution_path)]
+                    if snapshot_bash
+                    else [bash_path, str(execution_path)]
+                )
+                if snapshot_bash:
+                    popen_kwargs["executable"] = bash_path
+            else:
+                if captured_interpreter:
+                    python_path = str(captured_interpreter)
+                elif sys.platform == "win32":
+                    python_path, python_env_overlay = _windows_cron_python_invocation(
+                        sys.executable
+                    )
+                else:
+                    python_path = sys.executable
+                    python_env_overlay = {}
+                argv = (
+                    [
+                        python_path,
+                        "-s",
+                        "-P",
+                        "-c",
+                        (
+                            "import sys; from importlib.machinery import SourceFileLoader; "
+                            "p=sys.argv[1]; sys.argv=[p]; "
+                            "g={'__name__':'__main__','__file__':p,'__package__':None,"
+                            "'__cached__':None,'__spec__':None,"
+                            "'__loader__':SourceFileLoader('__main__',p)}; "
+                            "exec(compile(sys.stdin.buffer.read(),p,'exec'),g)"
+                        ),
+                        str(execution_path),
+                    ]
+                    if input_bytes is not None
+                    else [python_path, str(execution_path)]
+                )
+                if captured_interpreter:
+                    popen_kwargs["executable"] = python_path
+
+            sanitized_env = _sanitize_subprocess_env(os.environ.copy())
+            if isinstance(script_snapshot, dict):
+                sanitized_env = {
+                    key: value
+                    for key, value in sanitized_env.items()
+                    if key in _CRON_SNAPSHOT_ENV_ALLOWLIST
+                }
+            sanitized_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            sanitized_env.update(python_env_overlay)
+            if isinstance(script_snapshot, dict):
+                sanitized_env["PATH"] = _CRON_SNAPSHOT_EXECUTION_PATH
+                runtime_home = Path(script_snapshot["interpreter_path"]).parent.parent
+                runtime_lib = runtime_home / "lib"
+                if runtime_lib.is_dir():
+                    sanitized_env["PYTHONHOME"] = str(runtime_home)
+                    for variable in ("DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"):
+                        sanitized_env[variable] = str(runtime_lib)
+            if snapshot_roots:
+                sanitized_env["PYTHONPATH"] = os.pathsep.join(
+                    str(root) for root in snapshot_roots
+                )
+            if suffix in {".sh", ".bash"} and input_bytes is not None:
+                sanitized_env["BASH_SOURCE"] = str(execution_path)
+            remaining = run_control.remaining() if run_control is not None else None
+            if remaining is not None and remaining <= 0:
+                return False, (
+                    f"Cron total runtime limit expired before script start: {execution_path}"
+                )
+            effective_timeout = script_timeout
+            deadline_limited = remaining is not None and remaining < script_timeout
+            if deadline_limited:
+                effective_timeout = max(0.001, remaining)
+
+            if run_control is not None and not run_control.begin_script_spawn():
+                return False, (
+                    f"Cron total runtime limit expired before script start: {execution_path}"
+                )
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE if input_bytes is not None else None,
+                    text=input_bytes is None,
+                    cwd=workdir or str(execution_path.parent),
+                    env=sanitized_env,
+                    **popen_kwargs,
+                )
+            except BaseException:
+                if run_control is not None:
+                    run_control.cancel_script_spawn()
+                raise
+            cleanup = (
+                run_control.attach_script_process(process)
+                if run_control is not None
+                else None
+            )
+            deadline = time.monotonic() + effective_timeout
+            pending_input = input_bytes
+            try:
+                while True:
+                    wait_remaining = deadline - time.monotonic()
+                    if wait_remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, effective_timeout)
+                    wait_timeout = wait_remaining
+                    if heartbeat is not None:
+                        wait_timeout = min(
+                            _CRON_SCRIPT_HEARTBEAT_POLL_SECONDS,
+                            wait_remaining,
+                        )
+                    try:
+                        communicate_kwargs = {"timeout": wait_timeout}
+                        if pending_input is not None:
+                            communicate_kwargs["input"] = pending_input
+                        stdout_raw, stderr_raw = process.communicate(
+                            **communicate_kwargs
+                        )
+                        break
+                    except subprocess.TimeoutExpired:
+                        pending_input = None
+                        if heartbeat is None:
+                            raise
+                        heartbeat()
+            except subprocess.TimeoutExpired:
+                if run_control is not None and cleanup is not None:
+                    run_control.cleanup_script_process(cleanup, kill=True)
+                else:
+                    _kill_cron_process_group(process)
+                try:
+                    stdout_raw, stderr_raw = process.communicate(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    stdout_raw, stderr_raw = b"", b""
+                if deadline_limited:
+                    return False, (
+                        f"Cron total runtime limit expired during script: {execution_path}"
+                    )
+                return False, (
+                    f"Script timed out after {script_timeout}s: {execution_path}"
+                )
+            finally:
+                if run_control is not None and cleanup is not None:
+                    run_control.cleanup_script_process(
+                        cleanup,
+                        kill=process.poll() is None,
+                    )
+            if run_control is not None:
+                run_control.raise_if_expired("script execution")
+        stdout = (
+            stdout_raw.decode("utf-8", errors="replace")
+            if isinstance(stdout_raw, bytes)
+            else (stdout_raw or "")
+        ).strip()
+        stderr = (
+            stderr_raw.decode("utf-8", errors="replace")
+            if isinstance(stderr_raw, bytes)
+            else (stderr_raw or "")
+        ).strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:
@@ -2322,8 +4212,8 @@ def _run_job_script(
             stdout = "[REDACTED - redaction failed]"
             stderr = "[REDACTED - redaction failed]"
 
-        if result.returncode != 0:
-            parts = [f"Script exited with code {result.returncode}"]
+        if process.returncode != 0:
+            parts = [f"Script exited with code {process.returncode}"]
             if stderr:
                 parts.append(f"stderr:\n{stderr}")
             if stdout:
@@ -2332,14 +4222,17 @@ def _run_job_script(
 
         return True, stdout
 
-    except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {script_timeout}s: {path}"
+    except CronRunOutcomeOwnershipLost:
+        raise
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 
 
 def _run_job_script_with_claim_heartbeat(
-    job: dict, script_path: str, workdir: Optional[str] = None,
+    job: dict,
+    script_path: str,
+    workdir: Optional[str] = None,
+    run_control: Optional[_CronRunControl] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -2361,7 +4254,9 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, run_control=run_control
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -2392,10 +4287,14 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, run_control=run_control
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir)
+        return _run_job_script(
+            script_path, workdir=workdir, run_control=run_control
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -2429,6 +4328,103 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _resolve_persisted_cron_skill_entries(
+    job: dict,
+    legacy_skill_names: list[str],
+    bindings: Any,
+) -> list[tuple[str, str, dict[str, Any], str, Path]]:
+    """Validate all durable bindings before any Cron script or agent can run."""
+    from agent.skill_resolution import SkillResolutionError, load_verified_skill_content
+
+    if not isinstance(bindings, list):
+        raise SkillResolutionError(
+            "skill_binding_invalid", "", "Cron job has invalid persisted skill bindings."
+        )
+    binding_names = [
+        str(binding.get("canonical_name") or "").strip()
+        for binding in bindings
+        if isinstance(binding, dict)
+    ]
+    if binding_names != legacy_skill_names:
+        raise SkillResolutionError(
+            "skill_binding_mismatch",
+            ",".join(legacy_skill_names),
+            "Cron job skill compatibility fields do not match persisted bindings.",
+        )
+
+    entries: list[tuple[str, str, dict[str, Any], str, Path]] = []
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise SkillResolutionError(
+                "skill_binding_invalid",
+                "",
+                "Cron job contains an invalid persisted skill binding.",
+            )
+        skill_name = str(binding.get("canonical_name") or "").strip()
+        if not skill_name:
+            raise SkillResolutionError(
+                "skill_binding_invalid", "", "Cron skill binding has no canonical name."
+            )
+        try:
+            plugin_skill_path = None
+            if binding.get("source_kind") == "plugin":
+                try:
+                    from hermes_cli.plugins import (
+                        _get_disabled_plugins,
+                        discover_plugins,
+                        get_plugin_manager,
+                    )
+
+                    namespace = skill_name.partition(":")[0]
+                    if not namespace or namespace in _get_disabled_plugins():
+                        raise SkillResolutionError(
+                            "skill_binding_disabled",
+                            skill_name,
+                            "Persisted Cron plugin skill is disabled.",
+                        )
+                    discover_plugins()
+                    plugin_skill_path = get_plugin_manager().find_plugin_skill(skill_name)
+                except SkillResolutionError:
+                    raise
+                except Exception as exc:
+                    raise SkillResolutionError(
+                        "skill_plugin_resolution_failed",
+                        skill_name,
+                        "Plugin skill discovery failed during Cron execution.",
+                    ) from exc
+            skill_path, verified_content = load_verified_skill_content(
+                _get_hermes_home(),
+                binding,
+                plugin_skill_path=plugin_skill_path,
+            )
+            if binding.get("source_kind") == "plugin":
+                load_name = skill_name
+            else:
+                relative_skill = skill_path.relative_to(
+                    (_get_hermes_home() / "skills").resolve(strict=False)
+                )
+                load_name = (
+                    relative_skill.parent.as_posix()
+                    if relative_skill.name == "SKILL.md"
+                    else relative_skill.with_suffix("").as_posix()
+                )
+            entries.append(
+                (skill_name, load_name, binding, verified_content, skill_path)
+            )
+        except (SkillResolutionError, OSError, ValueError) as exc:
+            logger.warning(
+                "Cron job '%s': persisted skill binding rejected — %s",
+                job.get("name", job.get("id")),
+                exc,
+            )
+            raise SkillResolutionError(
+                "skill_binding_validation_failed",
+                skill_name,
+                f"Persisted Cron skill binding was rejected: {exc}",
+            ) from exc
+    return entries
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -2443,6 +4439,19 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     user_prompt = str(job.get("prompt") or "")
     prompt = user_prompt
     skills = job.get("skills")
+    if skills is None:
+        legacy = job.get("skill")
+        skills = [legacy] if legacy else []
+    elif isinstance(skills, str):
+        skills = [skills]
+    legacy_skill_names = [str(name).strip() for name in skills if str(name).strip()]
+    bindings_present = "skill_bindings" in job
+    bindings = job.get("skill_bindings") if bindings_present else None
+    bound_skill_entries = (
+        _resolve_persisted_cron_skill_entries(job, legacy_skill_names, bindings)
+        if bindings_present
+        else None
+    )
     # True when runtime-collected DATA (script stdout, upstream-job output)
     # has been injected into the prompt. Data content legitimately quotes
     # command-shape strings (a triage feed ingesting a bug report that
@@ -2539,17 +4548,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         "SILENT: If there is genuinely nothing new to report, respond "
         "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
         "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
+        "findings normally, or say [SILENT] and nothing more. "
+        "FINAL OUTPUT FRAME: Unless responding exactly [SILENT], put only "
+        "the complete user-visible result between exactly one top-level "
+        "`## Response` line and one later top-level `## End Response` line. "
+        "Do not use either heading in analysis, skill text, code fences, or "
+        "intermediate output.]\n\n"
     )
     prompt = cron_hint + prompt
-    if skills is None:
-        legacy = job.get("skill")
-        skills = [legacy] if legacy else []
-    elif isinstance(skills, str):
-        skills = [skills]
-
-    skill_names = [str(name).strip() for name in skills if str(name).strip()]
-    if not skill_names:
+    if not legacy_skill_names and not bindings:
         return _scan_assembled_cron_prompt(
             prompt,
             job,
@@ -2561,16 +4568,27 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     from tools.skills_tool import skill_view
     from tools.skill_usage import bump_use
     from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
+    from agent.skill_resolution import SkillResolutionError
     from agent.skill_utils import normalize_skill_lookup_name
 
     parts = []
     skipped: list[str] = []
-    for skill_name in skill_names:
+    skill_entries: list[tuple[str, str, Optional[dict[str, Any]], Optional[str], Optional[Path]]] = []
+    if bindings_present:
+        skill_entries = list(bound_skill_entries or [])
+    else:
+        skill_entries = [(name, name, None, None, None) for name in legacy_skill_names]
+
+    for skill_name, load_name, binding, verified_content, verified_path in skill_entries:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
         # that behavior so `skills: ["my-bundle"]` expands bundle members instead
         # of being treated as a missing skill.
-        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        bundle_key = (
+            resolve_bundle_command_key(skill_name.lstrip("/"))
+            if binding is None
+            else None
+        )
         if bundle_key:
             bundle_payload = build_bundle_invocation_message(
                 bundle_key,
@@ -2591,17 +4609,48 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             skipped.append(skill_name)
             continue
 
-        try:
-            loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
-            skipped.append(skill_name)
-            continue
-        if not loaded.get("success"):
-            error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
-            logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
-            skipped.append(skill_name)
-            continue
+        if binding is not None:
+            from agent.skill_preprocessing import preprocess_skill_content
+            from agent.skill_utils import parse_frontmatter
+            from tools.skills_tool import _is_skill_disabled, skill_matches_platform
+
+            frontmatter, _ = parse_frontmatter(verified_content or "")
+            if not skill_matches_platform(frontmatter):
+                raise SkillResolutionError(
+                    "skill_binding_platform_unsupported",
+                    skill_name,
+                    "Persisted Cron skill is not supported on this platform.",
+                )
+            if _is_skill_disabled(skill_name):
+                raise SkillResolutionError(
+                    "skill_binding_disabled",
+                    skill_name,
+                    "Persisted Cron skill is disabled in the active profile.",
+                )
+            preprocess_dir = (
+                verified_path.parent
+                if verified_path is not None and verified_path.name == "SKILL.md"
+                else None
+            )
+            content = preprocess_skill_content(
+                str(verified_content or ""),
+                preprocess_dir,
+                session_id=None,
+            ).strip()
+        else:
+            try:
+                loaded = json.loads(skill_view(normalize_skill_lookup_name(load_name)))
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
+                skipped.append(skill_name)
+                continue
+
+            if not loaded.get("success"):
+                error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
+                logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
+                skipped.append(skill_name)
+                continue
+            content = str(loaded.get("content") or "").strip()
 
         # Bump usage so the curator sees this skill as actively used.
         try:
@@ -2609,7 +4658,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except Exception:
             logger.debug("Cron job: failed to bump skill usage for '%s'", skill_name, exc_info=True)
 
-        content = str(loaded.get("content") or "").strip()
         if parts:
             parts.append("")
         parts.extend(
@@ -2750,9 +4798,14 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
-def run_job(
-    job: dict, *, defer_agent_teardown: Optional[list] = None
-) -> tuple[bool, str, str, Optional[str]]:
+def _run_job_body(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    _run_control: _CronRunControl,
+    script_snapshot: bytes | dict[str, Any] | None = None,
+    run_outcome_claim: dict[str, Any] | None = None,
+) -> tuple[bool, str, str, Optional[str]] | _RunJobResult:
     """
     Execute a single cron job.
 
@@ -2771,6 +4824,53 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    job_schedule = job.get("schedule")
+    is_oneshot = (
+        isinstance(job_schedule, dict) and job_schedule.get("kind") == "once"
+    )
+    run_claim = job.get("run_claim")
+    run_claim_owner = (
+        str(run_claim.get("by") or "") if isinstance(run_claim, dict) else ""
+    )
+    claim_heartbeat_seconds = _RUN_CLAIM_HEARTBEAT_SECONDS
+    last_claim_heartbeat = time.monotonic()
+    request_budget_token = None
+
+    def _heartbeat_claims_if_due() -> None:
+        nonlocal last_claim_heartbeat
+        if not ((is_oneshot and run_claim_owner) or run_outcome_claim is not None):
+            return
+        current_tick = time.monotonic()
+        if current_tick - last_claim_heartbeat < claim_heartbeat_seconds:
+            return
+        last_claim_heartbeat = current_tick
+        if is_oneshot and run_claim_owner:
+            try:
+                heartbeat_run_claim(job_id, expected_owner=run_claim_owner)
+            except Exception:
+                logger.debug(
+                    "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
+                )
+        if run_outcome_claim is not None:
+            _renew_run_outcome_claim_or_raise(job_id, run_outcome_claim)
+
+    # Runtime admission is deliberately before the no_agent short-circuit and
+    # before any Agent/session construction. A script-only job is still a
+    # durable behavior and cannot bypass its persisted authorization binding.
+    from cron.jobs import CronRuntimeAdmissionError, _apply_cron_runtime_governance
+
+    try:
+        _apply_cron_runtime_governance(job)
+    except CronRuntimeAdmissionError as exc:
+        return _RunJobResult(
+            success=False,
+            output=_runtime_admission_failure_document(job, exc.receipt),
+            final_response="",
+            error=str(exc),
+            runtime_admission_receipt=exc.receipt,
+            runtime_admission_decision=exc.decision,
+        )
+    _run_control.raise_if_expired("runtime governance")
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -2810,9 +4910,22 @@ def run_job(
             _job_workdir = None
 
         try:
-            ok, output = _run_job_script_with_claim_heartbeat(
-                job, script_path, workdir=_job_workdir,
-            )
+            if script_snapshot is None:
+                ok, output = _run_job_script_with_claim_heartbeat(
+                    job,
+                    script_path,
+                    workdir=_job_workdir,
+                    run_control=_run_control,
+                )
+            else:
+                script_kwargs: dict[str, Any] = {
+                    "workdir": _job_workdir,
+                    "run_control": _run_control,
+                    "script_snapshot": script_snapshot,
+                }
+                if run_outcome_claim is not None:
+                    script_kwargs["heartbeat"] = _heartbeat_claims_if_due
+                ok, output = _run_job_script(script_path, **script_kwargs)
         except Exception as exc:
             logger.exception(
                 "Job '%s': script execution raised unexpectedly", job_id,
@@ -2958,7 +5071,18 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
+        if script_snapshot is None:
+            prerun_script = _run_job_script_with_claim_heartbeat(
+                job, script_path, run_control=_run_control
+            )
+        else:
+            script_kwargs: dict[str, Any] = {
+                "run_control": _run_control,
+                "script_snapshot": script_snapshot,
+            }
+            if run_outcome_claim is not None:
+                script_kwargs["heartbeat"] = _heartbeat_claims_if_due
+            prerun_script = _run_job_script(script_path, **script_kwargs)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
@@ -3008,14 +5132,15 @@ def run_job(
 
     agent = None
 
-    # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
-
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import (
+        _VAR_MAP,
+        clear_session_vars,
+        reset_cron_authorization,
+        set_cron_authorization,
+        set_session_vars,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3115,7 +5240,18 @@ def run_job(
     # statement raises.  A leaked writer would deadlock the whole scheduler
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
+    _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
+    _cron_session_token = None
+    _cron_auth_tokens = []
     try:
+        _cron_auth_tokens = set_cron_authorization(
+            _cron_authorization_values(job), lease=_run_control.lease
+        )
+        # Scope cron approval policy to this job. Keep the token so the finally
+        # restores the pre-job state instead of pinning an explicit empty value,
+        # which would suppress the legacy os.environ fallback used by standalone
+        # cron entrypoints and tests.
+        _cron_session_token = _cron_session_var.set("1")
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -3138,6 +5274,7 @@ def run_job(
         )
         reset_secret_source_cache()
         load_hermes_dotenv(hermes_home=_get_hermes_home())
+        _run_control.raise_if_expired("dotenv loading")
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -3208,6 +5345,17 @@ def run_job(
                             model = _default
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+        finally:
+            _run_control.configure(_resolve_cron_run_timeout_seconds(job, _cfg))
+        provider_deadline = _run_control.hard_deadline()
+        if provider_deadline is not None:
+            from agent.request_budget import set_provider_request_budget
+
+            request_budget_token = set_provider_request_budget(
+                deadline_monotonic=provider_deadline,
+                cleanup_grace_seconds=_run_control.cleanup_grace(),
+            )
+        _run_control.raise_if_expired("config loading")
 
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
@@ -3259,8 +5407,9 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # Scheduled work has a bounded budget independent of broad interactive
+        # defaults, with an explicit per-job override for exceptional jobs.
+        max_iterations = _resolve_cron_max_iterations(job, _cfg)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
@@ -3360,6 +5509,7 @@ def run_job(
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
+        _run_control.raise_if_expired("provider resolution")
 
         reasoning_config = resolve_reasoning_config(
             _cfg if isinstance(_cfg, dict) else {}, str(model)
@@ -3452,22 +5602,36 @@ def run_job(
             except Exception as e:
                 logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
 
-        # Initialize MCP servers so configured mcp_servers are available to
-        # the agent's tool registry before AIAgent is constructed. Without
-        # this, cron jobs never saw any MCP tools — only the gateway / CLI
-        # paths called discover_mcp_tools() at startup. Idempotent: subsequent
-        # ticks short-circuit on already-connected servers inside
-        # register_mcp_servers(). Non-fatal on failure: a broken MCP server
-        # shouldn't kill an otherwise-working cron job. See #4219.
+        # Discover only MCP servers reachable through this job's effective
+        # toolset. Unrelated servers cannot consume the run's startup budget.
+        cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
         try:
+            from hermes_cli.tools_config import enabled_mcp_server_names
             from tools.mcp_tool import discover_mcp_tools
-            _mcp_tools = discover_mcp_tools()
+
+            selected_mcp_servers = (
+                None
+                if cron_enabled_toolsets is None
+                else sorted(
+                    set(cron_enabled_toolsets) & enabled_mcp_server_names(_cfg)
+                )
+            )
+            _mcp_tools = discover_mcp_tools(server_names=selected_mcp_servers)
             if _mcp_tools:
                 logger.info(
-                    "Job '%s': %d MCP tool(s) available",
-                    job_id, len(_mcp_tools),
+                    "Job '%s': %d MCP tool(s) available from %s",
+                    job_id,
+                    len(_mcp_tools),
+                    (
+                        "all configured servers"
+                        if selected_mcp_servers is None
+                        else selected_mcp_servers
+                    ),
                 )
+            _run_control.raise_if_expired("MCP discovery")
         except Exception as _mcp_exc:
+            if isinstance(_mcp_exc, TimeoutError):
+                raise
             logger.warning(
                 "Job '%s': MCP initialization failed (non-fatal): %s",
                 job_id, _mcp_exc,
@@ -3492,7 +5656,7 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+            enabled_toolsets=cron_enabled_toolsets,
             disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
@@ -3506,6 +5670,22 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        if provider_deadline is not None:
+            configure_budget = getattr(
+                agent, "configure_request_timeout_budget", None
+            )
+            if callable(configure_budget):
+                configure_budget(
+                    deadline_monotonic=provider_deadline,
+                    cleanup_grace_seconds=_run_control.cleanup_grace(),
+                )
+            else:
+                agent._request_timeout_deadline_monotonic = provider_deadline
+                agent._request_timeout_cleanup_grace_seconds = (
+                    _run_control.cleanup_grace()
+                )
+        _run_control.set_agent(agent)
+        _run_control.raise_if_expired("agent initialization")
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -3529,7 +5709,7 @@ def run_job(
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
         _POLL_INTERVAL = 5.0
-        # Keep the one-shot run_claim fresh while the run is alive (#62002):
+        # Keep both persisted claims fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
         # run that legitimately outlives it (stream stall, laptop asleep
         # mid-run) is indistinguishable from a dead tick — another process
@@ -3561,39 +5741,55 @@ def run_job(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        _cron_pool = DaemonThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="cron-conversation"
+        )
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
+        _cron_run_timeout = _run_control.timeout()
+        _run_started_at = _run_control.started_at
+        _wall_clock_timeout = False
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot:
-                    result = None
-                    while True:
-                        done, _ = concurrent.futures.wait(
-                            {_cron_future}, timeout=_POLL_INTERVAL,
-                        )
-                        if done:
-                            result = _cron_future.result()
-                            break
-                        _heartbeat_run_claim_if_due()
-                else:
-                    result = _cron_future.result()
+            if (
+                _cron_inactivity_limit is None
+                and _cron_run_timeout is None
+                and not _is_oneshot
+                and run_outcome_claim is None
+            ):
+                result = _cron_future.result()
             else:
                 result = None
                 while True:
+                    _wait_timeout = _POLL_INTERVAL
+                    if _cron_run_timeout is not None:
+                        _remaining = _cron_run_timeout - (
+                            time.monotonic() - _run_started_at
+                        )
+                        if _remaining <= 0:
+                            _wall_clock_timeout = True
+                            break
+                        _wait_timeout = min(_wait_timeout, _remaining)
                     done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
+                        {_cron_future}, timeout=_wait_timeout,
                     )
                     if done:
                         result = _cron_future.result()
                         break
-                    _heartbeat_run_claim_if_due()
+                    _heartbeat_claims_if_due()
+                    if (
+                        _cron_run_timeout is not None
+                        and time.monotonic() - _run_started_at >= _cron_run_timeout
+                    ):
+                        _wall_clock_timeout = True
+                        break
+                    if _cron_inactivity_limit is None:
+                        continue
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
                     if hasattr(agent, "get_activity_summary"):
@@ -3610,6 +5806,20 @@ def run_job(
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
+
+        if _wall_clock_timeout:
+            _elapsed = time.monotonic() - _run_started_at
+            logger.error(
+                "Job '%s' exceeded total runtime %.1fs (limit %.1fs)",
+                job_name,
+                _elapsed,
+                _cron_run_timeout,
+            )
+            _run_control.interrupt("Cron job exceeded total runtime limit")
+            raise TimeoutError(
+                f"Cron job '{job_name}' exceeded total runtime limit of "
+                f"{_cron_run_timeout:g}s"
+            )
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -3632,8 +5842,7 @@ def run_job(
                 _last_desc, _iter_n, _iter_max,
                 _cur_tool or "none",
             )
-            if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
+            _run_control.interrupt("Cron job timed out (inactivity)")
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
@@ -3675,7 +5884,17 @@ def run_job(
                 job_name,
             )
 
-        final_response = result.get("final_response", "") or ""
+        original_final_response = result.get("final_response", "") or ""
+        final_response, delivery_frame = _cron_final_response_parts(
+            original_final_response
+        )
+        # Frame-unwrap before the silence/empty checks.  The agent sometimes
+        # wraps the marker inside the explicit final-response frame it is told
+        # to use for business results ("## Response\n[SILENT]\n## End Response").
+        # The marker is still the entire user-visible payload, so a legitimate
+        # quiet tick must be treated as silence, not an empty-response failure.
+        # Keep the original closed frame separately for the outbound boundary;
+        # only this control/body value is used for logging and suppression.
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -3720,8 +5939,16 @@ def run_job(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None
+        return _RunJobResult(
+            True,
+            output,
+            final_response,
+            None,
+            delivery_frame=delivery_frame,
+        )
         
+    except CronRunOutcomeOwnershipLost:
+        raise
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
@@ -3745,6 +5972,10 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
+        if request_budget_token is not None:
+            from agent.request_budget import reset_provider_request_budget
+
+            reset_provider_request_budget(request_budget_token)
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.
@@ -3763,6 +5994,9 @@ def run_job(
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
         clear_session_vars(_ctx_tokens)
+        if _cron_session_token is not None:
+            _cron_session_var.reset(_cron_session_token)
+        reset_cron_authorization(_cron_auth_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
@@ -3850,6 +6084,185 @@ def run_job(
             _teardown_cron_agent(agent, job_id)
 
 
+def _run_job_impl(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    _run_control: _CronRunControl,
+    script_snapshot: bytes | dict[str, Any] | None = None,
+    run_outcome_claim: dict[str, Any] | None = None,
+) -> _RunJobResult:
+    """Execute in the worker and always return typed cross-thread metadata."""
+    result = _run_job_body(
+        job,
+        defer_agent_teardown=defer_agent_teardown,
+        _run_control=_run_control,
+        script_snapshot=script_snapshot,
+        run_outcome_claim=run_outcome_claim,
+    )
+    if isinstance(result, _RunJobResult):
+        cleanup_incomplete = bool(
+            result.cleanup_incomplete or _run_control.cleanup_incomplete()
+        )
+        if cleanup_incomplete:
+            return replace(
+                result,
+                success=False,
+                error=result.error
+                or "CleanupIncompleteError: cleanup_incomplete",
+                cleanup_incomplete=True,
+            )
+        return result
+    success, output, final_response, error = result
+    cleanup_incomplete = _run_control.cleanup_incomplete()
+    if cleanup_incomplete:
+        success = False
+        error = error or "CleanupIncompleteError: cleanup_incomplete"
+    return _RunJobResult(
+        success,
+        output,
+        final_response,
+        error,
+        cleanup_incomplete=cleanup_incomplete,
+        delivery_frame=(
+            _closed_cron_final_response_frame(final_response)
+            if success
+            else None
+        ),
+    )
+
+
+def _run_job_result(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    script_snapshot: bytes | dict[str, Any] | None = None,
+    run_outcome_claim: dict[str, Any] | None = None,
+) -> _RunJobResult:
+    """Execute a job under one deadline measured from this entry boundary.
+
+    The monitored worker includes runtime governance, dotenv/config/provider
+    loading, MCP and plugin discovery, agent construction, and the conversation
+    itself. A timeout revokes the shared cron runtime lease before returning, so
+    a non-cooperative late worker cannot retain cron approval authority.
+    """
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    started_at = time.monotonic()
+    entry_timeout = _preparse_cron_run_timeout(job)
+    job_id = str(job.get("id") or "")
+    job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    control = _CronRunControl(
+        job, started_at=started_at, entry_timeout=entry_timeout
+    )
+    collector = (
+        _DeferredCronAgentCollector(job_id)
+        if defer_agent_teardown is not None
+        else None
+    )
+    worker_deferred = collector if collector is not None else None
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    worker_context = contextvars.copy_context()
+    future = pool.submit(
+        worker_context.run,
+        _run_job_impl,
+        job,
+        defer_agent_teardown=worker_deferred,
+        _run_control=control,
+        script_snapshot=script_snapshot,
+        run_outcome_claim=run_outcome_claim,
+    )
+
+    try:
+        while True:
+            remaining = control.execution_remaining()
+            if remaining is not None and remaining <= 0:
+                timeout = control.timeout() or 0.0
+                base_reason = (
+                    f"Cron job '{job_name}' exceeded total runtime limit of "
+                    f"{timeout:g}s"
+                )
+                hard_deadline = control.hard_deadline()
+                cleanup_remaining = (
+                    max(0.0, hard_deadline - time.monotonic())
+                    if hard_deadline is not None
+                    else 0.0
+                )
+                interrupt_result = control.interrupt(
+                    base_reason,
+                    cleanup_timeout=cleanup_remaining,
+                )
+                if collector is not None:
+                    collector.revoke()
+                future.cancel()
+                cleanup_remaining = (
+                    max(0.0, hard_deadline - time.monotonic())
+                    if hard_deadline is not None
+                    else 0.0
+                )
+                if cleanup_remaining > 0.0:
+                    try:
+                        future.result(timeout=cleanup_remaining)
+                    except concurrent.futures.TimeoutError:
+                        pass
+                    except BaseException:
+                        pass
+                cleanup_incomplete = bool(
+                    interrupt_result.cleanup_incomplete
+                    or control.cleanup_incomplete()
+                    or not future.done()
+                )
+                reason = (
+                    f"{base_reason}; cleanup_incomplete"
+                    if cleanup_incomplete
+                    else base_reason
+                )
+                logger.error("Job '%s': %s", job_id, reason)
+                output = (
+                    f"# Cron Job: {job_name} (FAILED)\n\n"
+                    f"**Job ID:** {job_id}\n"
+                    f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    "## Error\n\n"
+                    f"```\nTimeoutError: {reason}\n```\n"
+                )
+                return _RunJobResult(
+                    False,
+                    output,
+                    "",
+                    f"TimeoutError: {reason}",
+                    cleanup_incomplete=cleanup_incomplete,
+                )
+
+            if future.done():
+                result = future.result()
+                if collector is not None and defer_agent_teardown is not None:
+                    collector.transfer_to(defer_agent_teardown)
+                return result
+
+            try:
+                future.result(timeout=control.wait_timeout())
+            except concurrent.futures.TimeoutError:
+                continue
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def run_job(
+    job: dict,
+    *,
+    defer_agent_teardown: Optional[list] = None,
+    script_snapshot: bytes | dict[str, Any] | None = None,
+    run_outcome_claim: dict[str, Any] | None = None,
+) -> tuple[bool, str, str, Optional[str]]:
+    """Compatibility surface returning the historical four-tuple."""
+    return _run_job_result(
+        job,
+        defer_agent_teardown=defer_agent_teardown,
+        script_snapshot=script_snapshot,
+        run_outcome_claim=run_outcome_claim,
+    ).legacy_tuple()
+
+
 def _teardown_cron_agent(agent, job_id: str) -> None:
     """Release an ephemeral cron agent's async resources.
 
@@ -3893,15 +6306,137 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    run_outcome_claim = None
+    dispatch_phase = "not_attempted"
+
+    def _renew_run_outcome_owner() -> None:
+        if run_outcome_claim is not None:
+            _renew_run_outcome_claim_or_raise(job["id"], run_outcome_claim)
+
     try:
-        # Pre-run dispatch claim (issue #38758): atomically commit a finite
-        # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
-        # mid-execution (gateway kill, OOM, segfault, hard-timeout) cannot
-        # re-fire the job forever on restart. No-op for recurring jobs (they
-        # use advance_next_run) and infinite/no-repeat jobs. This lives here in
-        # the shared body so BOTH the built-in ticker and the external provider
-        # (Chronos fire_due) get at-most-times semantics.
-        if not claim_dispatch(job["id"]):
+        if _set_running_job_state(
+            job["id"],
+            "preflight",
+            run_outcome_claim=None,
+            run_claim=job.get("run_claim"),
+            fire_claim=job.get("fire_claim"),
+        ):
+            return False
+        # A signed Job clears its previous terminal proof before any script,
+        # model, tool, or delivery side effect. The claim freezes the actual
+        # implementation/checkpoint tuple and is CAS-checked at terminal write.
+        run_outcome_claim = begin_job_run_outcome(job)
+        interrupted = _set_running_job_state(
+            job["id"],
+            "preflight",
+            run_outcome_claim=run_outcome_claim,
+        )
+        if interrupted:
+            if run_outcome_claim is not None:
+                abandon_job_run_outcome(
+                    job["id"],
+                    run_outcome_claim,
+                    reason_code="run_outcome_interrupted_before_dispatch",
+                    run_claim=job.get("run_claim"),
+                    fire_claim=job.get("fire_claim"),
+                )
+            return False
+        if job.get("creation_governance_receipt") is not None and run_outcome_claim is None:
+            verification_declared = any(
+                job.get(field) not in (None, "")
+                for field in ("verification_command", "verification_command_mode")
+            )
+            try:
+                cron_creation_profile_identity(job)
+                profile_binding_error = ""
+            except CronCreationProfileBindingError as exc:
+                profile_binding_error = exc.code
+            except Exception:
+                profile_binding_error = "creation_receipt_profile_unverified"
+            reason_code = profile_binding_error or (
+                "unsupported_verification_contract"
+                if verification_declared
+                else "run_outcome_claim_unavailable"
+            )
+            creation = job.get("creation_governance_receipt")
+            job_revision = (
+                str(creation.get("receipt_id") or "")
+                if isinstance(creation, dict)
+                else ""
+            )
+            record_job_run_preflight_denial(
+                job["id"],
+                job_revision=job_revision,
+                reason_code=reason_code,
+                run_claim=job.get("run_claim"),
+                fire_claim=job.get("fire_claim"),
+            )
+            logger.error(
+                "Job '%s': signed run outcome claim could not be established (%s); aborting",
+                job["id"],
+                reason_code,
+            )
+            return False
+        script_snapshot = None
+        if run_outcome_claim is not None:
+            snapshot_matches, script_snapshot = _cron_run_script_snapshot(
+                job,
+                run_outcome_claim,
+            )
+            if not snapshot_matches:
+                abandon_job_run_outcome(
+                    job["id"],
+                    run_outcome_claim,
+                    reason_code="run_outcome_script_changed",
+                    run_claim=job.get("run_claim"),
+                    fire_claim=job.get("fire_claim"),
+                )
+                logger.error(
+                    "Job '%s': script changed after the run claim; aborting",
+                    job["id"],
+                )
+                return False
+
+        # Claim a finite one-shot only after every zero-side-effect signed
+        # preflight succeeds. A crash after this point must retain at-most-times
+        # semantics; a rejected claim or changed snapshot must not consume it.
+        dispatch_phase = "attempting"
+        dispatch_allowed, dispatch_interrupted = _claim_dispatch_with_running_state(
+            job["id"],
+            run_outcome_claim,
+        )
+        if dispatch_interrupted:
+            if dispatch_allowed:
+                kwargs = (
+                    {"run_outcome_claim": run_outcome_claim}
+                    if run_outcome_claim is not None
+                    else {}
+                )
+                mark_job_run(
+                    job["id"],
+                    False,
+                    "Interrupted by gateway shutdown before execution started.",
+                    **kwargs,
+                )
+            elif run_outcome_claim is not None:
+                abandon_job_run_outcome(
+                    job["id"],
+                    run_outcome_claim,
+                    reason_code="run_outcome_interrupted_before_dispatch",
+                    run_claim=job.get("run_claim"),
+                    fire_claim=job.get("fire_claim"),
+                )
+            _consume_interrupted_flag(job["id"])
+            return False
+        if not dispatch_allowed:
+            dispatch_phase = "refused"
+            if run_outcome_claim is not None:
+                abandon_job_run_outcome(
+                    job["id"],
+                    run_outcome_claim,
+                    run_claim=job.get("run_claim"),
+                    fire_claim=job.get("fire_claim"),
+                )
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
@@ -3912,9 +6447,22 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 error="Dispatch claim rejected; execution was not started.",
             )
             return True  # not an error — already handled/removed
+        dispatch_phase = "committed"
+        if _set_running_job_state(job["id"], "executing"):
+            kwargs = (
+                {"run_outcome_claim": run_outcome_claim}
+                if run_outcome_claim is not None
+                else {}
+            )
+            mark_job_run(
+                job["id"],
+                False,
+                "Interrupted by gateway shutdown before execution started.",
+                **kwargs,
+            )
+            _consume_interrupted_flag(job["id"])
+            return False
 
-        # The attempt is claimed durably before executor/provider dispatch and
-        # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
 
         # Run the job under the profile's secret scope. get_secret() fails
@@ -3942,97 +6490,172 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
-            )
-        except BaseException:
-            # run_job's finally still hands back the agent when it raises; tear
-            # it down here so a failed run never leaks its async resources
-            # (#10200), then re-raise into the outer handler. BaseException
-            # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
-            # still triggers teardown before propagating.
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
-            raise
+            run_kwargs: dict[str, Any] = {
+                "defer_agent_teardown": _deferred_agents,
+            }
+            if script_snapshot is not None:
+                run_kwargs["script_snapshot"] = script_snapshot
+            if run_outcome_claim is not None:
+                run_kwargs["run_outcome_claim"] = run_outcome_claim
+            run_result = _run_job_result(job, **run_kwargs)
+            if not isinstance(run_result, _RunJobResult):
+                # Test/embedding compatibility for callers that monkeypatch the
+                # internal executor with the historical tuple shape.
+                run_result = _RunJobResult(*run_result)
         finally:
             reset_secret_scope(_scope_token)
 
-        # Everything from here through delivery runs with the agent still live
-        # (deferred teardown). Wrap it ALL in a try/finally so that if any step
-        # between run_job returning and delivery — save_job_output, the [SILENT]
-        # / empty-response computation, or _deliver_result itself — raises, the
-        # deferred agent is still torn down. Otherwise the outer `except` would
-        # swallow the error and leak the agent's subprocesses/clients (#10200).
-        delivery_error = None
-        try:
-            output_file = save_job_output(job["id"], output)
-            if verbose:
-                logger.info("Output saved to: %s", output_file)
-
-            # If the gateway shutdown killed this job's tool subprocess
-            # mid-flight (#60432), the agent may still have produced a
-            # plausible-looking final_response from the truncated output --
-            # force the failure path so the delivered message is an honest
-            # "this run was interrupted" summary instead of that response.
-            # Peek-only: the flag stays set for the authoritative check
-            # right before mark_job_run below.
-            if success and _is_interrupted(job["id"]):
-                success = False
-                error = (
-                    "Interrupted by gateway shutdown before the run finished "
-                    "(tool subprocess was killed mid-flight)."
+        success = run_result.success
+        output = run_result.output
+        final_response = run_result.final_response
+        error = run_result.error
+        admission_receipt = run_result.runtime_admission_receipt
+        admission_decision = run_result.runtime_admission_decision
+        if admission_receipt is not None and admission_decision is not None:
+            notice_status = _deliver_operational_notice(
+                job,
+                admission_decision,
+                adapters=adapters,
+                loop=loop,
+            )
+            if notice_status not in {"not_available", "sent"}:
+                logger.warning(
+                    "Job '%s': runtime-denial operational notice %s",
+                    job["id"],
+                    notice_status,
                 )
 
-            # Deliver the final response to the origin/target chat.
-            # If the agent responded with [SILENT], skip delivery (but
-            # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
-            # Treat whitespace-only final responses the same as empty
-            # responses: do not deliver a blank message, and let the
-            # empty-response guard below mark the run as a soft failure.
-            should_deliver = bool(deliver_content.strip())
-            unresolved_origin = False
-            # Cron silence suppression — see _is_cron_silence_response.  Replaces the
-            # old `SILENT_MARKER in ...upper()` substring check, which both leaked
-            # bracketless near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed
-            # a real report that merely quoted "[SILENT]" mid-sentence (#51438,
-            # #46917).  Keeps the intentional bracketed-prefix / trailing-line
-            # tolerance the cron contract relies on.
-            if should_deliver and success and _is_cron_silence_response(deliver_content):
+        # The agent stays live through delivery. The function-level finally
+        # tears it down after the terminal CAS, including every error path.
+        delivery_error = None
+        delivery_receipts: list[dict[str, Any]] = []
+        _renew_run_outcome_owner()
+        output_file = save_job_output(job["id"], output)
+        _renew_run_outcome_owner()
+        if verbose:
+            logger.info("Output saved to: %s", output_file)
+
+        if success and _is_interrupted(job["id"]):
+            success = False
+            error = (
+                "Interrupted by gateway shutdown before the run finished "
+                "(tool subprocess was killed mid-flight)."
+            )
+
+        # The body controls silence/empty behavior. A separately retained
+        # closed frame is the only successful delivery candidate so the output
+        # boundary can project it with its full provenance still attached.
+        delivery_frame = None
+        if success:
+            if run_result.delivery_frame is not None:
+                delivery_control_content, delivery_frame = (
+                    _cron_final_response_parts(run_result.delivery_frame)
+                )
+            else:
+                delivery_control_content, delivery_frame = (
+                    _cron_final_response_parts(final_response)
+                )
+            if delivery_frame is None:
+                delivery_control_content = final_response
+            deliver_content = delivery_frame or final_response
+        else:
+            delivery_control_content = _summarize_cron_failure_for_delivery(
+                job, error
+            )
+            deliver_content = delivery_control_content
+        # Whitespace-only responses are not delivered; the guard below records
+        # them as a soft failure.
+        should_deliver = bool(delivery_control_content.strip())
+        # Cron silence suppression preserves reports that merely quote the
+        # marker while accepting the intentional prefix/trailing-line forms.
+        if should_deliver and success:
+            if _is_cron_silence_response(delivery_control_content):
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
-
-            if should_deliver:
-                unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+            else:
+                # A standalone marker after a real report is contradictory;
+                # preserve the report while keeping raw output for audit.
+                cleaned_control_content = _strip_cron_silence_markers_from_report(
+                    delivery_control_content
                 )
-                try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
-                except Exception as de:
-                    delivery_error = str(de)
-                    logger.error("Delivery failed for job %s: %s", job["id"], de)
-        finally:
-            # Tear down the deferred agent(s) now that save + delivery have run
-            # (or raised). Must happen on every path so cron agents never leak
-            # their subprocesses/clients (#10200).
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
+                if delivery_frame is None:
+                    deliver_content = cleaned_control_content
+
+        if should_deliver:
+            try:
+                delivery_kwargs: dict[str, Any] = {
+                    "adapters": adapters,
+                    "loop": loop,
+                    "delivery_receipts": delivery_receipts,
+                }
+                if run_outcome_claim is not None:
+                    delivery_kwargs["heartbeat"] = _renew_run_outcome_owner
+                if delivery_frame is not None:
+                    delivery_kwargs["delivery_projection"] = (
+                        cleaned_control_content
+                    )
+                delivery_error = _deliver_result(
+                    job,
+                    deliver_content,
+                    **delivery_kwargs,
+                )
+            except CronRunOutcomeOwnershipLost:
+                raise
+            except Exception as de:
+                delivery_error = str(de)
+                logger.error("Delivery failed for job %s: %s", job["id"], de)
+                _append_failed_delivery_receipt(delivery_receipts)
 
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
         # (issue #8585)
-        if success and not final_response.strip():
+        if success and not delivery_control_content.strip():
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        delivery_receipt = _cron_delivery_receipt_summary(delivery_receipts)
+
+        interrupted = _consume_interrupted_flag(job["id"])
+        if interrupted:
+            success = False
+            error = "Interrupted by gateway shutdown before the run finished."
+        if not interrupted or run_outcome_claim is not None:
+            _renew_run_outcome_owner()
+            delivery_kwargs: dict[str, Any] = {"delivery_error": delivery_error}
+            if delivery_receipt is not None:
+                delivery_kwargs["delivery_receipt"] = delivery_receipt
+            run_outcome_receipt = (
+                None
+                if admission_receipt is not None or run_outcome_claim is None
+                else _cron_run_outcome_receipt(
+                    job,
+                    success=success,
+                    run_outcome_claim=run_outcome_claim,
+                    delivery_receipt=delivery_receipt,
+                )
+            )
+            if run_outcome_receipt is not None:
+                delivery_kwargs["run_outcome_receipt"] = run_outcome_receipt
+            if run_outcome_claim is not None:
+                delivery_kwargs["run_outcome_claim"] = run_outcome_claim
+            if admission_receipt is None:
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    **delivery_kwargs,
+                )
+            else:
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    runtime_admission_receipt=admission_receipt,
+                    **delivery_kwargs,
+                )
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
-        elif should_deliver and unresolved_origin:
-            delivery_outcome = "not_configured"
         elif should_deliver and normalized_deliver != "local":
             delivery_outcome = "delivered"
         else:
@@ -4045,37 +6668,111 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         )
         return True
 
-    except BaseException as e:  # noqa: BLE001 — deliberate: see below
-        # BaseException, not Exception (#73973): the inner run_job handler
-        # re-raises CancelledError / KeyboardInterrupt / SystemExit after agent
-        # teardown, and none of those are Exception subclasses. If they escape
-        # without mark_job_run(False), a finite one-shot is left wedged —
-        # claim_dispatch() already consumed repeat.completed, but last_run_at
-        # is never written, so the job sits in state "scheduled" until the
-        # run-claim TTL expires and the dispatch-limit guard removes it with
-        # no output and no error. Record the failure first, then re-raise
-        # anything that isn't a plain Exception.
-        _err_text = str(e) or type(e).__name__
-        logger.error("Error processing job %s: %s", job['id'], _err_text)
-        try:
-            if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
-        except Exception as record_err:
-            # Never let bookkeeping mask the original interruption.
-            logger.error(
-                "Failed to record interrupted run for job %s: %s",
-                job["id"], record_err,
-            )
-        try:
-            finish_execution(execution_id, success=False, error=_err_text)
-        except Exception as record_err:
-            logger.error(
-                "Failed to finish execution record for job %s: %s",
-                job["id"], record_err,
-            )
-        if not isinstance(e, Exception):
-            raise
+    except CronRunOutcomeOwnershipLost as ownership_error:
+        logger.error("Job '%s': %s; stopping without delivery or terminal write", job["id"], ownership_error)
+        finish_execution(execution_id, success=False, error=str(ownership_error))
         return False
+    except Exception as e:
+        logger.error("Error processing job %s: %s", job['id'], e)
+        if dispatch_phase != "committed":
+            if dispatch_phase == "attempting":
+                # claim_dispatch() may have persisted its finite-run claim
+                # before raising. Preserve every claim for reconciliation;
+                # guessing here could either double-run or consume the Job.
+                logger.error(
+                    "Job '%s': dispatch commit state is ambiguous; preserving claims",
+                    job["id"],
+                )
+            else:
+                try:
+                    if run_outcome_claim is not None:
+                        abandon_job_run_outcome(
+                            job["id"],
+                            run_outcome_claim,
+                            reason_code="run_outcome_preflight_exception",
+                            run_claim=job.get("run_claim"),
+                            fire_claim=job.get("fire_claim"),
+                        )
+                    elif job.get("creation_governance_receipt") is not None:
+                        creation = job.get("creation_governance_receipt")
+                        job_revision = (
+                            str(creation.get("receipt_id") or "")
+                            if isinstance(creation, dict)
+                            else ""
+                        )
+                        record_job_run_preflight_denial(
+                            job["id"],
+                            job_revision=job_revision,
+                            reason_code="run_outcome_preflight_exception",
+                            run_claim=job.get("run_claim"),
+                            fire_claim=job.get("fire_claim"),
+                        )
+                except Exception as cleanup_error:
+                    logger.error(
+                        "Job '%s': failed to persist preflight exception state: %s",
+                        job["id"],
+                        cleanup_error,
+                    )
+            return False
+        interrupted = _consume_interrupted_flag(job["id"])
+        if not interrupted or run_outcome_claim is not None:
+            if run_outcome_claim is not None:
+                try:
+                    _renew_run_outcome_owner()
+                except CronRunOutcomeOwnershipLost as ownership_error:
+                    logger.error(
+                        "Job '%s': %s; stopping without an exception terminal write",
+                        job["id"],
+                        ownership_error,
+                    )
+                    return False
+            admission_receipt = (
+                run_result.runtime_admission_receipt
+                if "run_result" in locals()
+                else None
+            )
+            run_outcome_receipt = (
+                None
+                if admission_receipt is not None or run_outcome_claim is None
+                else _cron_run_outcome_receipt(
+                    job,
+                    success=False,
+                    run_outcome_claim=run_outcome_claim,
+                    delivery_receipt=(
+                        delivery_receipt
+                        if "delivery_receipt" in locals()
+                        else None
+                    ),
+                )
+            )
+            outcome_kwargs: dict[str, Any] = {}
+            if admission_receipt is not None:
+                outcome_kwargs["runtime_admission_receipt"] = admission_receipt
+            if run_outcome_claim is not None:
+                outcome_kwargs["run_outcome_claim"] = run_outcome_claim
+            if run_outcome_receipt is None:
+                mark_job_run(
+                    job["id"],
+                    False,
+                    str(e),
+                    **outcome_kwargs,
+                )
+            else:
+                outcome_kwargs["run_outcome_receipt"] = run_outcome_receipt
+                mark_job_run(
+                    job["id"],
+                    False,
+                    str(e),
+                    **outcome_kwargs,
+                )
+        finish_execution(execution_id, success=False, error=str(e))
+        return False
+    finally:
+        for _deferred_agent in locals().get("_deferred_agents", []):
+            _teardown_cron_agent(_deferred_agent, job["id"])
+        with _running_lock:
+            _running_job_states.pop(job["id"], None)
+            _interrupted_job_ids.discard(job["id"])
 
 
 def _notify_provider_jobs_changed() -> None:
@@ -4144,8 +6841,20 @@ def tick(
 
         due_jobs = get_due_jobs()
 
-        if verbose and not due_jobs:
-            logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+        if not due_jobs:
+            # Idle tick: skip config load + pool partitioning entirely
+            # (#33612 — the gateway ticker calls tick(verbose=False) every
+            # 60s, so idle ticks previously fell through to load_config()).
+            # Still run the post-tick MCP orphan sweep: main intentionally
+            # sweeps on idle ticks so orphaned stdio children from crashed
+            # jobs are reaped even when nothing is due.
+            if verbose:
+                logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
+            try:
+                from tools.mcp_tool import _kill_orphaned_mcp_children
+                _kill_orphaned_mcp_children()
+            except Exception as _e:
+                logger.debug("Post-tick MCP orphan cleanup failed: %s", _e)
             return 0
 
         if verbose:
@@ -4153,11 +6862,11 @@ def tick(
 
         # Advance next_run_at for all recurring jobs FIRST, under the file lock,
         # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
+        # For parallel jobs that are already running, the advance keeps
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
-        for job in due_jobs:
-            advance_next_run(job["id"])
+        # Batched: one load + one save for the whole due set, not one per job.
+        advance_next_runs([job["id"] for job in due_jobs])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -4241,12 +6950,16 @@ def tick(
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
+                        _running_job_states.pop(j["id"], None)
+                        _interrupted_job_ids.discard(j["id"])
 
             try:
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
                 with _running_lock:
                     _running_job_ids.discard(job_id)
+                    _running_job_states.pop(job_id, None)
+                    _interrupted_job_ids.discard(job_id)
                 finish_execution(
                     execution["id"],
                     success=False,

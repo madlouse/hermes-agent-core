@@ -45,6 +45,7 @@ def isolated_profiles(tmp_path, monkeypatch, _isolate_hermes_home):
         (home / "config.yaml").write_text("{}\n", encoding="utf-8")
 
     _write_skill(default_home / "skills", "dashboard-skill")
+    _write_skill(default_home / "skills", "dashboard-skill-two")
     _write_skill(worker_home / "skills", "worker-skill")
 
     monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: default_home)
@@ -195,8 +196,27 @@ class TestCronJobSkills:
             json={"updates": {"skills": ["dashboard-skill", "worker-skill"]}},
             params={"profile": "default"},
         )
+        assert resp.status_code == 400
+        assert "skill_unavailable_in_active_profile" in resp.json()["detail"]
+
+        # A rejected cross-profile selector must not partially mutate the job.
+        current = client.get(
+            "/api/cron/jobs", params={"profile": "default"}
+        ).json()
+        match = [item for item in current if item["id"] == job["id"]]
+        assert match and match[0].get("skills") in (None, [])
+
+        resp = client.put(
+            f"/api/cron/jobs/{job['id']}",
+            json={
+                "updates": {
+                    "skills": ["dashboard-skill", "dashboard-skill-two"]
+                }
+            },
+            params={"profile": "default"},
+        )
         assert resp.status_code == 200
-        assert resp.json()["skills"] == ["dashboard-skill", "worker-skill"]
+        assert resp.json()["skills"] == ["dashboard-skill", "dashboard-skill-two"]
 
         # Clearing works too.
         resp = client.put(

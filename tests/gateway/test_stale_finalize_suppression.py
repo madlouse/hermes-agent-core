@@ -28,7 +28,8 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.hooks import HookRegistry
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
@@ -42,7 +43,10 @@ class FinalizeCaptureAdapter(BasePlatformAdapter):
     """Adapter that records every send/edit with its finalize flag."""
 
     def __init__(self, platform=Platform.TELEGRAM):
-        super().__init__(PlatformConfig(enabled=True, token="***"), platform)
+        super().__init__(
+            PlatformConfig(enabled=True, token="***", typing_indicator=False),
+            platform,
+        )
         self.sent = []
         self.edits = []
         self._next_id = 0
@@ -145,7 +149,19 @@ def _make_runner(adapter):
     runner._running_agents = {}
     runner._session_run_generation = {}
     runner.session_store = SimpleNamespace(_entries={}, _save=lambda: None)
-    runner.hooks = SimpleNamespace(loaded_hooks=False)
+    hooks = HookRegistry()
+
+    def screening(_event_type, context):
+        return {
+            "decision": "allow",
+            "content": context["content"],
+            "reason": "test_complete_response_screened",
+        }
+
+    hooks._handlers["outbound:before_send"] = [screening]
+    hooks._handler_owners[id(screening)] = "test-output-screen"
+    hooks._handler_capabilities[id(screening)] = frozenset({"output-screening"})
+    runner.hooks = hooks
     runner.config = SimpleNamespace(
         thread_sessions_per_user=False,
         group_sessions_per_user=False,
@@ -173,6 +189,10 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
         ),
         encoding="utf-8",
     )
+    (tmp_path / "channel_policy.toml").write_text(
+        "operator_enforce_enabled = false\n",
+        encoding="utf-8",
+    )
 
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -184,6 +204,7 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
 
     adapter = FinalizeCaptureAdapter()
     runner = _make_runner(adapter)
+    runner._resolve_profile_home_for_source = lambda _source: tmp_path
     gateway_run = importlib.import_module("gateway.run")
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
@@ -195,15 +216,34 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
         chat_id="-1001",
         chat_type="group",
     )
-    result = await runner._run_agent(
-        message="describe this photo",
-        context_prompt="",
-        history=[],
+    session_key = "agent:main:telegram:group:-1001"
+    results = []
+
+    async def handle_message(_event):
+        result = await runner._run_agent(
+            message="describe this photo",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id=session_id,
+            session_key=session_key,
+        )
+        results.append(result)
+        if result.get("already_sent") and not result.get("failed"):
+            return None
+        return result["final_response"]
+
+    adapter._message_handler = handle_message
+    monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: runner)
+    event = MessageEvent(
+        text="describe this photo",
+        message_type=MessageType.TEXT,
         source=source,
-        session_id=session_id,
-        session_key="agent:main:telegram:group:-1001",
+        message_id="inbound-71643",
     )
-    return adapter, result
+    await adapter._process_message_background(event, session_key)
+    assert len(results) == 1
+    return adapter, results[0]
 
 
 # ---------------------------------------------------------------------------
@@ -215,46 +255,41 @@ async def _run_streaming_turn(monkeypatch, tmp_path, agent_cls, session_id):
 async def test_stale_finalize_does_not_suppress_complete_response(
     monkeypatch, tmp_path
 ):
-    """The complete response must reach the platform even when the finalize
-    edit succeeded with only the stale preview snapshot."""
+    """Mandatory screening must buffer stale preview text and send the
+    complete response through the ordinary final-delivery boundary."""
     adapter, result = await _run_streaming_turn(
         monkeypatch, tmp_path, StalePrefixAgent, "sess-71643-stale-finalize"
     )
 
     assert result["final_response"] == FULL_RESPONSE
-    # The missing tail must appear in at least one platform call — either the
-    # reconciliation edit or the normal final send. On the buggy path it
-    # appears in NO call at all (message loss).
+    # Group A requires model deltas to stay buffered until the complete reply
+    # is screened. The complete response must then reach the platform exactly
+    # once through the ordinary final-send path.
     all_payloads = [c["content"] for c in adapter.sent] + [
         e["content"] for e in adapter.edits
     ]
     assert any(FULL_RESPONSE in payload for payload in all_payloads), (
         f"complete response never reached the platform; payloads: {all_payloads!r}"
     )
-    # The preferred recovery is an in-place reconciliation edit of the
-    # streamed message (single corrected message, no duplicate).
-    if result.get("already_sent"):
-        assert any(
-            e["content"] == FULL_RESPONSE and e["finalize"] for e in adapter.edits
-        ), "already_sent=True but no edit carried the complete response"
+    assert adapter.edits == []
+    assert [call["content"] for call in adapter.sent] == [FULL_RESPONSE]
+    assert result.get("already_sent") is not True
 
 
 @pytest.mark.asyncio
 async def test_equal_text_control_still_suppresses_duplicate_send(
     monkeypatch, tmp_path
 ):
-    """When the streamed text equals the final response, suppression must
-    keep working — no duplicate full-response send."""
+    """Equal delta/final text still produces one screened delivery only."""
     adapter, result = await _run_streaming_turn(
         monkeypatch, tmp_path, CompleteStreamAgent, "sess-71643-control-equal"
     )
 
     assert result["final_response"] == FULL_RESPONSE
-    assert result.get("already_sent") is True
-    # Exactly one platform message holds the answer: the streamed message
-    # (created by one send, then edited). No duplicate full send.
+    assert result.get("already_sent") is not True
+    assert adapter.edits == []
     full_sends = [c for c in adapter.sent if FULL_RESPONSE in c["content"]]
-    assert len(full_sends) <= 1, f"duplicate final delivery: {full_sends!r}"
+    assert len(full_sends) == 1, f"duplicate or missing final delivery: {full_sends!r}"
 
 
 # ---------------------------------------------------------------------------

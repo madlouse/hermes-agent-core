@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 
 import pytest
 
@@ -64,6 +65,92 @@ def fake_tool(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_transport_request_json_is_forwarded_to_shared_sender(fake_tool, capsys):
+    request = {"request_id": "request-1567", "frame_id": "frame-1567"}
+    args = _parse(
+        [
+            "--to",
+            "telegram",
+            "hello world",
+            "--transport-request-json",
+            json.dumps(request),
+            "--json",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [
+        {
+            "action": "send",
+            "target": "telegram",
+            "message": "hello world",
+            "transport_request": request,
+        }
+    ]
+    assert json.loads(capsys.readouterr().out)["success"] is True
+
+
+def test_transport_request_json_rejects_non_object_before_send(fake_tool, capsys):
+    args = _parse(
+        ["--to", "telegram", "hello", "--transport-request-json", "[]"]
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 2
+    assert fake_tool.calls == []
+    assert "must be a JSON object" in capsys.readouterr().err
+
+
+def test_send_preserves_owner_profile_across_dotenv_loading(
+    fake_tool, capsys, monkeypatch, tmp_path
+):
+    profile = tmp_path / "profiles" / "atlas"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text(
+        f"HERMES_HOME={tmp_path / 'other'}\nHERMES_PROFILE_ID=yuange\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.setenv("HERMES_PROFILE_ID", "atlas")
+    args = _parse(["--to", "telegram", "hello", "--json"])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert os.environ["HERMES_HOME"] == str(profile)
+    assert os.environ["HERMES_PROFILE_ID"] == "atlas"
+    assert json.loads(capsys.readouterr().out)["success"] is True
+
+
+def test_send_does_not_adopt_profile_identity_from_dotenv(
+    fake_tool, capsys, monkeypatch, tmp_path
+):
+    default_home = tmp_path / ".hermes"
+    default_home.mkdir()
+    (default_home / ".env").write_text(
+        f"HERMES_HOME={tmp_path / 'other'}\nHERMES_PROFILE_ID=yuange\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_ID", raising=False)
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: default_home)
+    args = _parse(["--to", "telegram", "hello", "--json"])
+
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert "HERMES_HOME" not in os.environ
+    assert "HERMES_PROFILE_ID" not in os.environ
+    assert json.loads(capsys.readouterr().out)["success"] is True
+
+
 
 
 
@@ -103,6 +190,77 @@ def test_file_decode_error_suggests_media_directive(fake_tool, capsys, monkeypat
 # ---------------------------------------------------------------------------
 
 
+def test_list_includes_configured_platform_without_discovered_channels(
+    monkeypatch, capsys
+):
+    """A configured platform absent from the channel directory must still be
+    listed (with a no-channels hint) instead of silently omitted."""
+    import types
+    import sys
+
+    class _FakePlatform:
+        def __init__(self, value):
+            self.value = value
+
+    class _FakeGwConfig:
+        def get_connected_platforms(self):
+            return [_FakePlatform("simplex")]
+
+    fake_gw_config = types.ModuleType("gateway.config")
+    fake_gw_config.load_gateway_config = lambda: _FakeGwConfig()
+    monkeypatch.setitem(sys.modules, "gateway.config", fake_gw_config)
+
+    fake_dir = types.ModuleType("gateway.channel_directory")
+    fake_dir.load_directory = lambda: {"updated_at": None, "platforms": {}}
+
+    def _format(platforms=None):
+        lines = []
+        for name, channels in sorted((platforms or {}).items()):
+            lines.append(f"{name}:")
+            if not channels:
+                lines.append("  (no channels discovered yet)")
+        return "\n".join(lines)
+
+    fake_dir.format_directory_for_display = _format
+    monkeypatch.setitem(sys.modules, "gateway.channel_directory", fake_dir)
+
+    rc = send_cmd._list_targets(None, json_mode=False)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "simplex" in out
+    assert "no channels discovered yet" in out
+
+
+def test_list_json_includes_configured_platform(monkeypatch, capsys):
+    import types
+    import sys
+
+    class _FakePlatform:
+        def __init__(self, value):
+            self.value = value
+
+    class _FakeGwConfig:
+        def get_connected_platforms(self):
+            return [_FakePlatform("simplex"), _FakePlatform("local")]
+
+    fake_gw_config = types.ModuleType("gateway.config")
+    fake_gw_config.load_gateway_config = lambda: _FakeGwConfig()
+    monkeypatch.setitem(sys.modules, "gateway.config", fake_gw_config)
+
+    fake_dir = types.ModuleType("gateway.channel_directory")
+    fake_dir.load_directory = lambda: {
+        "updated_at": None,
+        "platforms": {"telegram": [{"id": "1", "name": "home"}]},
+    }
+    fake_dir.format_directory_for_display = lambda platforms=None: ""
+    monkeypatch.setitem(sys.modules, "gateway.channel_directory", fake_dir)
+
+    rc = send_cmd._list_targets(None, json_mode=True)
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["platforms"]["simplex"] == []
+    assert "local" not in payload["platforms"]  # infra pseudo-platform skipped
+    assert payload["platforms"]["telegram"]  # discovered entries preserved
 
 
 # ---------------------------------------------------------------------------
@@ -161,5 +319,3 @@ def test_load_hermes_env_bridges_config_yaml_scalars(tmp_path, monkeypatch):
 
     assert os.environ.get("SOME_TOKEN") == "abc123"
     assert os.environ.get("TELEGRAM_HOME_CHANNEL") == "5550001111"
-
-

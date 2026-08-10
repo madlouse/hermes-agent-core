@@ -434,15 +434,30 @@ def _inject_session_context_env(env: dict) -> None:
     """
     try:
         from gateway.session_context import (
+            _CRON_AUTH_VAR_MAP,
             _UNSET,
             _VAR_MAP,
+            get_session_env,
             session_context_engaged,
         )
     except Exception:
         return
 
+    # Cron authorization is never a subprocess capability. Strip both ambient
+    # process values and caller-supplied overrides before bridging ordinary
+    # session routing metadata.
+    for var_name in _CRON_AUTH_VAR_MAP:
+        env.pop(var_name, None)
+
     _engaged = session_context_engaged()
     for var_name, var in _VAR_MAP.items():
+        if var_name == "HERMES_CRON_SESSION":
+            value = get_session_env(var_name, "")
+            if value:
+                env[var_name] = value
+            else:
+                env.pop(var_name, None)
+            continue
         value = var.get()
         if value is not _UNSET:
             # Explicitly bound (including "") — authoritative for this task.
@@ -456,9 +471,13 @@ def _inject_session_context_env(env: dict) -> None:
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            is_env_passthrough as _is_passthrough,
+            resolve_passthrough_value as _resolve_passthrough_value,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
 
@@ -467,8 +486,12 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
-            sanitized[key] = value
+        passthrough = _is_passthrough(key)
+        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            continue
+        resolved = _resolve_passthrough_value(key, value) if passthrough else value
+        if resolved is not None:
+            sanitized[key] = resolved
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -478,8 +501,13 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             sanitized[real_key] = value
         elif _is_hermes_internal_secret(key):
             continue
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
-            sanitized[key] = value
+        else:
+            passthrough = _is_passthrough(key)
+            if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+                continue
+            resolved = _resolve_passthrough_value(key, value) if passthrough else value
+            if resolved is not None:
+                sanitized[key] = resolved
 
     _inject_context_hermes_home(sanitized)
 
@@ -1255,9 +1283,13 @@ def _path_env_key(run_env: dict) -> str | None:
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            is_env_passthrough as _is_passthrough,
+            resolve_passthrough_value as _resolve_passthrough_value,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     merged = dict(os.environ | env)
     run_env = {}
@@ -1269,8 +1301,13 @@ def _make_run_env(env: dict) -> dict:
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
             continue
-        elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
-            run_env[k] = v
+        else:
+            passthrough = _is_passthrough(k)
+            if k in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+                continue
+            value = _resolve_passthrough_value(k, v) if passthrough else v
+            if value is not None:
+                run_env[k] = value
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
@@ -1396,6 +1433,8 @@ class LocalEnvironment(BaseEnvironment):
     Session snapshot preserves env vars across calls.
     CWD persists via file-based read after each command.
     """
+
+    _profile_scoped_passthrough = True
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)

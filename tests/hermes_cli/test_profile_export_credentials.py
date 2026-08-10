@@ -10,6 +10,14 @@ import tarfile
 from hermes_cli.profiles import export_profile, _DEFAULT_EXPORT_EXCLUDE_ROOT
 
 
+_OUTBOX_PRIVATE_FILES = {
+    "transport-outbox.sqlite3",
+    "transport-outbox.sqlite3-wal",
+    "transport-outbox.sqlite3-shm",
+    ".transport-outbox.key",
+}
+
+
 class TestCredentialExclusion:
 
     def test_auth_json_in_default_exclude_set(self):
@@ -30,6 +38,8 @@ class TestCredentialExclusion:
         (profile_dir / "SOUL.md").write_text("I am helpful.\n")
         (profile_dir / "memories").mkdir()
         (profile_dir / "memories" / "MEMORY.md").write_text("# Memories\n")
+        for filename in _OUTBOX_PRIVATE_FILES:
+            (profile_dir / filename).write_text("private transport authority")
 
         monkeypatch.setattr("hermes_cli.profiles._get_profiles_root", lambda: profiles_root)
         monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda n: profile_dir)
@@ -46,3 +56,32 @@ class TestCredentialExclusion:
         assert any("SOUL.md" in n for n in names), "SOUL.md should be in export"
         assert not any("auth.json" in n for n in names), "auth.json must NOT be in export"
         assert not any(".env" in n for n in names), ".env must NOT be in export"
+        assert not any(
+            name.endswith(tuple(_OUTBOX_PRIVATE_FILES)) for name in names
+        ), "transport outbox authority must NOT be in named-profile exports"
+
+    def test_default_profile_export_excludes_all_outbox_authority(
+        self, tmp_path, monkeypatch
+    ):
+        profile_dir = tmp_path / "default-home"
+        profile_dir.mkdir()
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        for filename in _OUTBOX_PRIVATE_FILES:
+            (profile_dir / filename).write_text("private transport authority")
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", lambda _name: profile_dir
+        )
+        output = tmp_path / "default-export.tar.gz"
+
+        result = export_profile("default", str(output))
+
+        with tarfile.open(result, "r:gz") as tf:
+            names = tf.getnames()
+        assert "default/config.yaml" in names
+        assert not any(
+            name.endswith(tuple(_OUTBOX_PRIVATE_FILES)) for name in names
+        ), "transport outbox authority must NOT be in default-profile exports"
+
+    def test_default_exclude_set_names_all_outbox_authority(self):
+        assert _OUTBOX_PRIVATE_FILES <= _DEFAULT_EXPORT_EXCLUDE_ROOT

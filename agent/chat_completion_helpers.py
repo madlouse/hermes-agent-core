@@ -491,16 +491,22 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
             normalize_converse_response,
         )
         region = api_kwargs.pop("__bedrock_region__", "us-east-1")
+        request_timeout = api_kwargs.pop("__provider_timeout__", None)
         api_kwargs.pop("__bedrock_converse__", None)
-        client = _get_bedrock_runtime_client(region)
+        client = _get_bedrock_runtime_client(
+            region, timeout_seconds=request_timeout
+        )
         try:
             raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
             # so the outer retry loop builds a fresh client/pool.
-            if is_stale_connection_error(_bedrock_exc):
+            if request_timeout is None and is_stale_connection_error(_bedrock_exc):
                 invalidate_runtime_client(region)
             raise
+        finally:
+            if request_timeout is not None:
+                client.close()
         return normalize_converse_response(raw_response)
     if agent.provider == "moa":
         # MoA is a virtual chat-completions provider backed by the
@@ -1146,6 +1152,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         )
+        if getattr(agent, "_request_timeout_deadline_monotonic", None) is not None:
+            anthropic_kwargs["timeout"] = agent._resolved_api_call_timeout()
         # Nous Portal reads ``tags`` and ``session_id`` as top-level body fields
         # on its Messages route the same way it does on /chat/completions, but
         # the profile hook that produces them is only consulted by the
@@ -1159,7 +1167,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         _bt = agent._get_transport()
         region = getattr(agent, "_bedrock_region", None) or "us-east-1"
         guardrail = getattr(agent, "_bedrock_guardrail_config", None)
-        return _bt.build_kwargs(
+        bedrock_kwargs = _bt.build_kwargs(
             model=agent.model,
             messages=api_messages,
             tools=tools_for_api,
@@ -1167,6 +1175,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             region=region,
             guardrail_config=guardrail,
         )
+        if getattr(agent, "_request_timeout_deadline_monotonic", None) is not None:
+            bedrock_kwargs["__provider_timeout__"] = agent._resolved_api_call_timeout()
+        return bedrock_kwargs
 
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
@@ -2383,7 +2394,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
-        logger.warning(f"Failed to get summary response: {e}")
+        logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:
         from agent import relay_llm
@@ -2424,7 +2435,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_vm(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
+            logger.warning("Failed to cleanup VM for task %s: %s", task_id, e)
     try:
         headed = False
         try:
@@ -2442,7 +2453,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             _ra().cleanup_browser(task_id)
     except Exception as e:
         if agent.verbose_logging:
-            logger.warning(f"Failed to cleanup browser for task {task_id}: {e}")
+            logger.warning("Failed to cleanup browser for task %s: %s", task_id, e)
 
 
 def _build_partial_stream_stub(
@@ -2567,8 +2578,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
                     final_kwargs = dict(next_api_kwargs)
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
+                    request_timeout = final_kwargs.pop("__provider_timeout__", None)
                     final_kwargs.pop("__bedrock_converse__", None)
-                    client = _get_bedrock_runtime_client(region)
+                    client = _get_bedrock_runtime_client(
+                        region, timeout_seconds=request_timeout
+                    )
                     try:
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
@@ -2588,13 +2602,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
-                            return normalize_converse_response(
-                                client.converse(**final_kwargs)
-                            )
-                        if is_stale_connection_error(_bedrock_exc):
+                            try:
+                                return normalize_converse_response(
+                                    client.converse(**final_kwargs)
+                                )
+                            finally:
+                                if request_timeout is not None:
+                                    client.close()
+                        if request_timeout is None and is_stale_connection_error(_bedrock_exc):
                             invalidate_runtime_client(region)
+                        if request_timeout is not None:
+                            client.close()
                         raise
-                    return raw_response.get("stream", [])
+                    stream = raw_response.get("stream", [])
+                    if request_timeout is None:
+                        return stream
+
+                    def _request_owned_stream():
+                        try:
+                            yield from stream
+                        finally:
+                            client.close()
+
+                    return _request_owned_stream()
 
                 def _on_text(text):
                     _fire_first()
@@ -3030,16 +3060,31 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
 
+        def _stream_timeout_for_attempt() -> _httpx.Timeout:
+            """Build the physical attempt timeout under the caller's budget."""
+            attempt_base_timeout = _base_timeout
+            attempt_read_timeout = _stream_read_timeout
+            attempt_conn_cap = _conn_cap
+            if getattr(agent, "_request_timeout_deadline_monotonic", None) is not None:
+                remaining = agent._remaining_request_timeout_budget()
+                attempt_base_timeout = min(attempt_base_timeout, remaining)
+                attempt_read_timeout = min(attempt_read_timeout, remaining)
+                attempt_conn_cap = min(attempt_conn_cap, remaining)
+            return _httpx.Timeout(
+                connect=attempt_conn_cap,
+                read=attempt_read_timeout,
+                write=attempt_base_timeout,
+                pool=attempt_conn_cap,
+            )
+
         def _open_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
-                "timeout": _httpx.Timeout(
-                    connect=_conn_cap,
-                    read=_stream_read_timeout,
-                    write=_base_timeout,
-                    pool=_conn_cap,
-                ),
+                # Relay invokes this callback once for every physical retry.
+                # Resolve the Cron-owned budget here, not when the logical
+                # stream begins, so a retry cannot restart a stale full timeout.
+                "timeout": _stream_timeout_for_attempt(),
             }
             # Native Gemini rejects OpenAI's usage-streaming extension.
             if not is_native_gemini_base_url(agent.base_url):

@@ -68,8 +68,9 @@ class TestRegisterMcpServersIsolation:
 
     def _run_with_mocked_connect(self, attempts):
         async def fake_connect(name, config):
-            attempts.append(name)
-            if name == "bad":
+            logical_name = config["_hermes_logical_name"]
+            attempts.append(logical_name)
+            if logical_name == "bad":
                 raise ConnectionError("exec: bad: not found")
             server = mcp_mod.MCPServerTask(name)
             server._registered_tool_names = []
@@ -88,9 +89,12 @@ class TestRegisterMcpServersIsolation:
                 patch("tools.mcp_tool._register_server_tools", return_value=[]), \
                 patch("tools.mcp_tool._filter_suspicious_mcp_servers", side_effect=lambda x: x):
             mcp_mod.register_mcp_servers(cfg)
-            assert "good" in mcp_mod._servers
-            assert "bad" not in mcp_mod._servers
-            assert mcp_mod._connect_cooldown_active("bad") is True
+            bindings = mcp_mod._active_mcp_server_keys.get()
+            good_key = bindings["good"]
+            bad_key = bindings["bad"]
+            assert good_key in mcp_mod._servers
+            assert bad_key not in mcp_mod._servers
+            assert mcp_mod._connect_cooldown_active(bad_key) is True
             assert "bad" in attempts
 
             attempts.clear()
@@ -107,9 +111,10 @@ class TestRegisterMcpServersIsolation:
                 patch("tools.mcp_tool._register_server_tools", return_value=[]), \
                 patch("tools.mcp_tool._filter_suspicious_mcp_servers", side_effect=lambda x: x):
             mcp_mod.register_mcp_servers(cfg)
-            assert mcp_mod._connect_cooldown_active("bad") is True
+            bad_key = mcp_mod._active_mcp_server_keys.get()["bad"]
+            assert mcp_mod._connect_cooldown_active(bad_key) is True
 
-            mcp_mod._server_connect_retry_after["bad"] = mcp_mod.time.monotonic() - 1
+            mcp_mod._server_connect_retry_after[bad_key] = mcp_mod.time.monotonic() - 1
             attempts.clear()
             mcp_mod.register_mcp_servers(cfg)
             assert "bad" in attempts, "elapsed cooldown should permit a retry"

@@ -81,6 +81,56 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertNotIn("acp_args", props["tasks"]["items"]["properties"])
         self.assertNotIn("maxItems", props["tasks"])  # removed — limit is now runtime-configurable
 
+    def test_top_level_description_compact_and_complete(self):
+        """The top-level description must stay compact while keeping every
+        contract that exists nowhere else in the schema (keyword-level, not
+        prose-literal, so rewording doesn't break CI)."""
+        from tools.delegate_tool import _build_top_level_description
+
+        desc = _build_top_level_description()
+        # Compaction ceiling: the old description was ~4,000 chars.
+        self.assertLessEqual(len(desc), 2200)
+        # Contracts only the top-level text carries:
+        for keyword in (
+            "background",          # async semantics
+            "wait or poll",        # no-poll rule
+            "execute_code",        # mechanical-work routing
+            "cronjob",             # durable-work routing
+            "/stop",               # non-durability warning
+            "context",             # pass-everything-via-context rule
+            "respond in Chinese",  # language example (weak models regress without it)
+            "SELF-REPORTS",        # verification contract
+            "fetch the URL",       # concrete verification verbs
+            "clarify",             # leaf blocked-tool list
+            "send_message",
+            "delegation.provider", # model inheritance / pinning
+        ):
+            self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
+
+    def test_dynamic_limits_moved_to_param_descriptions(self):
+        """Concurrency and nesting ceilings must reach the model through the
+        tasks/role parameter descriptions (the top-level text no longer
+        carries them)."""
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        from tools.registry import registry
+
+        with (
+            patch("tools.delegate_tool._get_max_concurrent_children", return_value=7),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=4),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+        ):
+            overrides = _build_dynamic_schema_overrides()
+            definition = registry.get_definitions({"delegate_task"})[0]["function"]
+
+        for parameters in (overrides["parameters"], definition["parameters"]):
+            self.assertIn("up to 7", parameters["properties"]["tasks"]["description"])
+            self.assertIn(
+                "max_spawn_depth=4", parameters["properties"]["role"]["description"]
+            )
+        # Static top-level text must not embed stale limits.
+        self.assertNotIn("up to 7", overrides["description"])
+        self.assertNotIn("max_spawn_depth", overrides["description"])
+
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
         prompt = _build_child_system_prompt("Fix the tests")
@@ -858,6 +908,98 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
+    def test_single_child_inherits_cron_authorization_context(self):
+        from gateway.session_context import (
+            get_session_env,
+            scoped_cron_authorization,
+        )
+        from tools.delegate_tool import _run_single_child
+
+        seen = []
+        child = MagicMock()
+
+        def run_conversation(**kwargs):
+            seen.append(get_session_env("HERMES_CRON_JOB_ID"))
+            return {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = run_conversation
+        with scoped_cron_authorization({"HERMES_CRON_JOB_ID": "bound-job"}):
+            result = _run_single_child(
+                task_index=0,
+                goal="Keep the cron authorization context",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(seen, ["bound-job"])
+
+    def test_parallel_children_inherit_without_cross_contamination(self):
+        from gateway.session_context import (
+            _CRON_JOB_ID,
+            get_session_env,
+            scoped_cron_authorization,
+        )
+
+        parent = _make_mock_parent()
+        barrier = threading.Barrier(2, timeout=5)
+        seen = {}
+
+        def run_child(*args, **kwargs):
+            index = kwargs["task_index"]
+            seen[index] = [get_session_env("HERMES_CRON_JOB_ID")]
+            _CRON_JOB_ID.set(f"child-{index}")
+            barrier.wait()
+            seen[index].append(get_session_env("HERMES_CRON_JOB_ID"))
+            return {
+                "task_index": index,
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 1,
+                "duration_seconds": 0.01,
+                "_child_role": "leaf",
+                "_child_cost_usd": 0.0,
+            }
+
+        credentials = {
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        }
+        with scoped_cron_authorization({"HERMES_CRON_JOB_ID": "parent-job"}), patch(
+            "tools.delegate_tool._load_config",
+            return_value={"max_iterations": 5, "max_concurrent_children": 2},
+        ), patch(
+            "tools.delegate_tool._resolve_delegation_credentials",
+            return_value=credentials,
+        ), patch(
+            "tools.delegate_tool._build_child_preserving_parent_tools",
+            side_effect=[MagicMock(), MagicMock()],
+        ), patch("tools.delegate_tool._run_single_child", side_effect=run_child):
+            result = json.loads(
+                delegate_task(
+                    tasks=[{"goal": "A"}, {"goal": "B"}],
+                    parent_agent=parent,
+                )
+            )
+            self.assertEqual(get_session_env("HERMES_CRON_JOB_ID"), "parent-job")
+
+        self.assertEqual([entry["status"] for entry in result["results"]], ["completed"] * 2)
+        self.assertEqual(seen, {0: ["parent-job", "child-0"], 1: ["parent-job", "child-1"]})
+        self.assertEqual(get_session_env("HERMES_CRON_JOB_ID"), "")
+
     def test_run_single_child_acquires_and_releases_lease(self):
         from tools.delegate_tool import _run_single_child
 

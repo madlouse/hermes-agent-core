@@ -15,6 +15,13 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    for name in ("blogwatcher", "maps"):
+        skill_dir = tmp_path / "skills" / name
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\n",
+            encoding="utf-8",
+        )
     return tmp_path
 
 
@@ -234,3 +241,57 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Failed to create job: boom" in out
+
+
+def test_cron_edit_requires_complete_verification_retirement(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **_kwargs: pytest.fail("partial retirement reached cron API"),
+    )
+    args = SimpleNamespace(
+        job_id="job-1",
+        retire_verification_profile_id="default",
+        retire_verification_job_revision=None,
+        retire_verification_command_sha256=None,
+    )
+
+    assert cron_cli.cron_edit(args) == 1
+    assert "All verification retirement preconditions are required" in capsys.readouterr().out
+
+
+def test_cron_edit_forwards_exact_governance_controls(monkeypatch):
+    captured = {}
+    job = {"id": "job-1", "name": "job", "schedule": {"display": "every 1h"}}
+    monkeypatch.setattr("cron.jobs.resolve_job_ref", lambda _ref, **_kwargs: job)
+
+    def fake_api(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True,
+            "job": {
+                "job_id": "job-1",
+                "name": "job",
+                "schedule": "every 1h",
+            },
+        }
+
+    monkeypatch.setattr(cron_cli, "_cron_api", fake_api)
+    revision = "sha256:" + "1" * 64
+    command_hash = "sha256:" + "2" * 64
+    args = SimpleNamespace(
+        job_id="job-1",
+        refresh_governance=False,
+        retire_verification_profile_id="default",
+        retire_verification_job_revision=revision,
+        retire_verification_command_sha256=command_hash,
+    )
+
+    assert cron_cli.cron_edit(args) == 0
+    assert captured["governance_refresh"] is False
+    assert captured["deprecated_verification_retirement"] == {
+        "schema_version": "cron-verification-retirement/v1",
+        "profile_id": "default",
+        "job_revision": revision,
+        "command_sha256": command_hash,
+    }

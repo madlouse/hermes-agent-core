@@ -33,6 +33,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
+DESKTOP_PACKAGE_FILE = REPO_ROOT / "apps" / "desktop" / "package.json"
+PACKAGE_LOCK_FILE = REPO_ROOT / "package-lock.json"
+UV_LOCK_FILE = REPO_ROOT / "uv.lock"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -78,6 +81,8 @@ LEGACY_AUTHOR_MAP = {
     "BB-light@users.noreply.github.com": "BB-light",  # PR #76015 salvage (caching: honor cache_ttl disable; #33555)
     "75556242+webtecnica@users.noreply.github.com": "webtecnica",  # PR #63360 salvage (nous: restore inference-api base_url)
     "contato@webtecnica.com.br": "webtecnica",  # PR #70888 salvage
+    "webtecnica@gmail.com": "webtecnica",  # PR #75838 salvage (aux: free-only fallback guard; #75803)
+    "ckaznocha@gmail.com": "ckaznocha",  # PR #71543 salvage (matrix: crypto store reset + pickle migration)
     "skosarevivan@yandex.ru": "Epoxidex",  # PR #29820 salvage (ollama: top-level reasoning_effort=none; #25758)
     "jdjiayou@163.com": "JiaDe-Wu",  # PR #34742 salvage (bedrock: bearer routing + streaming fallback + image decode; #28156)
     "changhyun.min@gmail.com": "minchang",  # PR #42231 salvage (providers: add Upstage Solar)
@@ -107,6 +112,9 @@ LEGACY_AUTHOR_MAP = {
     "xwolf.live@gmail.com": "vizi0uz",  # PR #59795 adopted in #62290
     "wilsonkinyuam@gmail.com": "WilsonKinyua",  # PR #62052 (tui: persist unflushed conversations on disconnect/restart)
     "humphreysun98@gmail.com": "HumphreySun98",  # PR #61142 salvage (web: null web/backend config value guards)
+    "merlin@threewizards.agency": "light-merlin-dark",  # PR #7821 salvage (zai: parallel endpoint detection probes)
+    "4850809+frizikk@users.noreply.github.com": "frizikk",  # PR #63389 salvage (session-search: fields projection skips unused context enrichment)
+    "endeavorisforever@gmail.com": "EndeavorYen",  # PR #33971 salvage (image: parallel image_generate batches + FileSyncManager transaction lock)
     "sonxi@nous.local": "17324393074",  # PR #53196 salvage (tools_config: known_plugin_toolsets null guard; commit under unlinked local identity)
     "lemonwan@users.noreply.github.com": "lemonwan",  # PR #59430 sibling salvage (adapter reconnect contract guard)
     "luxuguangno1@163.com": "luxuguang-leo",  # PR #52966 + #52908 salvage (QQBot reconnect + Feishu Channel signaling)
@@ -720,6 +728,7 @@ LEGACY_AUTHOR_MAP = {
     "mike@grossmann.at": "ReqX",
     "axmaiqiu@gmail.com": "qWaitCrypto",
     "44045911+kidonng@users.noreply.github.com": "kidonng",
+    "ayushere@users.noreply.github.com": "ayushere",
     "daniellsmarta@gmail.com": "DanielLSM",
     "264291321+v1b3coder@users.noreply.github.com": "v1b3coder",
     "silverchris@foxmail.com": "ming1523",
@@ -1345,6 +1354,7 @@ LEGACY_AUTHOR_MAP = {
     "iamagenius00@users.noreply.github.com": "iamagenius00",
     "9219265+cresslank@users.noreply.github.com": "cresslank",
     "trevmanthony@gmail.com": "trevthefoolish",
+    "at828@proton.me": "ATran28",  # PR #77270 whatsapp bridge reconnect wedge fix
     "ziliangpeng@users.noreply.github.com": "ziliangpeng",
     "ziliangdotme@gmail.com": "ziliangpeng",
     "centripetal-star@users.noreply.github.com": "centripetal-star",
@@ -2198,16 +2208,52 @@ def update_version_files(semver: str, calver_date: str):
     # Python package version. The desktop About panel reads the live Hermes
     # version at runtime, but app.getVersion()/packaging metadata still come
     # from this field, so it must track pyproject to avoid drift.
-    desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
-    if desktop_pkg.exists():
-        pkg_text = desktop_pkg.read_text(encoding="utf-8")
+    if DESKTOP_PACKAGE_FILE.exists():
+        pkg_text = DESKTOP_PACKAGE_FILE.read_text(encoding="utf-8")
         pkg_text = re.sub(
             r'("version"\s*:\s*)"[^"]+"',
             rf'\g<1>"{semver}"',
             pkg_text,
             count=1,
         )
-        desktop_pkg.write_text(pkg_text, encoding="utf-8")
+        DESKTOP_PACKAGE_FILE.write_text(pkg_text, encoding="utf-8")
+
+    if PACKAGE_LOCK_FILE.exists():
+        package_lock = json.loads(PACKAGE_LOCK_FILE.read_text(encoding="utf-8"))
+        desktop_entry = package_lock.get("packages", {}).get("apps/desktop")
+        if isinstance(desktop_entry, dict):
+            desktop_entry["version"] = semver
+            PACKAGE_LOCK_FILE.write_text(
+                json.dumps(package_lock, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+    if UV_LOCK_FILE.exists():
+        uv_lock = UV_LOCK_FILE.read_text(encoding="utf-8")
+        uv_lock, replacements = re.subn(
+            r'(?m)(^\[\[package\]\]\nname = "hermes-agent"\nversion = ")[^"]+("$)',
+            rf'\g<1>{semver}\g<2>',
+            uv_lock,
+            count=1,
+        )
+        if replacements != 1:
+            raise RuntimeError("uv.lock is missing the hermes-agent workspace package")
+        UV_LOCK_FILE.write_text(uv_lock, encoding="utf-8")
+
+
+def version_files_to_stage() -> list[str]:
+    """Return every existing file mutated by ``update_version_files``."""
+    return [
+        str(path)
+        for path in (
+            VERSION_FILE,
+            PYPROJECT_FILE,
+            DESKTOP_PACKAGE_FILE,
+            PACKAGE_LOCK_FILE,
+            UV_LOCK_FILE,
+        )
+        if path.exists()
+    ]
 
 
 def resolve_author(name: str, email: str) -> str:
@@ -2547,7 +2593,7 @@ def main():
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
             # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
+            add_files = version_files_to_stage()
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")

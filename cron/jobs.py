@@ -9,6 +9,7 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
 import shutil
@@ -17,6 +18,7 @@ import threading
 import time
 import os
 import re
+import sys
 import uuid
 
 # Cross-process advisory file locking for jobs.json critical sections.
@@ -189,12 +191,18 @@ def get_cron_output_dir() -> Path:
     return _current_cron_store().output_dir
 
 
+def get_cron_profile_home() -> Path:
+    """Return the canonical profile home owning the active cron store."""
+    return _current_cron_store().cron_dir.parent.expanduser().resolve(strict=False)
+
+
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
 # the cron inactivity timeout is disabled (HERMES_CRON_TIMEOUT=0 → unlimited),
 # in which case no finite run bound exists to derive from. Also acts as the
 # floor for the derived value so a very short configured timeout can't make the
 # claim expire mid-run.
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
+OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS = 300
 
 # The derived TTL is the cron inactivity timeout times this headroom multiplier.
 # A healthy run clears its claim via mark_job_run() long before the TTL; the
@@ -268,7 +276,7 @@ def _jobs_lock_file() -> Path:
 
 
 @contextlib.contextmanager
-def _jobs_lock():
+def _jobs_lock(*, require_cross_process: bool = False):
     """Serialize a load_jobs→modify→save_jobs critical section.
 
     Combines the in-process threading lock (cheap mutual exclusion between
@@ -289,6 +297,13 @@ def _jobs_lock():
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
+        if require_cross_process and not getattr(
+            _jobs_lock_state, "cross_process_acquired", False
+        ):
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(strict jobs lock unavailable)."
+            )
         _jobs_lock_state.depth = depth + 1
         try:
             yield
@@ -298,6 +313,7 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.cross_process_acquired = False
         lock_fd = None
         try:
             try:
@@ -323,9 +339,14 @@ def _jobs_lock():
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            _jobs_lock_state.cross_process_acquired = True
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
+                                if require_cross_process:
+                                    raise TimeoutError(
+                                        f"timed out waiting for strict cron jobs lock: {_jobs_lock_file()}"
+                                    )
                                 logger.error(
                                     "Timed out after %.0fs waiting for the cron "
                                     "jobs lock (%s) — another process is holding "
@@ -343,7 +364,15 @@ def _jobs_lock():
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    _jobs_lock_state.cross_process_acquired = True
+                elif require_cross_process:
+                    raise OSError("cross-process file locking is unavailable")
             except (OSError, IOError) as e:
+                if require_cross_process:
+                    raise CronJobGovernanceError(
+                        "Cron job persistence needs administrator review "
+                        "(strict jobs lock unavailable)."
+                    ) from e
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
@@ -363,12 +392,2380 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.cross_process_acquired = False
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
 # updated lets an unsafe value (``../escape``, absolute path, nested) leak
 # into output writes/deletes.
-_IMMUTABLE_JOB_FIELDS = frozenset({"id"})
+_CRON_GOVERNANCE_HOOK_OWNED_FIELDS = frozenset({
+    "operation",
+    "process_charter_ref",
+    "approval_evidence_ref",
+    "read_scope_ref",
+    "disclosure_policy_ref",
+    "risk_tier",
+    "implementation_path_evidence_ref",
+    "actionable_output",
+    "source_route",
+    "join_keys",
+    "creation_governance_receipt",
+})
+_IMMUTABLE_JOB_FIELDS = frozenset({
+    "id",
+    "skill_bindings",
+    *_CRON_GOVERNANCE_HOOK_OWNED_FIELDS,
+    "last_runtime_admission_receipt",
+    "last_delivery_receipt",
+    "last_run_outcome_receipt",
+    "active_run_outcome_claim",
+})
+_CRON_GOVERNANCE_ENV = "HERMES_CRON_CREATION_GOVERNANCE_REQUIRED"
+_CRON_GOVERNANCE_PLUGIN = "hck-tool-boundary"
+_CRON_RESUME_SCHEMA = "cron-persist-resume/v1"
+_CRON_RESUME_SCHEMA_V2 = "cron-persist-resume/v2"
+_CRON_RECOVERY_SCHEMA = "cron-persist-recovery/v1"
+_CRON_RECOVERY_REGISTRATION_SCHEMA = "cron-persist-recovery-registration/v1"
+_CRON_RECOVERY_DISPATCH_ACK_SCHEMA = "cron-persist-recovery-dispatch-ack/v2"
+_CRON_RECOVERY_DURABLE_CAS_SCHEMA = "cron-persist-recovery-durable-cas/v1"
+_CRON_RESUME_RECEIPT_FIELD = "cron_persist_resume_receipt"
+_CRON_RESUME_PACKAGE_FIELDS = frozenset({
+    "schema_version",
+    "operation",
+    "job_id",
+    "candidate_hash",
+    "persist_spec_hash",
+    "authorized_behavior_ref",
+    "scope_immutable",
+    "receipt",
+    "job",
+    "instruction",
+})
+_CRON_RESUME_RECEIPT_CORE_FIELDS = (
+    "schema_version",
+    "profile_id",
+    "frame_id",
+    "action_id",
+    "pending_id",
+    "operation",
+    "candidate_hash",
+    "persist_spec_hash",
+    "cron_job_id",
+    "behavior_id",
+    "process_id",
+    "approval_id",
+    "admin_actor_uid",
+    "prior_job_hash",
+    "issued_at",
+    "expires_at",
+)
+_CRON_RESUME_RECEIPT_V2_CORE_FIELDS = (
+    *_CRON_RESUME_RECEIPT_CORE_FIELDS,
+    "request_id",
+    "request_hash",
+    "source_route_hash",
+    "profile_home_sha256",
+)
+_CRON_RUNTIME_ADMISSION_RECEIPT_SCHEMA = "cron-runtime-admission/v1"
+_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD = "last_runtime_admission_receipt"
+_CRON_DELIVERY_RECEIPT_SCHEMA = "cron-delivery/v1"
+_CRON_DELIVERY_RECEIPT_FIELD = "last_delivery_receipt"
+_CRON_RUN_OUTCOME_RECEIPT_SCHEMA = "cron-run-outcome/v1"
+_CRON_RUN_OUTCOME_RECEIPT_FIELD = "last_run_outcome_receipt"
+_CRON_RUN_OUTCOME_CLAIM_SCHEMA = "cron-run-claim/v1"
+_CRON_RUN_OUTCOME_CLAIM_FIELD = "active_run_outcome_claim"
+_CRON_RUN_OUTCOME_CLAIM_MAX_TTL_SECONDS = 24 * 60 * 60
+_CRON_RUN_IMPLEMENTATION_SCHEMA = "cron-run-implementation/v1"
+_CRON_SUPPORT_ARTIFACT_SCHEMA = "cron-support-artifacts/v1"
+_CRON_SCRIPT_EXECUTION_SNAPSHOT_SCHEMA = "cron-script-execution-snapshot/v1"
+_CRON_CHECKPOINT_INVARIANT_SCHEMA = "cron-checkpoint-invariant/v1"
+_CRON_DELIVERY_BINDING_SCHEMA = "cron-run-delivery-binding/v1"
+_CRON_RUN_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
+_CRON_INTERPRETER_ARTIFACT_MAX_BYTES = 256 * 1024 * 1024
+_CRON_ARTIFACT_HASH_CHUNK_BYTES = 1024 * 1024
+_CRON_SUPPORT_ARTIFACT_MAX_FILES = 512
+_CRON_SUPPORT_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
+_CRON_SUPPORT_IGNORED_DIRS = frozenset(
+    {".git", ".venv", "venv", "node_modules", "__pycache__"}
+)
+_CRON_TRUSTED_BASH_PATHS = (
+    "/bin/bash",
+    "/usr/bin/bash",
+    "C:/Program Files/Git/bin/bash.exe",
+    "C:/Program Files/Git/usr/bin/bash.exe",
+)
+_CRON_CLAIM_UNSET = object()
+_CRON_RUN_IMPLEMENTATION_FIELDS = (
+    "prompt",
+    "skills",
+    "skill",
+    "model",
+    "provider",
+    "base_url",
+    "script",
+    "no_agent",
+    "context_from",
+    "enabled_toolsets",
+    "workdir",
+    "max_turns",
+    "run_timeout_seconds",
+)
+_CRON_CHECKPOINT_CONTRACT_FIELDS = (
+    "checkpoint_policy",
+    "checkpoint_invariant",
+)
+_CRON_GOVERNANCE_PATCH_FIELDS = frozenset({
+    "operation",
+    "authorized_behavior_ref",
+    "process_charter_ref",
+    "approval_evidence_ref",
+    "read_scope_ref",
+    "disclosure_policy_ref",
+    "risk_tier",
+    "implementation_categories",
+    "implementation_path_evidence_ref",
+    "actionable_output",
+    "source_route",
+    "join_keys",
+    "creation_governance_receipt",
+    "enabled",
+    "state",
+    "paused_reason",
+})
+_CRON_GOVERNANCE_RUNTIME_FIELDS = frozenset({
+    "created_at",
+    "enabled",
+    "fire_claim",
+    "last_delivery_error",
+    "last_delivery_recovered_at",
+    "last_error",
+    "last_output",
+    "last_run_at",
+    "last_run_id",
+    "last_status",
+    "next_run_at",
+    "operational_notice_receipts",
+    "paused_at",
+    "paused_reason",
+    "run_claim",
+    "state",
+    _CRON_RUNTIME_ADMISSION_RECEIPT_FIELD,
+    _CRON_DELIVERY_RECEIPT_FIELD,
+    _CRON_RUN_OUTCOME_RECEIPT_FIELD,
+    _CRON_RUN_OUTCOME_CLAIM_FIELD,
+})
+_CRON_GOVERNANCE_SELF_REFERENTIAL_FIELDS = frozenset({
+    "candidate_hash",
+    "creation_governance_receipt",
+    _CRON_RESUME_RECEIPT_FIELD,
+    "join_keys",
+})
+_CRON_GOVERNANCE_CALLER_BINDING_FIELDS = frozenset({
+    "authorized_behavior_ref",
+    "implementation_categories",
+})
+
+
+def _cron_governance_material(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Return definition material while excluding operational state."""
+    material = {
+        key: copy.deepcopy(value)
+        for key, value in job.items()
+        if key not in _CRON_GOVERNANCE_RUNTIME_FIELDS
+        and key not in _CRON_GOVERNANCE_SELF_REFERENTIAL_FIELDS
+    }
+    repeat = material.get("repeat")
+    if isinstance(repeat, dict):
+        material["repeat"] = {
+            key: copy.deepcopy(value)
+            for key, value in repeat.items()
+            if key != "completed"
+        }
+    return material
+
+
+def _cron_governance_material_changed(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+) -> bool:
+    return _cron_governance_material(before) != _cron_governance_material(after)
+
+
+def _cron_candidate_requires_governance(candidate: Dict[str, Any]) -> bool:
+    """Return whether a candidate claims or retains governance authority."""
+    if _CRON_RESUME_RECEIPT_FIELD in candidate:
+        return True
+    if isinstance(candidate.get("creation_governance_receipt"), dict):
+        return True
+    return any(
+        candidate.get(field) not in (None, "", [])
+        for field in _CRON_GOVERNANCE_CALLER_BINDING_FIELDS
+    )
+
+
+def _cron_stable_hash(value: Any) -> str:
+    body = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
+
+
+def _cron_persist_spec_hash(operation: str, candidate: Dict[str, Any]) -> str:
+    normalized = {
+        key: copy.deepcopy(value)
+        for key, value in candidate.items()
+        if key != _CRON_RESUME_RECEIPT_FIELD
+    }
+    return _cron_stable_hash({"operation": operation, "job": normalized})
+
+
+def _cron_request_material(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Return normalized user intent, excluding mutable and derived state."""
+    fields = (
+        "id",
+        "name",
+        "prompt",
+        "skills",
+        "skill",
+        "model",
+        "provider",
+        "base_url",
+        "script",
+        "no_agent",
+        "context_from",
+        "schedule",
+        "repeat",
+        "deliver",
+        "origin",
+        "enabled_toolsets",
+        "workdir",
+        "attach_to_session",
+        "authorized_behavior_ref",
+        "implementation_categories",
+        "source_route",
+    )
+    material = {
+        field: copy.deepcopy(candidate.get(field))
+        for field in fields
+        if field in candidate
+    }
+    repeat = material.get("repeat")
+    if isinstance(repeat, dict):
+        material["repeat"] = {
+            key: copy.deepcopy(value)
+            for key, value in repeat.items()
+            if key != "completed"
+        }
+    return material
+
+
+def _cron_request_hash(candidate: Dict[str, Any]) -> str:
+    return _cron_stable_hash(_cron_request_material(candidate))
+
+
+def _cron_source_route_hash(candidate: Dict[str, Any]) -> str:
+    return _cron_stable_hash({
+        "source_route": copy.deepcopy(candidate.get("source_route")),
+        "origin": copy.deepcopy(candidate.get("origin")),
+        "deliver": copy.deepcopy(candidate.get("deliver")),
+    })
+
+
+def _cron_candidate_definition_hash(candidate: Dict[str, Any]) -> str:
+    return _cron_stable_hash(_cron_governance_material(candidate))
+
+
+def cron_persist_recovery_dispatch_key(
+    recovery_id: str,
+    issuer: Dict[str, Any],
+    notification_effect: Dict[str, Any],
+) -> str:
+    """Bind one stable HAK/outbox idempotency key to recovery issuer and effect."""
+    if (
+        not str(recovery_id or "").strip()
+        or not isinstance(issuer, dict)
+        or set(issuer) != {"id", "version"}
+        or not str(issuer.get("id") or "").strip()
+        or not str(issuer.get("version") or "").strip()
+        or not isinstance(notification_effect, dict)
+    ):
+        raise ValueError("invalid Cron recovery dispatch key material")
+    return _cron_stable_hash({
+        "schema_version": _CRON_RECOVERY_REGISTRATION_SCHEMA,
+        "recovery_id": recovery_id,
+        "issuer": copy.deepcopy(issuer),
+        "effect_hash": _cron_stable_hash(notification_effect),
+    })
+
+
+def _active_cron_profile_identity() -> Dict[str, str]:
+    """Derive profile name and canonical-home digest from the Cron store path."""
+    home = _active_profile_home()
+    try:
+        resolved = home.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(active profile is unavailable)."
+        ) from exc
+    if not resolved.is_dir():
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(active profile is unavailable)."
+        )
+    profile_id = resolved.name if resolved.parent.name == "profiles" else "default"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile_id):
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(active profile identity is invalid)."
+        )
+    asserted = str(os.environ.get("HERMES_PROFILE_ID") or "").strip()
+    if asserted and asserted != profile_id:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(active profile identity mismatch)."
+        )
+    return {
+        "profile_id": profile_id,
+        "profile_home_sha256": _cron_stable_hash(str(resolved)),
+    }
+
+
+def _active_cron_profile_id() -> str:
+    return _active_cron_profile_identity()["profile_id"]
+
+
+class CronCreationProfileBindingError(ValueError):
+    """A signed Job cannot enter Group C without canonical-home authority."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.migration_action = "refresh_creation_governance_receipt"
+
+
+def cron_creation_profile_identity(job: Dict[str, Any]) -> Dict[str, str]:
+    """Read Profile authority from the persisted creation receipt and verify it."""
+    receipt = job.get("creation_governance_receipt")
+    job_id = str(job.get("id") or "")
+    if not isinstance(receipt, dict):
+        raise CronCreationProfileBindingError(
+            "creation_receipt_missing",
+            "cron creation governance receipt is required",
+        )
+    profile_id = str(receipt.get("profile_id") or "").strip()
+    if (
+        receipt.get("schema_version") != "cron-creation-governance/v1"
+        or receipt.get("cron_job_id") != job_id
+        or not _safe_run_outcome_identity(profile_id)
+        or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", str(receipt.get("receipt_id") or "")
+        )
+    ):
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_binding_invalid",
+            "invalid cron creation governance profile binding",
+        )
+    active = _active_cron_profile_identity()
+    if profile_id != active["profile_id"]:
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_mismatch",
+            "cron creation governance profile does not match active Profile",
+        )
+    asserted_home = str(receipt.get("profile_home_sha256") or "").strip()
+    if not asserted_home:
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_home_migration_required",
+            "legacy creation governance receipt must be refreshed with profile_home_sha256",
+        )
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", asserted_home):
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_home_invalid",
+            "creation governance receipt has an invalid profile_home_sha256",
+        )
+    if asserted_home != active["profile_home_sha256"]:
+        raise CronCreationProfileBindingError(
+            "creation_receipt_profile_home_mismatch",
+            "cron creation governance Profile home does not match active Profile",
+        )
+    return active
+
+
+def cron_persist_resume_identity(
+    operation: str,
+    candidate: Dict[str, Any],
+) -> Dict[str, str]:
+    """Return the Core-owned v2 request and route identities for a candidate."""
+    op = str(operation or "").strip().lower()
+    if op not in {"create", "update"} or not isinstance(candidate, dict):
+        raise ValueError("Cron persist resume identity requires create/update candidate")
+    profile_identity = _active_cron_profile_identity()
+    profile_id = profile_identity["profile_id"]
+    profile_home_sha256 = profile_identity["profile_home_sha256"]
+    request_hash = _cron_request_hash(candidate)
+    source_route_hash = _cron_source_route_hash(candidate)
+    request_id = _cron_stable_hash({
+        "profile_id": profile_id,
+        "profile_home_sha256": profile_home_sha256,
+        "operation": op,
+        "job_id": str(candidate.get("id") or "").strip(),
+        "request_hash": request_hash,
+    })
+    return {
+        "profile_id": profile_id,
+        "profile_home_sha256": profile_home_sha256,
+        "request_id": request_id,
+        "request_hash": request_hash,
+        "source_route_hash": source_route_hash,
+    }
+
+
+@dataclass(frozen=True)
+class CronResumeResolution:
+    """Typed classification of one structurally valid Cron resume package."""
+
+    disposition: str
+    candidate: Dict[str, Any]
+    reason: str = ""
+    recovery_context: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class _ParsedCronResume:
+    schema_version: str
+    operation: str
+    job: Dict[str, Any]
+    receipt: Dict[str, Any]
+
+
+class CronJobGovernanceError(PermissionError):
+    """Raised when a cron persistence candidate is not authorized."""
+
+    def __init__(self, message: str, *, decision: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.decision = copy.deepcopy(decision or {})
+
+    def payload(self) -> Dict[str, Any]:
+        pending = self.decision.get("pending_action")
+        payload = {
+            "schema_version": "cron-admin-pending-action/v1",
+            "action": "blocked",
+            "reason": str(self.decision.get("reason") or "review_required"),
+            "state": str(self.decision.get("state") or "review_required"),
+            "pending_action": (
+                copy.deepcopy(pending) if isinstance(pending, dict) else {}
+            ),
+        }
+        failures = self.decision.get("callback_failures")
+        if isinstance(failures, list):
+            payload["callback_failures"] = [
+                copy.deepcopy(item) for item in failures if isinstance(item, dict)
+            ]
+        recovery = self.decision.get("recovery")
+        if isinstance(recovery, dict):
+            payload["recovery"] = copy.deepcopy(recovery)
+        return payload
+
+def _safe_runtime_admission_code(value: Any, fallback: str) -> str:
+    """Keep persisted admission metadata machine-readable and non-sensitive."""
+    code = str(value or "").strip().lower()
+    if re.fullmatch(r"[a-z][a-z0-9_.:-]{0,95}", code):
+        return code
+    return fallback
+
+
+def _runtime_admission_job_fingerprint(job: Dict[str, Any]) -> str:
+    """Return a stable job link without persisting prompt, route, or credentials."""
+    creation_receipt = job.get("creation_governance_receipt")
+    join_keys = job.get("join_keys")
+    schedule = job.get("schedule")
+    material = {
+        "job_id": str(job.get("id") or ""),
+        "authorized_behavior_ref": str(job.get("authorized_behavior_ref") or ""),
+        "process_charter_ref": str(job.get("process_charter_ref") or ""),
+        "candidate_hash": (
+            str(creation_receipt.get("candidate_hash") or "")
+            if isinstance(creation_receipt, dict)
+            else str(join_keys.get("candidate_hash") or "")
+            if isinstance(join_keys, dict)
+            else ""
+        ),
+        "risk_tier": str(job.get("risk_tier") or ""),
+        "schedule_kind": str(schedule.get("kind") or "") if isinstance(schedule, dict) else "",
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _runtime_admission_receipt(
+    job: Dict[str, Any],
+    *,
+    reason_code: Any,
+    state: Any,
+    exception_class: str,
+    retryable: bool,
+) -> Dict[str, Any]:
+    """Build the small durable record shared by scheduler status and delivery."""
+    return {
+        "schema_version": _CRON_RUNTIME_ADMISSION_RECEIPT_SCHEMA,
+        "receipt_id": f"cron-runtime-admission:{uuid.uuid4().hex}",
+        "stage": "pre_cron_job_run",
+        "status": "blocked",
+        "reason_code": _safe_runtime_admission_code(reason_code, "runtime_binding_required"),
+        "state": _safe_runtime_admission_code(state, "review_required"),
+        "exception_class": _safe_runtime_admission_code(
+            exception_class, "runtime_admission_error"
+        ),
+        "retryable": bool(retryable),
+        "job_fingerprint": _runtime_admission_job_fingerprint(job),
+    }
+
+
+def _validated_runtime_admission_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
+    """Reject forged or free-form data before it can enter durable job state."""
+    expected_keys = {
+        "schema_version", "receipt_id", "stage", "status", "reason_code", "state",
+        "exception_class", "retryable", "job_fingerprint",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_keys:
+        raise ValueError("invalid runtime admission receipt")
+    if (
+        receipt.get("schema_version") != _CRON_RUNTIME_ADMISSION_RECEIPT_SCHEMA
+        or receipt.get("stage") != "pre_cron_job_run"
+        or receipt.get("status") != "blocked"
+        or not isinstance(receipt.get("retryable"), bool)
+        or not re.fullmatch(r"cron-runtime-admission:[0-9a-f]{32}", str(receipt.get("receipt_id") or ""))
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get("job_fingerprint") or ""))
+    ):
+        raise ValueError("invalid runtime admission receipt")
+    for field, fallback in {
+        "reason_code": "runtime_binding_required",
+        "state": "review_required",
+        "exception_class": "runtime_admission_error",
+    }.items():
+        value = str(receipt.get(field) or "")
+        if _safe_runtime_admission_code(value, fallback) != value:
+            raise ValueError("invalid runtime admission receipt")
+    return copy.deepcopy(receipt)
+
+
+def _validated_delivery_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
+    """Accept only the aggregate delivery fact safe for ``jobs.json``.
+
+    Transport-level receipts may contain message identifiers or provider
+    metadata. Cron persistence deliberately retains only cardinalities, so the
+    scheduler and Kit health surfaces can prove terminal delivery without
+    turning the job store into an outbound-message archive.
+    """
+    expected_keys = {
+        "schema_version",
+        "status",
+        "required_count",
+        "confirmed_count",
+        "failed_count",
+        "unconfirmed_count",
+        "receipts_truncated",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_keys:
+        raise ValueError("invalid cron delivery receipt")
+    if receipt.get("schema_version") != _CRON_DELIVERY_RECEIPT_SCHEMA:
+        raise ValueError("invalid cron delivery receipt")
+    if receipt.get("status") not in {"not_attempted", "success", "partial", "failed"}:
+        raise ValueError("invalid cron delivery receipt")
+    if not isinstance(receipt.get("receipts_truncated"), bool):
+        raise ValueError("invalid cron delivery receipt")
+    counts = {
+        field: receipt.get(field)
+        for field in ("required_count", "confirmed_count", "failed_count", "unconfirmed_count")
+    }
+    if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in counts.values()):
+        raise ValueError("invalid cron delivery receipt")
+    if counts["confirmed_count"] + counts["failed_count"] + counts["unconfirmed_count"] != counts["required_count"]:
+        raise ValueError("invalid cron delivery receipt")
+    if counts["required_count"] == 0:
+        expected_status = "not_attempted"
+    elif counts["confirmed_count"] == counts["required_count"]:
+        expected_status = "success"
+    elif counts["confirmed_count"]:
+        expected_status = "partial"
+    else:
+        expected_status = "failed"
+    if receipt.get("status") != expected_status:
+        raise ValueError("invalid cron delivery receipt")
+    return copy.deepcopy(receipt)
+
+
+def _safe_run_outcome_identity(value: Any) -> bool:
+    """Accept opaque profile/Job ids without allowing control data."""
+    if not isinstance(value, str) or value != value.strip():
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return bool(encoded) and len(encoded) <= 256 and not any(
+        ord(char) < 32 or 127 <= ord(char) <= 159 for char in value
+    )
+
+
+def _cron_run_hash(material: Any) -> str:
+    encoded = json.dumps(
+        material,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _cron_run_artifact(path: Path) -> tuple[Optional[str], Optional[bytes]]:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        if not resolved.is_file() or resolved.stat().st_size > _CRON_RUN_ARTIFACT_MAX_BYTES:
+            return None, None
+        content = resolved.read_bytes()
+        if len(content) > _CRON_RUN_ARTIFACT_MAX_BYTES:
+            return None, None
+        return "sha256:" + hashlib.sha256(content).hexdigest(), content
+    except (OSError, RuntimeError):
+        return None, None
+
+
+def _cron_run_artifact_hash(path: Path) -> Optional[str]:
+    return _cron_run_artifact(path)[0]
+
+
+def _cron_interpreter_artifact(
+    path: Path,
+) -> tuple[Optional[str], Optional[bytes], Optional[Path]]:
+    """Capture one bounded interpreter binary for exact snapshot execution."""
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+        if not resolved.is_file():
+            return None, None, None
+        digest = hashlib.sha256()
+        total = 0
+        chunks: list[bytes] = []
+        with resolved.open("rb") as handle:
+            while chunk := handle.read(_CRON_ARTIFACT_HASH_CHUNK_BYTES):
+                total += len(chunk)
+                if total > _CRON_INTERPRETER_ARTIFACT_MAX_BYTES:
+                    return None, None, None
+                digest.update(chunk)
+                chunks.append(chunk)
+        return "sha256:" + digest.hexdigest(), b"".join(chunks), resolved
+    except (OSError, RuntimeError):
+        return None, None, None
+
+
+def _cron_interpreter_artifact_hash(path: Path) -> Optional[str]:
+    return _cron_interpreter_artifact(path)[0]
+
+
+def _cron_profile_home() -> Path:
+    return _current_cron_store().cron_dir.parent
+
+
+def _cron_script_interpreter(path: Path) -> Optional[Path]:
+    if path.suffix.lower() in {".sh", ".bash"}:
+        for raw_candidate in _CRON_TRUSTED_BASH_PATHS:
+            candidate = Path(raw_candidate)
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+    if sys.platform == "win32":
+        return None
+    return Path(sys.executable)
+
+
+def _cron_script_artifact(
+    job: Dict[str, Any],
+    profile_home: Path,
+) -> tuple[Optional[str], Optional[str], Optional[bytes]]:
+    script = job.get("script")
+    if not isinstance(script, str) or not script.strip():
+        return (
+            _cron_run_hash({"state": "absent"}),
+            _cron_run_hash({"state": "not_applicable"}),
+            None,
+        )
+    scripts_root = (profile_home / "scripts").resolve(strict=False)
+    raw = Path(script).expanduser()
+    path = raw.resolve(strict=False) if raw.is_absolute() else (scripts_root / raw).resolve(strict=False)
+    try:
+        path.relative_to(scripts_root)
+    except ValueError:
+        return None, None, None
+    artifact_hash, snapshot = _cron_run_artifact(path)
+    interpreter = _cron_script_interpreter(path)
+    interpreter_hash = (
+        _cron_interpreter_artifact_hash(interpreter)
+        if interpreter is not None
+        else None
+    )
+    if artifact_hash is None or snapshot is None or interpreter_hash is None:
+        return None, None, None
+    return _cron_run_hash(
+        {
+            "state": "loaded",
+            "execution_mode": "stdin-snapshot/v1",
+            "interpreter": "bash" if path.suffix.lower() in {".sh", ".bash"} else "python",
+            "content_hash": artifact_hash,
+        }
+    ), interpreter_hash, snapshot
+
+
+def _cron_script_artifact_hash(job: Dict[str, Any], profile_home: Path) -> Optional[str]:
+    return _cron_script_artifact(job, profile_home)[0]
+
+
+def _cron_support_artifact(
+    job: Dict[str, Any], profile_home: Path
+) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    """Capture the bounded local tree that a script can import or execute."""
+    script = job.get("script")
+    if not isinstance(script, str) or not script.strip():
+        return _cron_run_hash({"state": "not_applicable"}), []
+    scripts_root = (profile_home / "scripts").resolve(strict=False)
+    raw = Path(script).expanduser()
+    script_path = (
+        raw.resolve(strict=False)
+        if raw.is_absolute()
+        else (scripts_root / raw).resolve(strict=False)
+    )
+    try:
+        script_path.relative_to(scripts_root)
+    except ValueError:
+        return None, None
+
+    roots: list[tuple[str, Path]] = [("script_root", script_path.parent)]
+    workdir = str(job.get("workdir") or "").strip()
+    if workdir:
+        workdir_input = Path(workdir).expanduser()
+        workdir_path = workdir_input.resolve(strict=False)
+        if workdir_input.is_symlink() or workdir_path != script_path.parent:
+            return None, None
+
+    records: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
+    total_bytes = 0
+    try:
+        for root_kind, raw_root in roots:
+            root = raw_root.resolve(strict=True)
+            for candidate in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+                relative = candidate.relative_to(root)
+                if set(relative.parts) & _CRON_SUPPORT_IGNORED_DIRS:
+                    continue
+                if candidate.is_dir():
+                    continue
+                if candidate.is_symlink() or not candidate.is_file():
+                    return None, None
+                content_hash, content = _cron_run_artifact(candidate)
+                if content_hash is None or content is None:
+                    return None, None
+                mode = candidate.stat().st_mode & 0o777
+                total_bytes += len(content)
+                if (
+                    len(records) >= _CRON_SUPPORT_ARTIFACT_MAX_FILES
+                    or total_bytes > _CRON_SUPPORT_ARTIFACT_MAX_BYTES
+                ):
+                    return None, None
+                records.append(
+                    {
+                        "root": root_kind,
+                        "path": relative.as_posix(),
+                        "content_hash": content_hash,
+                        "mode": mode,
+                    }
+                )
+                snapshots.append(
+                    {
+                        "root": root_kind,
+                        "path": relative.as_posix(),
+                        "content": content,
+                        "mode": mode,
+                    }
+                )
+    except (OSError, RuntimeError, ValueError):
+        return None, None
+    return (
+        _cron_run_hash(
+            {"schema_version": _CRON_SUPPORT_ARTIFACT_SCHEMA, "files": records}
+        ),
+        snapshots,
+    )
+
+
+def _cron_support_artifact_hash(
+    job: Dict[str, Any], profile_home: Path
+) -> Optional[str]:
+    return _cron_support_artifact(job, profile_home)[0]
+
+
+def _cron_run_script_snapshot(
+    job: Dict[str, Any],
+    claim: Dict[str, Any],
+    *,
+    profile_home: Optional[Path] = None,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Capture the bounded Profile-controlled files after validating the claim."""
+    home = (profile_home or _cron_profile_home()).expanduser().resolve(strict=False)
+    artifact_hash, interpreter_hash, snapshot = _cron_script_artifact(job, home)
+    support_hash, support_snapshot = _cron_support_artifact(job, home)
+    if snapshot is None:
+        return (
+            artifact_hash == claim.get("script_artifact_hash")
+            and interpreter_hash == claim.get("interpreter_artifact_hash")
+            and support_hash == claim.get("support_artifact_hash")
+        ), None
+    scripts_root = (home / "scripts").resolve(strict=False)
+    raw = Path(str(job.get("script") or "")).expanduser()
+    script_path = (
+        raw.resolve(strict=False)
+        if raw.is_absolute()
+        else (scripts_root / raw).resolve(strict=False)
+    )
+    interpreter = _cron_script_interpreter(script_path)
+    if interpreter is None:
+        return False, None
+    captured_interpreter_hash, interpreter_snapshot, interpreter_path = (
+        _cron_interpreter_artifact(interpreter)
+    )
+    matches = (
+        artifact_hash == claim.get("script_artifact_hash")
+        and interpreter_hash == claim.get("interpreter_artifact_hash")
+        and captured_interpreter_hash == interpreter_hash
+        and support_hash == claim.get("support_artifact_hash")
+        and interpreter_snapshot is not None
+        and interpreter_path is not None
+        and support_snapshot is not None
+    )
+    if not matches:
+        return False, None
+    return True, {
+        "schema_version": _CRON_SCRIPT_EXECUTION_SNAPSHOT_SCHEMA,
+        "script_name": script_path.name,
+        "script_suffix": script_path.suffix.lower(),
+        "script_bytes": snapshot,
+        "interpreter_path": str(interpreter_path),
+        "interpreter_bytes": interpreter_snapshot,
+        "support_files": support_snapshot,
+    }
+
+
+def _cron_run_outcome_claim(
+    job: Dict[str, Any],
+    *,
+    run_id: Optional[str] = None,
+    profile_home: Optional[Path] = None,
+    claim_started_at_epoch: Optional[int] = None,
+    claim_heartbeat_at_epoch: Optional[int] = None,
+    claim_expires_at_epoch: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Freeze the actual executable and checkpoint contract before a run."""
+    creation = job.get("creation_governance_receipt")
+    if not isinstance(creation, dict):
+        return None
+    try:
+        profile_id = cron_creation_profile_identity(job)["profile_id"]
+    except (CronJobGovernanceError, ValueError):
+        return None
+    job_id = job.get("id")
+    revision = creation.get("receipt_id")
+    if (
+        creation.get("schema_version") != "cron-creation-governance/v1"
+        or creation.get("cron_job_id") != job_id
+        or not _safe_run_outcome_identity(profile_id)
+        or not _safe_run_outcome_identity(job_id)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", str(revision or ""))
+    ):
+        return None
+    home = (profile_home or _cron_profile_home()).expanduser().resolve(strict=False)
+    script_hash, interpreter_hash, _snapshot = _cron_script_artifact(job, home)
+    support_hash = _cron_support_artifact_hash(job, home)
+    if script_hash is None or interpreter_hash is None or support_hash is None or any(
+        job.get(field) not in (None, "")
+        for field in ("verification_command", "verification_command_mode")
+    ):
+        # An arbitrary subprocess cannot be proven read-only without an OS
+        # sandbox. A future fixed verifier must use a new versioned contract.
+        return None
+    implementation_hash = _cron_run_hash(
+        {
+            "schema_version": _CRON_RUN_IMPLEMENTATION_SCHEMA,
+            "mode": "no_agent" if job.get("no_agent") is True else "agent",
+            "execution": {
+                field: copy.deepcopy(job.get(field))
+                for field in _CRON_RUN_IMPLEMENTATION_FIELDS
+            },
+            "script_artifact_hash": script_hash,
+            "interpreter_artifact_hash": interpreter_hash,
+            "support_artifact_hash": support_hash,
+        }
+    )
+    checkpoint_contract = {
+        field: copy.deepcopy(job.get(field))
+        for field in _CRON_CHECKPOINT_CONTRACT_FIELDS
+        if field in job
+    }
+    checkpoint_policy_hash = _cron_run_hash(
+        {
+            "schema_version": "cron-checkpoint-policy/v1",
+            "job_revision": revision,
+            "checkpoint_contract": checkpoint_contract or {"mode": "not_declared"},
+        }
+    )
+    if (
+        claim_started_at_epoch is None
+        and claim_heartbeat_at_epoch is None
+        and claim_expires_at_epoch is None
+    ):
+        claim_started_at_epoch = int(time.time())
+        claim_heartbeat_at_epoch = claim_started_at_epoch
+        claim_expires_at_epoch = claim_heartbeat_at_epoch + min(
+            int(_oneshot_run_claim_ttl_seconds()),
+            _CRON_RUN_OUTCOME_CLAIM_MAX_TTL_SECONDS,
+        )
+    claim: Dict[str, Any] = {
+        "schema_version": _CRON_RUN_OUTCOME_CLAIM_SCHEMA,
+        "profile_id": profile_id,
+        "job_id": job_id,
+        "job_revision": revision,
+        "run_id": run_id or f"cron-run:{uuid.uuid4().hex}",
+        "claim_started_at_epoch": claim_started_at_epoch,
+        "claim_heartbeat_at_epoch": claim_heartbeat_at_epoch,
+        "claim_expires_at_epoch": claim_expires_at_epoch,
+        "script_artifact_hash": script_hash,
+        "interpreter_artifact_hash": interpreter_hash,
+        "support_artifact_hash": support_hash,
+        "implementation_hash": implementation_hash,
+        "checkpoint_policy_hash": checkpoint_policy_hash,
+    }
+    return _validated_run_outcome_claim(claim)
+
+
+def _validated_run_outcome_claim(claim: Dict[str, Any]) -> Dict[str, Any]:
+    required = {
+        "schema_version",
+        "profile_id",
+        "job_id",
+        "job_revision",
+        "run_id",
+        "claim_started_at_epoch",
+        "claim_heartbeat_at_epoch",
+        "claim_expires_at_epoch",
+        "script_artifact_hash",
+        "interpreter_artifact_hash",
+        "support_artifact_hash",
+        "implementation_hash",
+        "checkpoint_policy_hash",
+    }
+    if not isinstance(claim, dict) or set(claim) != required:
+        raise ValueError("invalid cron run outcome claim")
+    started_at = claim.get("claim_started_at_epoch")
+    heartbeat_at = claim.get("claim_heartbeat_at_epoch")
+    expires_at = claim.get("claim_expires_at_epoch")
+    if (
+        claim.get("schema_version") != _CRON_RUN_OUTCOME_CLAIM_SCHEMA
+        or not _safe_run_outcome_identity(claim.get("profile_id"))
+        or not _safe_run_outcome_identity(claim.get("job_id"))
+        or not re.fullmatch(r"cron-run:[0-9a-f]{32}", str(claim.get("run_id") or ""))
+        or not all(
+            re.fullmatch(r"sha256:[0-9a-f]{64}", str(claim.get(field) or ""))
+            for field in (
+                "job_revision",
+                "script_artifact_hash",
+                "interpreter_artifact_hash",
+                "support_artifact_hash",
+                "implementation_hash",
+                "checkpoint_policy_hash",
+            )
+        )
+        or isinstance(started_at, bool)
+        or not isinstance(started_at, int)
+        or isinstance(heartbeat_at, bool)
+        or not isinstance(heartbeat_at, int)
+        or isinstance(expires_at, bool)
+        or not isinstance(expires_at, int)
+        or started_at <= 0
+        or heartbeat_at < started_at
+        or not (
+            ONESHOT_RUN_CLAIM_TTL_SECONDS
+            <= expires_at - heartbeat_at
+            <= _CRON_RUN_OUTCOME_CLAIM_MAX_TTL_SECONDS
+        )
+    ):
+        raise ValueError("invalid cron run outcome claim")
+    return copy.deepcopy(claim)
+
+
+def _run_outcome_claim_is_active(
+    claim: Dict[str, Any],
+    *,
+    now_epoch: Optional[int] = None,
+) -> bool:
+    """Return whether a validated claim still owns its bounded run window."""
+    validated = _validated_run_outcome_claim(claim)
+    now = int(time.time()) if now_epoch is None else now_epoch
+    return (
+        validated["claim_heartbeat_at_epoch"]
+        <= now
+        < validated["claim_expires_at_epoch"]
+    )
+
+
+def heartbeat_job_run_outcome(
+    job_id: str,
+    claim: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Refresh the exact active claim without changing its run identity."""
+    claim = _validated_run_outcome_claim(claim)
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) != claim:
+                return None
+            if not _run_outcome_claim_is_active(claim):
+                return None
+            heartbeat_at = max(
+                int(time.time()),
+                claim["claim_heartbeat_at_epoch"],
+            )
+            refreshed = {
+                **claim,
+                "claim_heartbeat_at_epoch": heartbeat_at,
+                "claim_expires_at_epoch": heartbeat_at
+                + min(
+                    int(_oneshot_run_claim_ttl_seconds()),
+                    _CRON_RUN_OUTCOME_CLAIM_MAX_TTL_SECONDS,
+                ),
+            }
+            refreshed = _validated_run_outcome_claim(refreshed)
+            job[_CRON_RUN_OUTCOME_CLAIM_FIELD] = copy.deepcopy(refreshed)
+            _save_jobs_unlocked(jobs)
+            return refreshed
+    return None
+
+
+def _validated_run_outcome_receipt(receipt: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the redacted, revision-bound terminal execution fact."""
+    required_keys = {
+        "schema_version",
+        "profile_id",
+        "job_id",
+        "job_revision",
+        "run_id",
+        "terminal_state",
+        "implementation_hash",
+        "checkpoint_invariant_hash",
+        "delivery_receipt_hash",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != required_keys:
+        raise ValueError("invalid cron run outcome receipt")
+    if (
+        receipt.get("schema_version") != _CRON_RUN_OUTCOME_RECEIPT_SCHEMA
+        or receipt.get("terminal_state") not in {"success", "failed"}
+        or not _safe_run_outcome_identity(receipt.get("profile_id"))
+        or not _safe_run_outcome_identity(receipt.get("job_id"))
+        or not re.fullmatch(r"cron-run:[0-9a-f]{32}", str(receipt.get("run_id") or ""))
+    ):
+        raise ValueError("invalid cron run outcome receipt")
+    for field in (
+        "job_revision",
+        "implementation_hash",
+        "checkpoint_invariant_hash",
+        "delivery_receipt_hash",
+    ):
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(receipt.get(field) or "")):
+            raise ValueError("invalid cron run outcome receipt")
+    return copy.deepcopy(receipt)
+
+
+def _cron_delivery_receipt_hash(
+    run_id: str,
+    delivery_receipt: Optional[Dict[str, Any]],
+) -> str:
+    normalized = (
+        _validated_delivery_receipt(delivery_receipt)
+        if delivery_receipt is not None
+        else {"state": "not_recorded"}
+    )
+    return _cron_run_hash(
+        {
+            "schema_version": _CRON_DELIVERY_BINDING_SCHEMA,
+            "run_id": run_id,
+            "delivery_receipt": normalized,
+        }
+    )
+
+
+def _cron_checkpoint_invariant_hash(
+    job: Dict[str, Any],
+    claim: Dict[str, Any],
+    *,
+    success: bool,
+) -> Optional[str]:
+    checkpoint_contract = {
+        field: copy.deepcopy(job.get(field))
+        for field in _CRON_CHECKPOINT_CONTRACT_FIELDS
+        if field in job
+    }
+    policy_hash = _cron_run_hash(
+        {
+            "schema_version": "cron-checkpoint-policy/v1",
+            "job_revision": claim["job_revision"],
+            "checkpoint_contract": checkpoint_contract or {"mode": "not_declared"},
+        }
+    )
+    if policy_hash != claim.get("checkpoint_policy_hash"):
+        return None
+    if checkpoint_contract and success:
+        # #1424 owns the actual checkpoint observation. A declaration alone
+        # cannot authorize a successful terminal outcome.
+        return None
+    terminal_state = (
+        "unobserved_due_to_failure"
+        if checkpoint_contract
+        else "not_applicable"
+    )
+    return _cron_run_hash(
+        {
+            "schema_version": _CRON_CHECKPOINT_INVARIANT_SCHEMA,
+            "run_id": claim["run_id"],
+            "policy_hash": policy_hash,
+            "implementation_hash": claim["implementation_hash"],
+            "terminal_state": terminal_state,
+            "pending_stage_count": None if checkpoint_contract else 0,
+        }
+    )
+
+
+def _cron_run_outcome_receipt(
+    job: Dict[str, Any],
+    *,
+    success: bool,
+    run_outcome_claim: Optional[Dict[str, Any]] = None,
+    delivery_receipt: Optional[Dict[str, Any]] = None,
+    profile_home: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a terminal fact only when the pre-run implementation stayed exact."""
+    if not isinstance(success, bool):
+        raise ValueError("cron run outcome success must be boolean")
+    if run_outcome_claim is None:
+        return None
+    claim = _validated_run_outcome_claim(run_outcome_claim)
+    current = _cron_run_outcome_claim(
+        job,
+        run_id=claim["run_id"],
+        profile_home=profile_home,
+        claim_started_at_epoch=claim["claim_started_at_epoch"],
+        claim_heartbeat_at_epoch=claim["claim_heartbeat_at_epoch"],
+        claim_expires_at_epoch=claim["claim_expires_at_epoch"],
+    )
+    if current != claim:
+        return None
+    checkpoint_hash = _cron_checkpoint_invariant_hash(
+        job,
+        claim,
+        success=success,
+    )
+    if checkpoint_hash is None:
+        return None
+    receipt: Dict[str, Any] = {
+        "schema_version": _CRON_RUN_OUTCOME_RECEIPT_SCHEMA,
+        "profile_id": claim["profile_id"],
+        "job_id": claim["job_id"],
+        "job_revision": claim["job_revision"],
+        "run_id": claim["run_id"],
+        "terminal_state": "success" if success else "failed",
+        "implementation_hash": claim["implementation_hash"],
+        "checkpoint_invariant_hash": checkpoint_hash,
+        "delivery_receipt_hash": _cron_delivery_receipt_hash(
+            claim["run_id"],
+            delivery_receipt,
+        ),
+    }
+    return _validated_run_outcome_receipt(receipt)
+
+
+def begin_job_run_outcome(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Clear stale success and atomically claim this signed Job revision."""
+    snapshot_creation = job.get("creation_governance_receipt")
+    if not isinstance(snapshot_creation, dict):
+        return None
+    snapshot_revision = snapshot_creation.get("receipt_id")
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for stored in jobs:
+            if stored.get("id") != job.get("id"):
+                continue
+            creation = stored.get("creation_governance_receipt")
+            if not isinstance(creation, dict) or creation.get("receipt_id") != snapshot_revision:
+                return None
+            existing_claim = stored.get(_CRON_RUN_OUTCOME_CLAIM_FIELD)
+            if existing_claim is not None:
+                try:
+                    if _run_outcome_claim_is_active(existing_claim):
+                        return None
+                except ValueError:
+                    return None
+            claim = _cron_run_outcome_claim(stored)
+            if claim is None:
+                stored[_CRON_RUN_OUTCOME_CLAIM_FIELD] = None
+                stored[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = None
+                _save_jobs_unlocked(jobs)
+                return None
+            stored[_CRON_RUN_OUTCOME_CLAIM_FIELD] = copy.deepcopy(claim)
+            stored[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = None
+            _save_jobs_unlocked(jobs)
+            return claim
+    return None
+
+
+def record_job_run_preflight_denial(
+    job_id: str,
+    *,
+    job_revision: str,
+    reason_code: str,
+    run_claim: Any = _CRON_CLAIM_UNSET,
+    fire_claim: Any = _CRON_CLAIM_UNSET,
+) -> bool:
+    """Persist a zero-side-effect denial without consuming a finite dispatch."""
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for stored in jobs:
+            if stored.get("id") != job_id:
+                continue
+            creation = stored.get("creation_governance_receipt")
+            if (
+                not isinstance(creation, dict)
+                or creation.get("receipt_id") != job_revision
+                or stored.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None
+                or (
+                    run_claim is not _CRON_CLAIM_UNSET
+                    and stored.get("run_claim") != run_claim
+                )
+                or (
+                    fire_claim is not _CRON_CLAIM_UNSET
+                    and stored.get("fire_claim") != fire_claim
+                )
+            ):
+                return False
+            if run_claim is not _CRON_CLAIM_UNSET:
+                stored["run_claim"] = None
+            if fire_claim is not _CRON_CLAIM_UNSET:
+                stored["fire_claim"] = None
+            stored[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = None
+            stored[_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD] = _runtime_admission_receipt(
+                stored,
+                reason_code=reason_code,
+                state="review_required",
+                exception_class="run_outcome_preflight_denied",
+                retryable=False,
+            )
+            _save_jobs_unlocked(jobs)
+            return True
+    return False
+
+
+def abandon_job_run_outcome(
+    job_id: str,
+    claim: Dict[str, Any],
+    *,
+    reason_code: Optional[str] = None,
+    run_claim: Any = _CRON_CLAIM_UNSET,
+    fire_claim: Any = _CRON_CLAIM_UNSET,
+) -> bool:
+    """Clear an unexecuted claim without advancing schedule or run status."""
+    claim = _validated_run_outcome_claim(claim)
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if (
+                job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) != claim
+                or (
+                    run_claim is not _CRON_CLAIM_UNSET
+                    and job.get("run_claim") != run_claim
+                )
+                or (
+                    fire_claim is not _CRON_CLAIM_UNSET
+                    and job.get("fire_claim") != fire_claim
+                )
+            ):
+                return False
+            job[_CRON_RUN_OUTCOME_CLAIM_FIELD] = None
+            job[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = None
+            if run_claim is not _CRON_CLAIM_UNSET:
+                job["run_claim"] = None
+            if fire_claim is not _CRON_CLAIM_UNSET:
+                job["fire_claim"] = None
+            if reason_code is not None:
+                job[_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD] = _runtime_admission_receipt(
+                    job,
+                    reason_code=reason_code,
+                    state="review_required",
+                    exception_class="run_outcome_preflight_denied",
+                    retryable=False,
+                )
+            _save_jobs_unlocked(jobs)
+            return True
+    return False
+
+
+
+
+def _cron_creation_governance_expected() -> bool:
+    if str(os.environ.get(_CRON_GOVERNANCE_ENV, "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        return True
+    home = get_hermes_home()
+    plugin_dir = home / "plugins" / _CRON_GOVERNANCE_PLUGIN
+    managed_profile = (home / ".hermes-agent-kit").exists()
+    if not (plugin_dir / "plugin.yaml").is_file():
+        return managed_profile
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        plugins = config.get("plugins") if isinstance(config, dict) else {}
+        enabled = plugins.get("enabled") if isinstance(plugins, dict) else []
+        disabled = plugins.get("disabled") if isinstance(plugins, dict) else []
+        return (
+            _CRON_GOVERNANCE_PLUGIN in (enabled or [])
+            and _CRON_GOVERNANCE_PLUGIN not in (disabled or [])
+        )
+    except Exception:
+        return managed_profile
+
+
+def _cron_persist_governance_active(
+    candidate: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return whether writes need the strict cross-process lock."""
+    expected = _cron_creation_governance_expected() or (
+        isinstance(candidate, dict) and _cron_candidate_requires_governance(candidate)
+    )
+    try:
+        from hermes_cli.plugins import discover_plugins, has_hook
+
+        discover_plugins()
+        return expected or has_hook("pre_cron_job_persist")
+    except Exception:
+        return expected
+
+
+def _validated_recovery_blocker(
+    blocked_decisions: List[Dict[str, Any]],
+    recovery_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Require one generic issuer-bound registration and one sealed effect."""
+    if len(blocked_decisions) != 1:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(ambiguous resume recovery registration).",
+            decision={
+                "action": "block",
+                "reason": "resume_recovery_registration_ambiguous",
+                "state": "resume_review_required",
+            },
+        )
+    blocked = copy.deepcopy(blocked_decisions[0])
+    registration = blocked.get("recovery_registration")
+    effect = blocked.get("notification_effect")
+    pending = blocked.get("pending_action")
+    frame = pending.get("frame") if isinstance(pending, dict) else None
+    issuer = registration.get("issuer") if isinstance(registration, dict) else None
+    expected_registration_fields = {
+        "schema_version",
+        "issuer",
+        "recovery_id",
+        "pending_id",
+        "frame_id",
+        "effect_hash",
+        "dispatch_key",
+    }
+    valid = (
+        isinstance(registration, dict)
+        and set(registration) == expected_registration_fields
+        and registration.get("schema_version")
+        == _CRON_RECOVERY_REGISTRATION_SCHEMA
+        and isinstance(issuer, dict)
+        and set(issuer) == {"id", "version"}
+        and bool(str(issuer.get("id") or "").strip())
+        and bool(str(issuer.get("version") or "").strip())
+        and registration.get("recovery_id") == recovery_context.get("recovery_id")
+        and isinstance(pending, dict)
+        and registration.get("pending_id") == pending.get("pending_id")
+        and isinstance(frame, dict)
+        and registration.get("frame_id") == frame.get("frame_id")
+        and isinstance(effect, dict)
+        and registration.get("effect_hash") == _cron_stable_hash(effect)
+        and registration.get("dispatch_key")
+        == cron_persist_recovery_dispatch_key(
+            str(recovery_context.get("recovery_id") or ""),
+            issuer,
+            effect,
+        )
+        and "post_persist_effects" not in blocked
+    )
+    if not valid:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(invalid resume recovery registration).",
+            decision={
+                "action": "block",
+                "reason": "resume_recovery_registration_invalid",
+                "state": "resume_review_required",
+            },
+        )
+    blocked["post_persist_effects"] = [copy.deepcopy(effect)]
+    return blocked
+
+
+def _apply_cron_persist_governance(
+    operation: str,
+    candidate: Dict[str, Any],
+    existing_jobs: List[Dict[str, Any]],
+    *,
+    recovery_context: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Run the generic persistence decision hook inside the jobs lock."""
+    expected = (
+        _cron_creation_governance_expected()
+        or _cron_candidate_requires_governance(candidate)
+    )
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_mandatory_hook
+
+        discover_plugins()
+        hook_kwargs = {
+            "operation": operation,
+            "candidate": copy.deepcopy(candidate),
+            "existing_jobs": copy.deepcopy(existing_jobs),
+        }
+        if recovery_context is not None:
+            hook_kwargs["recovery_context"] = copy.deepcopy(recovery_context)
+        report = invoke_mandatory_hook("pre_cron_job_persist", **hook_kwargs)
+    except Exception as exc:
+        if not expected:
+            logger.warning("pre_cron_job_persist discovery failed", exc_info=True)
+            return candidate, "allow_write"
+        decision = {
+            "action": "block",
+            "reason": "governance_unavailable",
+            "state": "review_required",
+            "callback_failures": [{
+                "hook": "pre_cron_job_persist",
+                "stage": "discovery",
+                "exception_class": type(exc).__name__,
+            }],
+        }
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review (governance unavailable).",
+            decision=decision,
+        ) from exc
+
+    results = report.get("results") if isinstance(report, dict) else []
+    failures = report.get("failures") if isinstance(report, dict) else []
+    callback_count = report.get("callback_count") if isinstance(report, dict) else 0
+    results = results if isinstance(results, list) else []
+    failures = failures if isinstance(failures, list) else []
+    callback_count = callback_count if isinstance(callback_count, int) else 0
+    decisions = [
+        item for item in results
+        if isinstance(item, dict) and item.get("action") in {"allow", "block"}
+    ]
+    blocked_decisions = [item for item in decisions if item.get("action") == "block"]
+    if recovery_context is not None and failures:
+        raise CronJobGovernanceError(
+            "Cron job was not saved: governance_callback_failed (review_required).",
+            decision={
+                "action": "block",
+                "reason": "governance_callback_failed",
+                "state": "review_required",
+                "callback_failures": copy.deepcopy(failures),
+            },
+        )
+    if recovery_context is not None and blocked_decisions:
+        blocked = _validated_recovery_blocker(blocked_decisions, recovery_context)
+        reason = str(blocked.get("reason") or "review_required")
+        state = str(blocked.get("state") or "review_required")
+        raise CronJobGovernanceError(
+            f"Cron job was not saved: {reason} ({state}).",
+            decision=blocked,
+        )
+    post_effects: List[Dict[str, Any]] = []
+    for blocked_decision in blocked_decisions:
+        effect = blocked_decision.get("notification_effect")
+        if isinstance(effect, dict) and effect not in post_effects:
+            post_effects.append(copy.deepcopy(effect))
+
+    if failures:
+        blocked = {
+            "action": "block",
+            "reason": "governance_callback_failed",
+            "state": "review_required",
+            "callback_failures": copy.deepcopy(failures),
+        }
+        if post_effects:
+            blocked["post_persist_effects"] = post_effects
+        raise CronJobGovernanceError(
+            "Cron job was not saved: governance_callback_failed (review_required).",
+            decision=blocked,
+        )
+
+    if blocked_decisions:
+        blocked = copy.deepcopy(blocked_decisions[0])
+        if post_effects:
+            blocked["post_persist_effects"] = post_effects
+        reason = str(blocked.get("reason") or "review_required")
+        state = str(blocked.get("state") or "review_required")
+        raise CronJobGovernanceError(
+            f"Cron job was not saved: {reason} ({state}).",
+            decision=blocked,
+        )
+
+    allowed = [item for item in decisions if item.get("action") == "allow"]
+    if not allowed and not expected and callback_count == 0:
+        return candidate, "allow_write"
+    if len(allowed) != 1:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(missing or ambiguous authorization)."
+        )
+
+    decision = allowed[0]
+    disposition = str(decision.get("persist_disposition") or "allow_write")
+    if disposition == "already_persisted":
+        resume = candidate.get(_CRON_RESUME_RECEIPT_FIELD)
+        resume_id = (
+            str(resume.get("receipt_id") or "").strip()
+            if isinstance(resume, dict)
+            else ""
+        )
+        matching = [
+            job for job in existing_jobs
+            if str(job.get("id") or "") == str(candidate.get("id") or "")
+            and isinstance(job.get("creation_governance_receipt"), dict)
+            and str(
+                job["creation_governance_receipt"].get("resume_receipt_id") or ""
+            ) == resume_id
+        ]
+        if not resume_id or len(matching) != 1:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(invalid already-persisted result)."
+            )
+        return copy.deepcopy(matching[0]), "already_persisted"
+    if disposition != "allow_write":
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(invalid persistence disposition)."
+        )
+
+    patch = decision.get("job_patch")
+    if not isinstance(patch, dict) or set(patch) - _CRON_GOVERNANCE_PATCH_FIELDS:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review (invalid governance result)."
+        )
+    resume = candidate.get(_CRON_RESUME_RECEIPT_FIELD)
+    resume_pause = {
+        "enabled": False,
+        "state": "paused",
+        "paused_reason": "admin_authorized_pending_explicit_enable",
+    }
+    if resume is not None:
+        if {key: patch.get(key) for key in resume_pause} != resume_pause:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(invalid resume pause result)."
+            )
+    elif set(patch).intersection(resume_pause):
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(unexpected governance state patch)."
+        )
+    receipt = patch.get("creation_governance_receipt")
+    if not isinstance(receipt, dict) or not str(receipt.get("receipt_id") or "").strip():
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review (missing governance receipt)."
+        )
+    profile_identity = _active_cron_profile_identity()
+    if str(receipt.get("profile_id") or "").strip() != profile_identity["profile_id"]:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(governance receipt Profile mismatch)."
+        )
+    receipt = copy.deepcopy(receipt)
+    asserted_home = str(receipt.get("profile_home_sha256") or "").strip()
+    if asserted_home and asserted_home != profile_identity["profile_home_sha256"]:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(governance receipt Profile home mismatch)."
+        )
+    # Core owns the canonical filesystem boundary. Bind every newly authorized
+    # receipt before persistence so Group C never has to infer a home from a
+    # reusable profile name. Existing unbound receipts fail closed and require
+    # an explicit governance refresh to pass through this migration point.
+    receipt["profile_home_sha256"] = profile_identity["profile_home_sha256"]
+    patch = {**patch, "creation_governance_receipt": receipt}
+    if resume is not None:
+        resume_id = (
+            str(resume.get("receipt_id") or "").strip()
+            if isinstance(resume, dict)
+            else ""
+        )
+        if not resume_id or str(receipt.get("resume_receipt_id") or "").strip() != resume_id:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(resume receipt was not consumed)."
+            )
+    governed = {**candidate, **copy.deepcopy(patch)}
+    governed.pop(_CRON_RESUME_RECEIPT_FIELD, None)
+    return governed, "allow_write"
+
+
+def _post_cron_persist_effects(
+    error: CronJobGovernanceError,
+) -> List[Dict[str, Any]]:
+    """Extract opaque effects sealed into a denied decision."""
+    effects = error.decision.get("post_persist_effects")
+    if not isinstance(effects, list):
+        return []
+    return [copy.deepcopy(effect) for effect in effects if isinstance(effect, dict)]
+
+
+class CronRuntimeAdmissionError(PermissionError):
+    """Raised before any cron script or Agent side effect may begin."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        decision: Optional[Dict[str, Any]] = None,
+        job: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.decision = copy.deepcopy(decision or {})
+        self.receipt = _runtime_admission_receipt(
+            job or {},
+            reason_code=self.decision.get("reason"),
+            state=self.decision.get("state"),
+            exception_class="runtime_admission_blocked",
+            retryable=bool(self.decision.get("retryable", False)),
+        )
+
+
+def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
+    """Run mandatory runtime admission before both cron execution paths."""
+    required = (
+        _cron_creation_governance_expected()
+        or _cron_candidate_requires_governance(job)
+    )
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_mandatory_hook
+
+        discover_plugins()
+        report = invoke_mandatory_hook(
+            "pre_cron_job_run",
+            job=copy.deepcopy(job),
+        )
+    except Exception as exc:
+        if not required:
+            logger.warning("pre_cron_job_run discovery failed", exc_info=True)
+            return
+        decision = {
+            "action": "block",
+            "reason": "runtime_governance_unavailable",
+            "state": "runtime_review_required",
+            "callback_failures": [{
+                "hook": "pre_cron_job_run",
+                "stage": "discovery",
+                "exception_class": type(exc).__name__,
+            }],
+        }
+        raise CronRuntimeAdmissionError(
+            "Cron job was not run: runtime_governance_unavailable.",
+            decision=decision,
+            job=job,
+        ) from exc
+
+    results = report.get("results") if isinstance(report, dict) else []
+    failures = report.get("failures") if isinstance(report, dict) else []
+    callback_count = report.get("callback_count") if isinstance(report, dict) else 0
+    results = results if isinstance(results, list) else []
+    failures = failures if isinstance(failures, list) else []
+    callback_count = callback_count if isinstance(callback_count, int) else 0
+    if failures:
+        decision = {
+            "action": "block",
+            "reason": "runtime_governance_callback_failed",
+            "state": "runtime_review_required",
+            "callback_failures": copy.deepcopy(failures),
+        }
+        raise CronRuntimeAdmissionError(
+            "Cron job was not run: runtime_governance_callback_failed.",
+            decision=decision,
+            job=job,
+        )
+
+    decisions = [
+        item for item in results
+        if isinstance(item, dict) and item.get("action") in {"allow", "block"}
+    ]
+    blocked = next(
+        (item for item in decisions if item.get("action") == "block"),
+        None,
+    )
+    if blocked is not None:
+        reason = str(blocked.get("reason") or "runtime_binding_required")
+        raise CronRuntimeAdmissionError(
+            f"Cron job was not run: {reason}.",
+            decision=copy.deepcopy(blocked),
+            job=job,
+        )
+    allowed = [item for item in decisions if item.get("action") == "allow"]
+    if not allowed and not required and callback_count == 0:
+        return
+    if len(allowed) != 1:
+        decision = {
+            "action": "block",
+            "reason": "runtime_admission_ambiguous",
+            "state": "runtime_review_required",
+        }
+        raise CronRuntimeAdmissionError(
+            "Cron job was not run: runtime_admission_ambiguous.",
+            decision=decision,
+            job=job,
+        )
+
+
+def _dispatch_post_cron_persist_effects(
+    operation: str,
+    effects: List[Dict[str, Any]],
+) -> None:
+    """Dispatch denied-write effects after the jobs lock has been released."""
+    if not effects:
+        return
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+
+        discover_plugins()
+        for effect in effects:
+            invoke_hook(
+                "post_cron_job_persist",
+                operation=operation,
+                notification_effect=copy.deepcopy(effect),
+            )
+    except Exception:
+        logger.warning(
+            "post_cron_job_persist observer failed after rejected %s",
+            operation,
+            exc_info=True,
+        )
+
+
+def _invalid_resume(reason: str) -> CronJobGovernanceError:
+    return CronJobGovernanceError(
+        "Cron job persistence needs administrator review (invalid resume package).",
+        decision={
+            "action": "block",
+            "reason": reason,
+            "state": "resume_review_required",
+        },
+    )
+
+
+def _parse_resume_package(
+    package: Dict[str, Any], *, operation: str
+) -> _ParsedCronResume:
+    """Verify an immutable v1/v2 envelope without consulting mutable state."""
+    if not isinstance(package, dict):
+        raise _invalid_resume("resume_package_invalid")
+    schema = str(package.get("schema_version") or "").strip()
+    receipt_fields = (
+        _CRON_RESUME_RECEIPT_CORE_FIELDS
+        if schema == _CRON_RESUME_SCHEMA
+        else _CRON_RESUME_RECEIPT_V2_CORE_FIELDS
+        if schema == _CRON_RESUME_SCHEMA_V2
+        else ()
+    )
+    job = package.get("job")
+    receipt = package.get("receipt")
+    if not receipt_fields or not isinstance(job, dict) or not isinstance(receipt, dict):
+        raise _invalid_resume("resume_package_schema_invalid")
+    job_id = str(job.get("id") or "").strip()
+    receipt_id = str(receipt.get("receipt_id") or "").strip()
+    candidate_hash = str(package.get("candidate_hash") or "").strip()
+    persist_spec_hash = str(package.get("persist_spec_hash") or "").strip()
+    behavior_ref = str(package.get("authorized_behavior_ref") or "").strip()
+    receipt_core = {
+        field: copy.deepcopy(receipt.get(field)) for field in receipt_fields
+    }
+    sha256_pattern = r"sha256:[0-9a-f]{64}"
+    safe_job_id = bool(
+        job_id
+        and job_id not in {".", ".."}
+        and "/" not in job_id
+        and "\\" not in job_id
+        and not Path(job_id).is_absolute()
+        and not Path(job_id).drive
+    )
+    valid = (
+        set(package) == _CRON_RESUME_PACKAGE_FIELDS
+        and set(receipt) == {*receipt_fields, "receipt_id"}
+        and receipt.get("schema_version") == schema
+        and package.get("scope_immutable") is True
+        and isinstance(package.get("instruction"), str)
+        and bool(str(package.get("instruction") or "").strip())
+        and str(package.get("operation") or "").strip().lower() == operation
+        and str(package.get("job_id") or "").strip() == job_id
+        and all(
+            str(receipt.get(field) or "").strip()
+            for field in receipt_fields
+            if field != "prior_job_hash"
+        )
+        and str(receipt.get("operation") or "").strip().lower() == operation
+        and str(receipt.get("cron_job_id") or "").strip() == job_id
+        and behavior_ref
+        and behavior_ref == str(receipt.get("behavior_id") or "").strip()
+        and behavior_ref == str(job.get("authorized_behavior_ref") or "").strip()
+        and safe_job_id
+        and re.fullmatch(sha256_pattern, receipt_id) is not None
+        and receipt_id == _cron_stable_hash(receipt_core)
+        and re.fullmatch(sha256_pattern, candidate_hash) is not None
+        and candidate_hash == str(receipt.get("candidate_hash") or "").strip()
+        and re.fullmatch(sha256_pattern, persist_spec_hash) is not None
+        and persist_spec_hash == str(receipt.get("persist_spec_hash") or "").strip()
+        and persist_spec_hash == _cron_persist_spec_hash(operation, job)
+    )
+    if not valid:
+        raise _invalid_resume("resume_package_integrity_mismatch")
+    if (
+        schema == _CRON_RESUME_SCHEMA_V2
+        and operation == "update"
+        and not str(receipt.get("prior_job_hash") or "").strip()
+    ):
+        raise _invalid_resume("resume_update_precondition_missing")
+    if schema == _CRON_RESUME_SCHEMA_V2:
+        identity = cron_persist_resume_identity(operation, job)
+        if any(receipt.get(field) != identity[field] for field in identity):
+            raise _invalid_resume("resume_request_or_route_mismatch")
+        try:
+            issued_at = datetime.fromisoformat(
+                str(receipt["issued_at"]).replace("Z", "+00:00")
+            )
+            expires_at = datetime.fromisoformat(
+                str(receipt["expires_at"]).replace("Z", "+00:00")
+            )
+            now = _hermes_now()
+            if now.tzinfo is None:
+                now = now.astimezone()
+        except (TypeError, ValueError):
+            raise _invalid_resume("resume_receipt_time_invalid") from None
+        if (
+            issued_at.tzinfo is None
+            or expires_at.tzinfo is None
+            or issued_at >= expires_at
+            or issued_at > now
+            or expires_at <= now
+        ):
+            raise _invalid_resume("resume_receipt_expired")
+    return _ParsedCronResume(
+        schema_version=schema,
+        operation=operation,
+        job=copy.deepcopy(job),
+        receipt=copy.deepcopy(receipt),
+    )
+
+
+def _cron_resume_precondition_hash(job: Dict[str, Any]) -> str:
+    return _cron_stable_hash({
+        key: copy.deepcopy(value)
+        for key, value in job.items()
+        if key != _CRON_RESUME_RECEIPT_FIELD
+    })
+
+
+def _recovery_context(
+    parsed: _ParsedCronResume,
+    *,
+    disposition: str,
+    reason: str,
+    fresh_candidate: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    receipt = parsed.receipt
+    fresh_candidate_hash = (
+        _cron_candidate_definition_hash(fresh_candidate) if fresh_candidate else ""
+    )
+    fresh_spec_hash = (
+        _cron_persist_spec_hash(parsed.operation, fresh_candidate)
+        if fresh_candidate
+        else ""
+    )
+    core = {
+        "schema_version": _CRON_RECOVERY_SCHEMA,
+        "disposition": disposition,
+        "reason": reason,
+        "profile_id": str(receipt.get("profile_id") or ""),
+        "profile_home_sha256": str(receipt.get("profile_home_sha256") or ""),
+        "operation": parsed.operation,
+        "job_id": str(parsed.job.get("id") or ""),
+        "request_id": str(receipt.get("request_id") or ""),
+        "request_hash": str(receipt.get("request_hash") or ""),
+        "source_route_hash": str(receipt.get("source_route_hash") or ""),
+        "rejected_receipt_id": str(receipt.get("receipt_id") or ""),
+        "rejected_receipt_hash": _cron_stable_hash(receipt),
+        "rejected_frame_id": str(receipt.get("frame_id") or ""),
+        "rejected_pending_id": str(receipt.get("pending_id") or ""),
+        "rejected_candidate_hash": str(receipt.get("candidate_hash") or ""),
+        "rejected_persist_spec_hash": str(receipt.get("persist_spec_hash") or ""),
+        "prior_job_hash": str(receipt.get("prior_job_hash") or ""),
+        "fresh_candidate_hash": fresh_candidate_hash,
+        "fresh_persist_spec_hash": fresh_spec_hash,
+    }
+    core["recovery_id"] = _cron_stable_hash(core)
+    return core
+
+
+def _resolve_resume(
+    parsed: _ParsedCronResume,
+    *,
+    existing_jobs: List[Dict[str, Any]],
+) -> CronResumeResolution:
+    """Classify exact, recoverable drift, and unsafe resume envelopes."""
+    candidate = copy.deepcopy(parsed.job)
+    receipt = parsed.receipt
+    job_id = str(candidate.get("id") or "")
+    matches = [job for job in existing_jobs if str(job.get("id") or "") == job_id]
+    if len(matches) > 1:
+        raise _invalid_resume("resume_job_id_ambiguous")
+    if parsed.operation == "create" and matches:
+        stored_receipt = matches[0].get("creation_governance_receipt")
+        if not (
+            isinstance(stored_receipt, dict)
+            and str(stored_receipt.get("resume_receipt_id") or "")
+            == str(receipt.get("receipt_id") or "")
+        ):
+            raise _invalid_resume("resume_job_id_conflict")
+    if parsed.operation == "update":
+        if len(matches) != 1:
+            raise _invalid_resume("resume_update_target_missing")
+        if matches[0].get("active_run_outcome_claim") is not None:
+            raise CronJobGovernanceError(
+                "Cron job authorization cannot change while a signed run is active."
+            )
+        if parsed.schema_version == _CRON_RESUME_SCHEMA_V2 and (
+            _cron_resume_precondition_hash(matches[0])
+            != str(receipt.get("prior_job_hash") or "")
+        ):
+            raise _invalid_resume("resume_update_precondition_mismatch")
+    if parsed.schema_version == _CRON_RESUME_SCHEMA:
+        return CronResumeResolution(
+            disposition="exact",
+            candidate={
+                **candidate,
+                _CRON_RESUME_RECEIPT_FIELD: copy.deepcopy(receipt),
+            },
+        )
+
+    selectors = _normalize_skill_list(candidate.get("skill"), candidate.get("skills"))
+    try:
+        normalized_skills, bindings = _resolve_skill_fields(selectors)
+    except Exception as exc:
+        from agent.skill_resolution import SkillResolutionError
+
+        if not isinstance(exc, SkillResolutionError):
+            raise
+        context = _recovery_context(
+            parsed,
+            disposition="blocked_unreconstructable",
+            reason=str(exc.code),
+            fresh_candidate=None,
+        )
+        return CronResumeResolution(
+            disposition="blocked_unreconstructable",
+            candidate=candidate,
+            reason=str(exc.code),
+            recovery_context=context,
+        )
+    fresh = copy.deepcopy(candidate)
+    fresh["skills"] = normalized_skills
+    fresh["skill"] = normalized_skills[0] if normalized_skills else None
+    fresh["skill_bindings"] = bindings
+    fresh_identity = cron_persist_resume_identity(parsed.operation, fresh)
+    if any(
+        fresh_identity[field] != str(receipt.get(field) or "")
+        for field in (
+            "profile_id",
+            "profile_home_sha256",
+            "request_id",
+            "request_hash",
+            "source_route_hash",
+        )
+    ):
+        raise _invalid_resume("resume_fresh_request_or_route_mismatch")
+    fresh_spec_hash = _cron_persist_spec_hash(parsed.operation, fresh)
+    if fresh_spec_hash == str(receipt.get("persist_spec_hash") or ""):
+        return CronResumeResolution(
+            disposition="exact",
+            candidate={
+                **fresh,
+                _CRON_RESUME_RECEIPT_FIELD: copy.deepcopy(receipt),
+            },
+        )
+    context = _recovery_context(
+        parsed,
+        disposition="fresh_blocked_candidate",
+        reason="resume_persist_spec_drift",
+        fresh_candidate=fresh,
+    )
+    return CronResumeResolution(
+        disposition="recoverable_spec_drift",
+        candidate=fresh,
+        reason="resume_persist_spec_drift",
+        recovery_context=context,
+    )
+
+
+def get_cron_persist_recovery(
+    recovery_id: str, *, profile_home: Optional[Union[str, Path]] = None
+) -> Optional[Dict[str, Any]]:
+    """Return one verified profile-local recovery disposition."""
+    from cron.persist_recovery import get_recovery
+
+    cron_dir = (
+        Path(profile_home).expanduser().resolve(strict=False) / "cron"
+        if profile_home is not None
+        else _current_cron_store().cron_dir
+    )
+    return get_recovery(
+        cron_dir,
+        str(recovery_id or "").strip(),
+        profile_home=(
+            Path(profile_home).expanduser().resolve(strict=False)
+            if profile_home is not None
+            else _active_profile_home()
+        ),
+    )
+
+
+def _recovery_store_failure(exc: Exception) -> CronJobGovernanceError:
+    return CronJobGovernanceError(
+        "Cron job persistence needs administrator review "
+        "(resume recovery store unavailable).",
+        decision={
+            "action": "block",
+            "reason": "resume_recovery_store_unavailable",
+            "state": "resume_review_required",
+            "callback_failures": [{
+                "stage": "recovery_store",
+                "exception_class": type(exc).__name__,
+            }],
+        },
+    )
+
+
+def _load_recovery_replay(
+    context: Dict[str, Any], candidate: Dict[str, Any]
+) -> Optional[CronJobGovernanceError]:
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        load_by_rejected_receipt,
+    )
+
+    try:
+        stored = load_by_rejected_receipt(
+            _current_cron_store().cron_dir,
+            str(context["rejected_receipt_id"]),
+            profile_home=_active_profile_home(),
+        )
+    except CronPersistRecoveryStoreError as exc:
+        raise _recovery_store_failure(exc) from exc
+    if stored is None:
+        return None
+    lineage_fields = (
+        "recovery_id",
+        "disposition",
+        "reason",
+        "profile_id",
+        "profile_home_sha256",
+        "operation",
+        "job_id",
+        "request_id",
+        "request_hash",
+        "source_route_hash",
+        "rejected_receipt_id",
+        "rejected_receipt_hash",
+        "rejected_frame_id",
+        "rejected_pending_id",
+        "rejected_candidate_hash",
+        "rejected_persist_spec_hash",
+        "prior_job_hash",
+        "fresh_candidate_hash",
+        "fresh_persist_spec_hash",
+    )
+    if (
+        any(stored.get(field) != context.get(field) for field in lineage_fields)
+        or stored.get("candidate") != candidate
+        or not isinstance(stored.get("decision"), dict)
+    ):
+        raise _invalid_resume("resume_recovery_lineage_conflict")
+    decision = copy.deepcopy(stored["decision"])
+    # Registration and transport are owned by the sealed HAK Frame. Ordinary
+    # replay returns the same pending action without re-emitting its observer.
+    decision.pop("post_persist_effects", None)
+    return CronJobGovernanceError(
+        "Cron job was not saved: stale authorization requires fresh review.",
+        decision=decision,
+    )
+
+
+def _record_recovery_error(
+    resolution: CronResumeResolution,
+    decision: Dict[str, Any],
+) -> CronJobGovernanceError:
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        record_recovery,
+    )
+
+    context = copy.deepcopy(resolution.recovery_context or {})
+    if resolution.disposition == "recoverable_spec_drift":
+        registration = decision.get("recovery_registration")
+        effects = decision.get("post_persist_effects")
+        if not isinstance(registration, dict) or not (
+            isinstance(effects, list)
+            and len(effects) == 1
+            and isinstance(effects[0], dict)
+        ):
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(invalid resume recovery governance result)."
+            )
+        context["pending_id"] = str(registration.get("pending_id") or "")
+        context["frame_id"] = str(registration.get("frame_id") or "")
+        context["registration"] = copy.deepcopy(registration)
+        context["notification_effect"] = copy.deepcopy(effects[0])
+    public_recovery = {
+        key: copy.deepcopy(value)
+        for key, value in context.items()
+        if key not in {"rejected_receipt_hash"}
+    }
+    stored_decision = copy.deepcopy(decision)
+    stored_decision.pop("post_persist_effects", None)
+    stored_decision["recovery"] = public_recovery
+    record = {
+        **context,
+        "candidate": copy.deepcopy(resolution.candidate),
+        "decision": stored_decision,
+        "created_at": _hermes_now().isoformat(),
+    }
+    try:
+        record_recovery(
+            _current_cron_store().cron_dir,
+            record,
+            profile_home=_active_profile_home(),
+        )
+    except CronPersistRecoveryStoreError as exc:
+        raise _recovery_store_failure(exc) from exc
+    reason = str(stored_decision.get("reason") or resolution.reason)
+    state = str(stored_decision.get("state") or "resume_review_required")
+    return CronJobGovernanceError(
+        f"Cron job was not saved: {reason} ({state}).",
+        decision=stored_decision,
+    )
+
+
+def _unreconstructable_recovery_error(
+    resolution: CronResumeResolution,
+) -> CronJobGovernanceError:
+    decision = {
+        "action": "block",
+        "reason": resolution.reason or "resume_candidate_unreconstructable",
+        "state": "resume_recovery_unreconstructable",
+    }
+    return _record_recovery_error(resolution, decision)
+
+
+def _claim_cron_recovery_dispatch(recovery_id: str) -> Optional[Dict[str, Any]]:
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        claim_recovery_dispatch,
+    )
+
+    try:
+        return claim_recovery_dispatch(
+            _current_cron_store().cron_dir,
+            recovery_id,
+            profile_home=_active_profile_home(),
+        )
+    except CronPersistRecoveryStoreError as exc:
+        raise _recovery_store_failure(exc) from exc
+
+
+def _valid_recovery_dispatch_ack(
+    result: Any,
+    claim: Dict[str, Any],
+) -> bool:
+    registration = claim.get("registration")
+    issuer = registration.get("issuer") if isinstance(registration, dict) else None
+    durable_cas = result.get("durable_cas") if isinstance(result, dict) else None
+    return bool(
+        isinstance(result, dict)
+        and set(result)
+        == {
+            "schema_version",
+            "issuer",
+            "recovery_id",
+            "dispatch_key",
+            "disposition",
+            "durable_cas",
+        }
+        and result.get("schema_version") == _CRON_RECOVERY_DISPATCH_ACK_SCHEMA
+        and result.get("issuer") == issuer
+        and result.get("recovery_id") == claim.get("recovery_id")
+        and result.get("dispatch_key") == claim.get("dispatch_key")
+        and result.get("disposition") == "durably_accepted"
+        and isinstance(durable_cas, dict)
+        and set(durable_cas)
+        == {"schema_version", "dispatch_key", "owner_id", "cas_version"}
+        and durable_cas.get("schema_version") == _CRON_RECOVERY_DURABLE_CAS_SCHEMA
+        and durable_cas.get("dispatch_key") == claim.get("dispatch_key")
+        and bool(str(durable_cas.get("owner_id") or "").strip())
+        and isinstance(durable_cas.get("cas_version"), int)
+        and durable_cas.get("cas_version") >= 1
+    )
+
+
+def _dispatch_claimed_cron_recovery_effects(
+    operation: str,
+    claims: List[Dict[str, Any]],
+) -> None:
+    """Deliver durable recovery effects after the jobs lock is released."""
+    if not claims:
+        return
+    from cron.persist_recovery import (
+        CronPersistRecoveryStoreError,
+        complete_recovery_dispatch,
+        heartbeat_recovery_dispatch,
+        release_recovery_dispatch,
+    )
+
+    # ContextVar-backed profile routing does not propagate into a plain
+    # threading.Thread. Pin the owning store for the whole dispatch lifecycle.
+    dispatch_store = _current_cron_store()
+    dispatch_profile_home = dispatch_store.cron_dir.parent.resolve(strict=False)
+
+    for claim in claims:
+        acknowledged = False
+        heartbeat_stop = threading.Event()
+        heartbeat_lost = threading.Event()
+        heartbeat_interval = max(
+            min(float(claim.get("lease_seconds") or 30.0) / 3.0, 5.0),
+            0.05,
+        )
+
+        def maintain_claim() -> None:
+            while not heartbeat_stop.wait(heartbeat_interval):
+                try:
+                    alive = heartbeat_recovery_dispatch(
+                        dispatch_store.cron_dir,
+                        str(claim["recovery_id"]),
+                        str(claim["claim_id"]),
+                        int(claim["fence_token"]),
+                        profile_home=dispatch_profile_home,
+                        lease_seconds=float(claim["lease_seconds"]),
+                    )
+                except CronPersistRecoveryStoreError:
+                    logger.warning(
+                        "Cron resume recovery dispatch heartbeat failed",
+                        exc_info=True,
+                    )
+                    alive = False
+                if not alive:
+                    heartbeat_lost.set()
+                    return
+
+        heartbeat_thread: Optional[threading.Thread] = None
+        try:
+            from hermes_cli.plugins import discover_plugins, invoke_hook
+
+            discover_plugins()
+            if not heartbeat_recovery_dispatch(
+                dispatch_store.cron_dir,
+                str(claim["recovery_id"]),
+                str(claim["claim_id"]),
+                int(claim["fence_token"]),
+                profile_home=dispatch_profile_home,
+                lease_seconds=float(claim["lease_seconds"]),
+            ):
+                heartbeat_lost.set()
+                raise CronPersistRecoveryStoreError(
+                    "Cron resume recovery dispatch claim was fenced before observer entry."
+                )
+            heartbeat_thread = threading.Thread(
+                target=maintain_claim,
+                name="cron-recovery-dispatch-heartbeat",
+                daemon=True,
+            )
+            heartbeat_thread.start()
+            results = invoke_hook(
+                "post_cron_job_persist",
+                operation=operation,
+                notification_effect=copy.deepcopy(claim["notification_effect"]),
+                recovery_registration=copy.deepcopy(claim["registration"]),
+                recovery_dispatch={
+                    "recovery_id": claim["recovery_id"],
+                    "dispatch_key": claim["dispatch_key"],
+                },
+            )
+            acknowledgements = [
+                result
+                for result in results
+                if _valid_recovery_dispatch_ack(result, claim)
+            ]
+            acknowledged = len(acknowledgements) == 1 and not heartbeat_lost.is_set()
+        except Exception:
+            logger.warning(
+                "post_cron_job_persist recovery observer failed after rejected %s",
+                operation,
+                exc_info=True,
+            )
+        finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=max(heartbeat_interval * 2.0, 0.2))
+        try:
+            if acknowledged:
+                complete_recovery_dispatch(
+                    dispatch_store.cron_dir,
+                    str(claim["recovery_id"]),
+                    str(claim["claim_id"]),
+                    int(claim["fence_token"]),
+                    profile_home=dispatch_profile_home,
+                )
+            else:
+                release_recovery_dispatch(
+                    dispatch_store.cron_dir,
+                    str(claim["recovery_id"]),
+                    str(claim["claim_id"]),
+                    int(claim["fence_token"]),
+                    profile_home=dispatch_profile_home,
+                )
+        except CronPersistRecoveryStoreError:
+            logger.warning(
+                "Cron resume recovery dispatch disposition update failed",
+                exc_info=True,
+            )
 
 
 def _job_output_dir(job_id: str) -> Path:
@@ -402,6 +2799,57 @@ def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = N
         if text and text not in normalized:
             normalized.append(text)
     return normalized
+
+
+def _active_profile_home() -> Path:
+    """Return the profile that owns the active Cron store."""
+    return _current_cron_store().cron_dir.parent.resolve(strict=False)
+
+
+def _registered_plugin_skill_paths(
+    selectors: List[str], profile_home: Path
+) -> Dict[str, Path]:
+    qualified = [selector for selector in selectors if ":" in selector]
+    if not qualified:
+        return {}
+    if profile_home.resolve(strict=False) != get_hermes_home().resolve(strict=False):
+        return {}
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()
+        manager = get_plugin_manager()
+        return {
+            selector: path
+            for selector in qualified
+            if (path := manager.find_plugin_skill(selector)) is not None
+        }
+    except Exception as exc:
+        from agent.skill_resolution import SkillResolutionError
+
+        raise SkillResolutionError(
+            "skill_plugin_resolution_failed",
+            qualified[0],
+            "Plugin skill discovery failed before Cron persistence.",
+        ) from exc
+
+
+def _resolve_skill_fields(
+    selectors: List[str],
+    *,
+    profile_home: Optional[Path] = None,
+) -> Tuple[List[str], List[Dict[str, Any]]]:
+    if not selectors:
+        return [], []
+    from agent.skill_resolution import resolve_skill_refs
+
+    profile = (profile_home or _active_profile_home()).resolve(strict=False)
+    bindings = resolve_skill_refs(
+        profile,
+        selectors,
+        plugin_skill_paths=_registered_plugin_skill_paths(selectors, profile),
+    )
+    return [str(binding["canonical_name"]) for binding in bindings], bindings
 
 
 def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
@@ -1010,7 +3458,7 @@ def get_ticker_last_error() -> Optional[str]:
 # Job CRUD Operations
 # =============================================================================
 
-def load_jobs() -> List[Dict[str, Any]]:
+def load_jobs(*, repair_recoverable: bool = True) -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
@@ -1044,12 +3492,23 @@ def load_jobs() -> List[Dict[str, Any]]:
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
-        if _strict_retry and jobs:
+        if _strict_retry:
+            if not repair_recoverable:
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review "
+                    "(jobs store requires control-character repair)."
+                )
             # Hit control-character corruption — rewrite with proper escaping.
-            save_jobs(jobs)
-            logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+            if jobs:
+                save_jobs(jobs)
+                logger.warning("Auto-repaired jobs.json (had invalid control characters)")
         return jobs
     if isinstance(data, list):
+        if not repair_recoverable:
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(jobs store requires shape repair)."
+            )
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
         if data:
@@ -1261,6 +3720,9 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    authorized_behavior_ref: Optional[str] = None,
+    implementation_categories: Optional[List[str]] = None,
+    governance_resume: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1309,6 +3771,79 @@ def create_job(
     Returns:
         The created job dict
     """
+    if governance_resume is not None:
+        parsed_resume = _parse_resume_package(governance_resume, operation="create")
+        post_effects: List[Dict[str, Any]] = []
+        recovery_claims: List[Dict[str, Any]] = []
+        with contextlib.ExitStack() as stack:
+            stack.callback(
+                _dispatch_post_cron_persist_effects,
+                "create",
+                post_effects,
+            )
+            stack.callback(
+                _dispatch_claimed_cron_recovery_effects,
+                "create",
+                recovery_claims,
+            )
+            stack.enter_context(_jobs_lock(require_cross_process=True))
+            jobs = load_jobs(repair_recoverable=False)
+            resolution = _resolve_resume(parsed_resume, existing_jobs=jobs)
+            candidate = resolution.candidate
+            if resolution.recovery_context is not None:
+                replay = _load_recovery_replay(
+                    resolution.recovery_context,
+                    resolution.candidate,
+                )
+                if replay is not None:
+                    claim = _claim_cron_recovery_dispatch(
+                        str(resolution.recovery_context["recovery_id"])
+                    )
+                    if claim is not None:
+                        recovery_claims.append(claim)
+                    raise replay
+            if resolution.disposition == "blocked_unreconstructable":
+                raise _unreconstructable_recovery_error(resolution)
+            try:
+                governed, disposition = _apply_cron_persist_governance(
+                    "create",
+                    candidate,
+                    jobs,
+                    recovery_context=resolution.recovery_context,
+                )
+            except CronJobGovernanceError as exc:
+                if (
+                    resolution.disposition == "recoverable_spec_drift"
+                    and isinstance(exc.decision.get("recovery_registration"), dict)
+                ):
+                    recovery_error = _record_recovery_error(resolution, exc.decision)
+                    claim = _claim_cron_recovery_dispatch(
+                        str(resolution.recovery_context["recovery_id"])
+                    )
+                    if claim is not None:
+                        recovery_claims.append(claim)
+                    raise recovery_error from exc
+                post_effects.extend(_post_cron_persist_effects(exc))
+                raise
+            if resolution.disposition == "recoverable_spec_drift":
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review "
+                    "(resume recovery was not blocked)."
+                )
+            if disposition == "already_persisted":
+                return _normalize_job_record(governed)
+            if any(
+                str(item.get("id") or "") == str(governed.get("id") or "")
+                for item in jobs
+            ):
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review "
+                    "(resume job id conflict)."
+                )
+            jobs.append(governed)
+            _save_jobs_unlocked(jobs)
+        return _normalize_job_record(governed)
+
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -1326,7 +3861,8 @@ def create_job(
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
 
-    normalized_skills = _normalize_skill_list(skill, skills)
+    requested_skills = _normalize_skill_list(skill, skills)
+    normalized_skills, skill_bindings = _resolve_skill_fields(requested_skills)
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
@@ -1394,6 +3930,7 @@ def create_job(
         "prompt": prompt_text,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,
+        "skill_bindings": skill_bindings,
         "model": normalized_model,
         "provider": normalized_provider,
         # Provider/model resolution captured at creation for unpinned jobs
@@ -1421,6 +3958,10 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        _CRON_RUNTIME_ADMISSION_RECEIPT_FIELD: None,
+        _CRON_DELIVERY_RECEIPT_FIELD: None,
+        _CRON_RUN_OUTCOME_RECEIPT_FIELD: None,
+        _CRON_RUN_OUTCOME_CLAIM_FIELD: None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1433,10 +3974,37 @@ def create_job(
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
 
-    with _jobs_lock():
+    if authorized_behavior_ref is not None:
+        job["authorized_behavior_ref"] = _normalize_job_optional_text(
+            authorized_behavior_ref
+        )
+    if implementation_categories is not None:
+        job["implementation_categories"] = [
+            str(item).strip()
+            for item in implementation_categories
+            if str(item).strip()
+        ]
+
+    governance_active = _cron_persist_governance_active(job)
+    post_effects: List[Dict[str, Any]] = []
+    with contextlib.ExitStack() as stack:
+        stack.callback(_dispatch_post_cron_persist_effects, "create", post_effects)
+        lock_context = (
+            _jobs_lock(require_cross_process=True)
+            if governance_active
+            else _jobs_lock()
+        )
+        stack.enter_context(lock_context)
         jobs = load_jobs()
+        try:
+            job, disposition = _apply_cron_persist_governance("create", job, jobs)
+        except CronJobGovernanceError as exc:
+            post_effects.extend(_post_cron_persist_effects(exc))
+            raise
+        if disposition != "allow_write":
+            return _normalize_job_record(job)
         jobs.append(job)
-        save_jobs(jobs)
+        _save_jobs_unlocked(jobs)
 
     return job
 
@@ -1463,7 +4031,11 @@ class AmbiguousJobReference(LookupError):
         )
 
 
-def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
+def resolve_job_ref(
+    ref: str,
+    *,
+    repair_recoverable: bool = True,
+) -> Optional[Dict[str, Any]]:
     """Resolve a job reference (ID or name) to a job record.
 
     - Exact ID match wins (works even if a different job's name equals this ID).
@@ -1473,7 +4045,7 @@ def resolve_job_ref(ref: str) -> Optional[Dict[str, Any]]:
     """
     if not ref:
         return None
-    jobs = load_jobs()
+    jobs = load_jobs(repair_recoverable=repair_recoverable)
     for job in jobs:
         if job["id"] == ref:
             return _normalize_job_record(job)
@@ -1504,8 +4076,112 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_job(
+    job_id: str,
+    updates: Dict[str, Any],
+    governance_resume: Optional[Dict[str, Any]] = None,
+    governance_refresh: bool = False,
+    deprecated_verification_retirement: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    special_requests = sum(
+        request is not None and request is not False
+        for request in (
+            governance_resume,
+            governance_refresh,
+            deprecated_verification_retirement,
+        )
+    )
+    if special_requests > 1:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(refresh, resume, and verification retirement are mutually exclusive)."
+        )
+    if (governance_refresh or deprecated_verification_retirement is not None) and updates:
+        raise CronJobGovernanceError(
+            "Cron job persistence needs administrator review "
+            "(refresh and verification retirement require an otherwise unchanged Job)."
+        )
+    if governance_resume is not None:
+        parsed_resume = _parse_resume_package(governance_resume, operation="update")
+        if str(parsed_resume.job.get("id") or "") != str(job_id or ""):
+            raise CronJobGovernanceError(
+                "Cron job persistence needs administrator review "
+                "(resume job id mismatch)."
+            )
+        post_effects: List[Dict[str, Any]] = []
+        recovery_claims: List[Dict[str, Any]] = []
+        with contextlib.ExitStack() as stack:
+            stack.callback(
+                _dispatch_post_cron_persist_effects,
+                "update",
+                post_effects,
+            )
+            stack.callback(
+                _dispatch_claimed_cron_recovery_effects,
+                "update",
+                recovery_claims,
+            )
+            stack.enter_context(_jobs_lock(require_cross_process=True))
+            jobs = load_jobs(repair_recoverable=False)
+            resolution = _resolve_resume(parsed_resume, existing_jobs=jobs)
+            candidate = resolution.candidate
+            if resolution.recovery_context is not None:
+                replay = _load_recovery_replay(
+                    resolution.recovery_context,
+                    resolution.candidate,
+                )
+                if replay is not None:
+                    claim = _claim_cron_recovery_dispatch(
+                        str(resolution.recovery_context["recovery_id"])
+                    )
+                    if claim is not None:
+                        recovery_claims.append(claim)
+                    raise replay
+            if resolution.disposition == "blocked_unreconstructable":
+                raise _unreconstructable_recovery_error(resolution)
+            target = next(
+                (index for index, item in enumerate(jobs) if item.get("id") == job_id),
+                None,
+            )
+            if target is None:
+                return None
+            if jobs[target].get("active_run_outcome_claim") is not None:
+                raise CronJobGovernanceError(
+                    "Cron job authorization cannot change while a signed run is active."
+                )
+            try:
+                governed, disposition = _apply_cron_persist_governance(
+                    "update",
+                    candidate,
+                    jobs,
+                    recovery_context=resolution.recovery_context,
+                )
+            except CronJobGovernanceError as exc:
+                if (
+                    resolution.disposition == "recoverable_spec_drift"
+                    and isinstance(exc.decision.get("recovery_registration"), dict)
+                ):
+                    recovery_error = _record_recovery_error(resolution, exc.decision)
+                    claim = _claim_cron_recovery_dispatch(
+                        str(resolution.recovery_context["recovery_id"])
+                    )
+                    if claim is not None:
+                        recovery_claims.append(claim)
+                    raise recovery_error from exc
+                post_effects.extend(_post_cron_persist_effects(exc))
+                raise
+            if resolution.disposition == "recoverable_spec_drift":
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review "
+                    "(resume recovery was not blocked)."
+                )
+            if disposition == "already_persisted":
+                return _normalize_job_record(governed)
+            jobs[target] = governed
+            _save_jobs_unlocked(jobs)
+            return _normalize_job_record(governed)
+
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -1515,11 +4191,70 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
 
-    with _jobs_lock():
-        jobs = load_jobs()
+    post_effects: List[Dict[str, Any]] = []
+    with contextlib.ExitStack() as stack:
+        stack.callback(_dispatch_post_cron_persist_effects, "update", post_effects)
+        stack.enter_context(_jobs_lock())
+        jobs = load_jobs(
+            repair_recoverable=not (
+                governance_refresh
+                or deprecated_verification_retirement is not None
+            )
+        )
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+
+            special_operation = (
+                governance_refresh
+                or deprecated_verification_retirement is not None
+            )
+            if special_operation and not _cron_persist_governance_active(job):
+                raise CronJobGovernanceError(
+                    "Cron job persistence needs administrator review "
+                    "(governance unavailable)."
+                )
+            if special_operation and job.get("active_run_outcome_claim") is not None:
+                raise CronJobGovernanceError(
+                    "Cron job authorization cannot change while a signed run is active."
+                )
+
+            if deprecated_verification_retirement is not None:
+                request = deprecated_verification_retirement
+                receipt = job.get("creation_governance_receipt")
+                command = job.get("verification_command")
+                expected_keys = {
+                    "schema_version",
+                    "profile_id",
+                    "job_revision",
+                    "command_sha256",
+                }
+                command_sha256 = (
+                    "sha256:" + hashlib.sha256(command.encode("utf-8")).hexdigest()
+                    if isinstance(command, str) and command
+                    else ""
+                )
+                expected_command = (
+                    f"HERMES_HOME={_current_cron_store().cron_dir.parent.resolve()} "
+                    f"hermes cron status {job_id}"
+                )
+                if (
+                    not isinstance(request, dict)
+                    or set(request) != expected_keys
+                    or request.get("schema_version")
+                    != "cron-verification-retirement/v1"
+                    or not isinstance(receipt, dict)
+                    or receipt.get("cron_job_id") != job_id
+                    or request.get("profile_id") != receipt.get("profile_id")
+                    or request.get("job_revision") != receipt.get("receipt_id")
+                    or request.get("command_sha256") != command_sha256
+                    or command != expected_command
+                    or job.get("verification_command_mode") not in (None, "")
+                ):
+                    raise CronJobGovernanceError(
+                        "Cron job persistence needs administrator review "
+                        "(deprecated verification retirement precondition mismatch)."
+                    )
 
             # Validate / normalize workdir if present in updates.  Empty string
             # or None both mean "clear the field" (restore old behaviour).
@@ -1530,17 +4265,35 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            skill_fields_changed = "skills" in updates or "skill" in updates
             previous_inference_axes = _normalized_inference_axes(job)
-            updated = _apply_skill_fields({**job, **updates})
+            if special_operation:
+                updated = copy.deepcopy(job)
+            else:
+                updated = (
+                    _apply_skill_fields({**job, **updates})
+                    if skill_fields_changed
+                    else {**job, **updates}
+                )
+            if deprecated_verification_retirement is not None:
+                updated.pop("verification_command", None)
+                updated.pop("verification_command_mode", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
 
-            if "skills" in updates or "skill" in updates:
-                normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
+            if skill_fields_changed:
+                requested_skills = _normalize_skill_list(
+                    updates.get("skill") if "skill" in updates else None,
+                    updates.get("skills") if "skills" in updates else None,
+                )
+                normalized_skills, skill_bindings = _resolve_skill_fields(
+                    requested_skills
+                )
                 updated["skills"] = normalized_skills
                 updated["skill"] = normalized_skills[0] if normalized_skills else None
+                updated["skill_bindings"] = skill_bindings
 
             if schedule_changed:
                 updated_schedule = updated["schedule"]
@@ -1589,7 +4342,12 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["provider_snapshot"] = provider_snapshot
                 updated["model_snapshot"] = model_snapshot
 
-            if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
+            if (
+                not special_operation
+                and updated.get("enabled", True)
+                and updated.get("state") != "paused"
+                and not updated.get("next_run_at")
+            ):
                 next_run = compute_next_run(updated["schedule"])
                 if next_run is None and updated["schedule"].get("kind") == "once":
                     run_at = updated["schedule"].get("run_at", "unknown")
@@ -1599,8 +4357,34 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     )
                 updated["next_run_at"] = next_run
 
+            material_changed = (
+                governance_refresh
+                or _cron_governance_material_changed(job, updated)
+            )
+            if material_changed:
+                if job.get("active_run_outcome_claim") is not None:
+                    raise CronJobGovernanceError(
+                        "Cron job authorization cannot change while a signed run is active."
+                    )
+                governance_active = _cron_persist_governance_active(updated)
+                strict_context = (
+                    _jobs_lock(require_cross_process=True)
+                    if governance_active
+                    else contextlib.nullcontext()
+                )
+                with strict_context:
+                    try:
+                        updated, disposition = _apply_cron_persist_governance(
+                            "update", updated, jobs
+                        )
+                    except CronJobGovernanceError as exc:
+                        post_effects.extend(_post_cron_persist_effects(exc))
+                        raise
+                    if disposition != "allow_write":
+                        return _normalize_job_record(updated)
+
             jobs[i] = updated
-            save_jobs(jobs)
+            _save_jobs_unlocked(jobs)
             return _normalize_job_record(jobs[i])
     return None
 
@@ -1665,29 +4449,46 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
-    job = resolve_job_ref(job_id)
-    if not job:
-        return False
-    canonical_id = job["id"]
-    with _jobs_lock():
+    with _jobs_lock(require_cross_process=True):
         jobs = load_jobs()
-        original_len = len(jobs)
-        jobs = [j for j in jobs if j["id"] != canonical_id]
-        if len(jobs) < original_len:
-            # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
-            # left over from before the create-time guard) fails closed without
-            # half-applying the removal.
-            job_output_dir = _job_output_dir(canonical_id)
-            save_jobs(jobs)
-            # Clean up output directory to prevent orphaned dirs accumulating
-            if job_output_dir.exists():
-                shutil.rmtree(job_output_dir)
-            return True
-    return False
+        job = next((item for item in jobs if item.get("id") == job_id), None)
+        if job is None:
+            name_matches = [
+                item
+                for item in jobs
+                if str(item.get("name") or "").lower() == str(job_id or "").lower()
+            ]
+            if len(name_matches) > 1:
+                raise AmbiguousJobReference(
+                    job_id,
+                    [_normalize_job_record(item) for item in name_matches],
+                )
+            job = name_matches[0] if name_matches else None
+        if job is None:
+            return False
+        if job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) is not None:
+            raise CronJobGovernanceError(
+                "Cron job cannot be removed while a signed run is active."
+            )
+        canonical_id = job["id"]
+        # Resolve the output dir BEFORE saving so a legacy unsafe ID (e.g.
+        # left over from before the create-time guard) fails closed without
+        # half-applying the removal.
+        job_output_dir = _job_output_dir(canonical_id)
+        retained = [item for item in jobs if item["id"] != canonical_id]
+        _save_jobs_unlocked(retained)
+        # Clean up output directory to prevent orphaned dirs accumulating.
+        if job_output_dir.exists():
+            shutil.rmtree(job_output_dir)
+        return True
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 runtime_admission_receipt: Optional[Dict[str, Any]] = None,
+                 delivery_receipt: Optional[Dict[str, Any]] = None,
+                 run_outcome_receipt: Optional[Dict[str, Any]] = None,
+                 run_outcome_claim: Optional[Dict[str, Any]] = None):
     """
     Mark a job as having been run.
     
@@ -1696,17 +4497,95 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``runtime_admission_receipt`` records a fail-closed pre-execution decision.
+    ``delivery_receipt`` and ``run_outcome_receipt`` contain only redacted,
+    revision-bound terminal proof. The claim is the CAS owner for that write.
     """
-    with _jobs_lock():
+    if runtime_admission_receipt is not None:
+        runtime_admission_receipt = _validated_runtime_admission_receipt(
+            runtime_admission_receipt
+        )
+    if delivery_receipt is not None:
+        delivery_receipt = _validated_delivery_receipt(delivery_receipt)
+    if run_outcome_receipt is not None:
+        run_outcome_receipt = _validated_run_outcome_receipt(run_outcome_receipt)
+    if run_outcome_claim is not None:
+        run_outcome_claim = _validated_run_outcome_claim(run_outcome_claim)
+    if run_outcome_receipt is not None and run_outcome_claim is None:
+        raise ValueError("cron run outcome receipt requires its pre-run claim")
+    with _jobs_lock(require_cross_process=run_outcome_claim is not None):
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                creation = job.get("creation_governance_receipt")
+                if isinstance(creation, dict) and run_outcome_claim is None:
+                    logger.warning(
+                        "mark_job_run: signed job_id %s requires its active run outcome claim; skipping save",
+                        job_id,
+                    )
+                    return False
+                if run_outcome_claim is not None:
+                    if (
+                        not isinstance(creation, dict)
+                        or creation.get("receipt_id") != run_outcome_claim.get("job_revision")
+                        or job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD) != run_outcome_claim
+                        or not _run_outcome_claim_is_active(run_outcome_claim)
+                    ):
+                        logger.warning(
+                            "mark_job_run: stale run outcome claim for job_id %s; skipping save",
+                            job_id,
+                        )
+                        return False
+                    if run_outcome_receipt is not None and any(
+                        run_outcome_receipt.get(field) != run_outcome_claim.get(field)
+                        for field in (
+                            "profile_id",
+                            "job_id",
+                            "job_revision",
+                            "run_id",
+                            "implementation_hash",
+                        )
+                    ):
+                        raise ValueError("cron run outcome receipt does not match its claim")
+                    if run_outcome_receipt is not None:
+                        expected_checkpoint = _cron_checkpoint_invariant_hash(
+                            job,
+                            run_outcome_claim,
+                            success=success,
+                        )
+                        expected_delivery = _cron_delivery_receipt_hash(
+                            run_outcome_claim["run_id"],
+                            delivery_receipt,
+                        )
+                        if (
+                            run_outcome_receipt.get("terminal_state")
+                            != ("success" if success else "failed")
+                            or expected_checkpoint != run_outcome_receipt.get("checkpoint_invariant_hash")
+                            or expected_delivery != run_outcome_receipt.get("delivery_receipt_hash")
+                        ):
+                            raise ValueError("cron run outcome receipt does not match its claim")
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                job[_CRON_DELIVERY_RECEIPT_FIELD] = (
+                    copy.deepcopy(delivery_receipt)
+                    if delivery_receipt is not None
+                    else None
+                )
+                job[_CRON_RUN_OUTCOME_RECEIPT_FIELD] = (
+                    copy.deepcopy(run_outcome_receipt)
+                    if run_outcome_receipt is not None
+                    else None
+                )
+                job[_CRON_RUN_OUTCOME_CLAIM_FIELD] = None
+                job[_CRON_RUNTIME_ADMISSION_RECEIPT_FIELD] = (
+                    copy.deepcopy(runtime_admission_receipt)
+                    if runtime_admission_receipt is not None
+                    else None
+                )
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1738,10 +4617,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
                     # Check if we've hit the repeat limit
                     if times is not None and times > 0 and completed >= times:
-                        # Remove the job (limit reached)
-                        jobs.pop(i)
+                        # Limit reached: retain the record as a terminal
+                        # completion instead of popping it. Deleting the job
+                        # here discarded the last_status / last_error /
+                        # last_delivery_error written above — a finished
+                        # one-shot vanished from `cronjob list` with no
+                        # inspectable outcome, and a failed delivery was
+                        # invisible. Mirror the terminal shape of the
+                        # next_run_at-is-None branch below; the retention
+                        # sweep prunes these after
+                        # COMPLETED_ONESHOT_RETENTION_DAYS.
+                        job["enabled"] = False
+                        job["state"] = "completed"
+                        job["next_run_at"] = None
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -1776,9 +4666,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
@@ -1825,7 +4716,238 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
         )
 
 
-def claim_dispatch(job_id: str) -> bool:
+def claim_operational_notice_delivery(
+    job_id: str,
+    idempotency_key: str,
+    *,
+    now_epoch: Optional[int] = None,
+    lease_seconds: int = OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
+) -> Dict[str, Any]:
+    """Claim one notice with cross-process lease recovery and no capacity eviction."""
+    key = str(idempotency_key or "").strip()
+    if (
+        not key
+        or len(key) > 512
+        or isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or lease_seconds <= 0
+        or lease_seconds > 86400
+    ):
+        return {"status": "invalid_key", "claimed": False}
+    started = time.monotonic()
+    epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+    owner = f"operational-notice-owner:{uuid.uuid4().hex}"
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            receipts = job.get("operational_notice_receipts")
+            receipts = dict(receipts) if isinstance(receipts, dict) else {}
+            existing = receipts.get(key)
+            if isinstance(existing, dict):
+                status = str(existing.get("status") or "claimed")
+                lease_expires = existing.get("lease_expires_at_epoch")
+                if status not in {"claimed", "uncertain"} or (
+                    status == "claimed"
+                    and
+                    isinstance(lease_expires, int) and epoch < lease_expires
+                ):
+                    return {"status": status, "claimed": False}
+                recovery_count = int(existing.get("recovery_count") or 0) + 1
+                transport_request_id = str(
+                    existing.get("transport_request_id") or ""
+                )
+            else:
+                recovery_count = 0
+                transport_request_id = ""
+            now = _hermes_now().isoformat()
+            receipts[key] = {
+                "status": "claimed",
+                "claimed_at": now,
+                "updated_at": now,
+                "claim_owner": owner,
+                "claim_heartbeat_at_epoch": epoch,
+                "lease_expires_at_epoch": epoch + lease_seconds,
+                "recovery_count": recovery_count,
+                "transport_request_id": transport_request_id,
+                "caller": "cron_scheduler",
+                "parameters": {"idempotency_key": key},
+                "result": {"status": "claimed"},
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+            job["operational_notice_receipts"] = receipts
+            _save_jobs_unlocked(jobs)
+            return {
+                "status": "claimed",
+                "claimed": True,
+                "claim_owner": owner,
+                "recovered": recovery_count > 0,
+                "transport_request_id": transport_request_id,
+            }
+    return {"status": "job_not_found", "claimed": False}
+
+
+def bind_operational_notice_transport_request(
+    job_id: str,
+    idempotency_key: str,
+    *,
+    claim_owner: str,
+    transport_request_id: str,
+) -> Dict[str, Any]:
+    """CAS-bind one stable outbox request to the current notice owner."""
+    key = str(idempotency_key or "").strip()
+    request_id = str(transport_request_id or "").strip()
+    if not key or not request_id or len(request_id) > 512:
+        return {"status": "invalid_request"}
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            receipts = job.get("operational_notice_receipts")
+            if not isinstance(receipts, dict) or not isinstance(receipts.get(key), dict):
+                return {"status": "not_claimed"}
+            current = receipts[key]
+            if current.get("status") != "claimed" or current.get("claim_owner") != claim_owner:
+                return {"status": "ownership_lost"}
+            existing = str(current.get("transport_request_id") or "")
+            if existing and existing != request_id:
+                return {"status": "request_conflict"}
+            current = {
+                **current,
+                "transport_request_id": request_id,
+                "updated_at": _hermes_now().isoformat(),
+            }
+            receipts[key] = current
+            job["operational_notice_receipts"] = receipts
+            _save_jobs_unlocked(jobs)
+            return {"status": "bound", "transport_request_id": request_id}
+    return {"status": "job_not_found"}
+
+
+def heartbeat_operational_notice_delivery(
+    job_id: str,
+    idempotency_key: str,
+    *,
+    claim_owner: str,
+    transport_request_id: str = "",
+    now_epoch: Optional[int] = None,
+    lease_seconds: int = OPERATIONAL_NOTICE_CLAIM_LEASE_SECONDS,
+) -> Dict[str, Any]:
+    """Renew the current owner without permitting request identity drift."""
+    key = str(idempotency_key or "").strip()
+    request_id = str(transport_request_id or "").strip()
+    epoch = int(time.time()) if now_epoch is None else int(now_epoch)
+    if not key or lease_seconds <= 0 or lease_seconds > 86400:
+        return {"status": "invalid_claim"}
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            receipts = job.get("operational_notice_receipts")
+            if not isinstance(receipts, dict) or not isinstance(receipts.get(key), dict):
+                return {"status": "not_claimed"}
+            current = receipts[key]
+            if current.get("status") != "claimed" or current.get("claim_owner") != claim_owner:
+                return {"status": "ownership_lost"}
+            bound_request = str(current.get("transport_request_id") or "")
+            if request_id and bound_request and request_id != bound_request:
+                return {"status": "request_conflict"}
+            current = {
+                **current,
+                "claim_heartbeat_at_epoch": epoch,
+                "lease_expires_at_epoch": epoch + lease_seconds,
+                "updated_at": _hermes_now().isoformat(),
+            }
+            receipts[key] = current
+            job["operational_notice_receipts"] = receipts
+            _save_jobs_unlocked(jobs)
+            return {
+                "status": "claimed",
+                "claim_owner": claim_owner,
+                "lease_expires_at_epoch": current["lease_expires_at_epoch"],
+                "transport_request_id": bound_request,
+            }
+    return {"status": "job_not_found"}
+
+
+def mark_operational_notice_delivery(
+    job_id: str,
+    idempotency_key: str,
+    status: str,
+    *,
+    claim_owner: str,
+    transport_request_id: str = "",
+    confirmed_transport_receipt_id: str = "",
+) -> Dict[str, Any]:
+    """CAS a terminal fact; uncertain remains recoverable and cannot hide sent."""
+    if status not in {"sent", "failed", "uncertain"}:
+        return {"status": "invalid_status"}
+    key = str(idempotency_key or "").strip()
+    started = time.monotonic()
+    with _jobs_lock(require_cross_process=True):
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            receipts = job.get("operational_notice_receipts")
+            if not isinstance(receipts, dict) or not isinstance(receipts.get(key), dict):
+                return {"status": "not_claimed"}
+            if receipts[key].get("status") == "sent":
+                return {"status": "sent"}
+            if (
+                receipts[key].get("status") != "claimed"
+                or receipts[key].get("claim_owner") != claim_owner
+            ):
+                return {"status": "ownership_lost"}
+            bound_request = str(receipts[key].get("transport_request_id") or "")
+            supplied_request = str(transport_request_id or "")
+            if status == "sent" and (
+                not bound_request or bound_request != supplied_request
+            ):
+                return {"status": "request_mismatch"}
+            if status != "sent" and (bound_request or supplied_request) and (
+                bound_request != supplied_request
+            ):
+                return {"status": "request_mismatch"}
+            if status == "sent" and not str(confirmed_transport_receipt_id or "").strip():
+                return {"status": "confirmed_receipt_required"}
+            if status == "uncertain":
+                receipts[key] = {
+                    **receipts[key],
+                    "updated_at": _hermes_now().isoformat(),
+                    "result": {"status": "uncertain"},
+                    "duration_ms": int((time.monotonic() - started) * 1000),
+                }
+                job["operational_notice_receipts"] = receipts
+                _save_jobs_unlocked(jobs)
+                return {"status": "uncertain", "terminal": False}
+            receipts[key] = {
+                **receipts[key],
+                "status": status,
+                "updated_at": _hermes_now().isoformat(),
+                "lease_expires_at_epoch": None,
+                "result": {"status": status},
+                "confirmed_transport_receipt_id": (
+                    str(confirmed_transport_receipt_id)
+                    if status == "sent"
+                    else ""
+                ),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+            job["operational_notice_receipts"] = receipts
+            _save_jobs_unlocked(jobs)
+            return {"status": status}
+    return {"status": "job_not_found"}
+
+
+def claim_dispatch(
+    job_id: str,
+    *,
+    run_outcome_claim: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Atomically claim a finite one-shot job dispatch BEFORE execution.
 
     Increments ``repeat.completed`` under the cross-process jobs lock and
@@ -1842,11 +4964,33 @@ def claim_dispatch(job_id: str) -> bool:
     Recurring jobs (they use ``advance_next_run``) and infinite-repeat / no-repeat
     jobs are left unchanged and always allowed to proceed.
     """
-    with _jobs_lock():
+    if run_outcome_claim is not None:
+        run_outcome_claim = _validated_run_outcome_claim(run_outcome_claim)
+    with _jobs_lock(require_cross_process=run_outcome_claim is not None):
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+            creation = job.get("creation_governance_receipt")
+            if creation is not None and run_outcome_claim is None:
+                logger.warning(
+                    "claim_dispatch: signed job_id %s requires an exact run outcome claim; refusing dispatch",
+                    job_id,
+                )
+                return False
+            if run_outcome_claim is not None:
+                if (
+                    not isinstance(creation, dict)
+                    or creation.get("receipt_id")
+                    != run_outcome_claim.get("job_revision")
+                    or job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD)
+                    != run_outcome_claim
+                ):
+                    logger.warning(
+                        "claim_dispatch: stale run outcome claim for job_id %s; refusing dispatch",
+                        job_id,
+                    )
+                    return False
             if job.get("schedule", {}).get("kind") != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
             repeat = job.get("repeat")
@@ -1857,13 +5001,29 @@ def claim_dispatch(job_id: str) -> bool:
                 return True  # infinite — always dispatch
             completed = repeat.get("completed", 0)
             if completed >= times:
-                # Already dispatched the max number of times (e.g. a prior
-                # tick claimed then died before mark_job_run could remove it).
-                # Clean up so it stops appearing as due on every tick.
+                # Already dispatched the max number of times.
+                if job.get("last_run_at") is not None:
+                    # A prior run completed normally (e.g. mark_job_run raced
+                    # with this tick). Retain the terminal record — same shape
+                    # as mark_job_run's repeat-limit branch — instead of
+                    # deleting the job and its final status/delivery error.
+                    job["enabled"] = False
+                    job["state"] = "completed"
+                    job["next_run_at"] = None
+                    save_jobs(jobs)
+                    logger.info(
+                        "Job '%s': dispatch limit reached (%d/%d) — marking completed",
+                        job.get("name", job.get("id", "?")),
+                        completed,
+                        times,
+                    )
+                    return False
+                # A prior tick claimed the dispatch then died before the run
+                # completed (#73973) — a genuinely wedged claim. Remove it so
+                # it stops appearing as due, and leave an operator-visible
+                # diagnostic instead of vanishing silently.
                 jobs.pop(i)
                 save_jobs(jobs)
-                # If the claimed run never completed (#73973), leave an
-                # operator-visible diagnostic instead of vanishing silently.
                 _write_wedged_oneshot_diagnostic(job)
                 logger.info(
                     "Job '%s': dispatch limit reached (%d/%d) — removing",
@@ -1883,8 +5043,14 @@ def claim_dispatch(job_id: str) -> bool:
             )
             return True
 
+        if run_outcome_claim is not None:
+            logger.warning(
+                "claim_dispatch: exact run outcome claim has no stored job_id %s; refusing dispatch",
+                job_id,
+            )
+            return False
         logger.debug(
-            "claim_dispatch: job_id %s not in store — proceeding without claim "
+            "claim_dispatch: unsigned job_id %s not in store — proceeding "
             "(handed-in job dict; nothing to persist a claim against)",
             job_id,
         )
@@ -1923,6 +5089,43 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
     return False
 
 
+def advance_next_runs(job_ids) -> int:
+    """Batch form of :func:`advance_next_run` for the due-dispatch loop.
+
+    One ``load_jobs()`` + at most one ``save_jobs()`` for the whole due
+    set, instead of one of each per job — the per-job form costs
+    O(N loads + N saves) for N due jobs (~110 ms at N=50, measured), the
+    batch form O(1 + 1) (~2 ms). ``job_ids`` may contain ids of one-shot
+    or unknown jobs; they are skipped exactly as the per-job form skips
+    them. Returns the number of jobs whose ``next_run_at`` was advanced.
+
+    Crash semantics: the batch persists once at the end, so a crash
+    mid-batch re-fires the whole set on restart (at-least-once burst)
+    rather than advancing a prefix — acceptable given the sub-10ms window,
+    and identical to the per-job form once the batch completes.
+    """
+    ids = set(job_ids)
+    if not ids:
+        return 0
+    with _jobs_lock():
+        jobs = load_jobs()
+        now = _hermes_now().isoformat()
+        advanced = 0
+        for job in jobs:
+            if job["id"] not in ids:
+                continue
+            kind = job.get("schedule", {}).get("kind")
+            if kind not in {"cron", "interval"}:
+                continue
+            new_next = compute_next_run(job["schedule"], now)
+            if new_next and new_next != job.get("next_run_at"):
+                job["next_run_at"] = new_next
+                advanced += 1
+        if advanced:
+            save_jobs(jobs)
+        return advanced
+
+
 def advance_next_run(job_id: str) -> bool:
     """Preemptively advance next_run_at for a recurring job before execution.
 
@@ -1935,21 +5138,9 @@ def advance_next_run(job_id: str) -> bool:
 
     Returns True if next_run_at was advanced, False otherwise.
     """
-    with _jobs_lock():
-        jobs = load_jobs()
-        for job in jobs:
-            if job["id"] == job_id:
-                kind = job.get("schedule", {}).get("kind")
-                if kind not in {"cron", "interval"}:
-                    return False
-                now = _hermes_now().isoformat()
-                new_next = compute_next_run(job["schedule"], now)
-                if new_next and new_next != job.get("next_run_at"):
-                    job["next_run_at"] = new_next
-                    save_jobs(jobs)
-                    return True
-                return False
-        return False
+    # >= 1 (not == 1): a corrupted jobs file with duplicate ids advances
+    # every matching record; the wrapper still reports the advance.
+    return advance_next_runs([job_id]) >= 1
 
 
 def _machine_id() -> str:
@@ -2022,6 +5213,82 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             save_jobs(jobs)
             return True
         return False
+
+
+# Completed one-shot job records are retained in jobs.json (final status +
+# delivery error stay inspectable via `cronjob list`) instead of being deleted
+# at completion, then pruned by _sweep_completed_oneshots once they age out.
+COMPLETED_ONESHOT_RETENTION_DAYS = 7
+
+
+def _completed_oneshot_retention_days() -> float:
+    """Resolve the completed one-shot retention window from config.
+
+    ``cron.completed_retention_days`` (number, default
+    ``COMPLETED_ONESHOT_RETENTION_DAYS``). A non-positive value disables the
+    sweep, retaining completed one-shot records indefinitely.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return float(
+            cron_cfg.get(
+                "completed_retention_days", COMPLETED_ONESHOT_RETENTION_DAYS
+            )
+        )
+    except Exception:
+        return float(COMPLETED_ONESHOT_RETENTION_DAYS)
+
+
+def _sweep_completed_oneshots(raw_jobs: List[Dict[str, Any]], now: datetime) -> bool:
+    """Prune terminal ``state == "completed"`` one-shot records past retention.
+
+    Mutates *raw_jobs* in place; returns True when anything was removed (the
+    caller persists). Only one-shot (``schedule.kind == "once"``) records in
+    the terminal completed state are candidates; recurring jobs and non-
+    terminal one-shots are never touched. Age is measured from
+    ``last_run_at`` — a completed record without a parseable ``last_run_at``
+    is kept (never guess a record into deletion).
+    """
+    retention_days = _completed_oneshot_retention_days()
+    if retention_days <= 0:
+        return False
+    cutoff = now - timedelta(days=retention_days)
+    removed = False
+    for rj in list(raw_jobs):
+        try:
+            if rj.get("state") != "completed":
+                continue
+            schedule = rj.get("schedule")
+            kind = schedule.get("kind") if isinstance(schedule, dict) else None
+            if kind != "once":
+                continue
+            last_run = rj.get("last_run_at")
+            if not isinstance(last_run, str):
+                continue
+            try:
+                last_run_dt = _ensure_aware(datetime.fromisoformat(last_run))
+            except Exception:
+                continue
+            if last_run_dt >= cutoff:
+                continue
+            raw_jobs.remove(rj)
+            removed = True
+            logger.info(
+                "Job '%s': pruning completed one-shot record "
+                "(finished %s, retention %.1f days)",
+                rj.get("name", rj.get("id", "?")),
+                last_run,
+                retention_days,
+            )
+        except Exception:
+            logger.debug(
+                "Retention sweep skipped malformed job record %r",
+                rj.get("id", "?"),
+                exc_info=True,
+            )
+    return removed
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
@@ -2143,6 +5410,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # (derived from HERMES_CRON_TIMEOUT). See _oneshot_run_claim_ttl_seconds.
     _run_claim_ttl = _oneshot_run_claim_ttl_seconds()
 
+    # Retention sweep: completed one-shots are retained (so their final
+    # status / delivery error stay inspectable via `cronjob list`) instead of
+    # being deleted on completion, but they must not accumulate in jobs.json
+    # forever. Prune terminal one-shot records older than the retention
+    # window each scan.
+    if _sweep_completed_oneshots(raw_jobs, now):
+        needs_save = True
+        jobs = [j for j in jobs if any(rj.get("id") == j.get("id") for rj in raw_jobs)]
+
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
         # unexpected job record must never abort the whole scan. The id /
@@ -2153,6 +5429,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         try:
             if not job.get("enabled", True):
                 continue
+            active_outcome_claim = job.get(_CRON_RUN_OUTCOME_CLAIM_FIELD)
+            if active_outcome_claim is not None:
+                try:
+                    if _run_outcome_claim_is_active(active_outcome_claim):
+                        continue
+                except ValueError:
+                    # Invalid durable evidence belongs to the existing HAK
+                    # repair path and must never be dispatched automatically.
+                    continue
 
             # Cross-process running-claim guard (#59229): if another scheduler
             # process already claimed this one-shot and its run is still in flight
@@ -2583,15 +5868,17 @@ def rewrite_skill_refs(
             if not mapped and not dropped:
                 continue
 
-            job["skills"] = new_skills
-            job["skill"] = new_skills[0] if new_skills else None
+            canonical_skills, skill_bindings = _resolve_skill_fields(new_skills)
+            job["skills"] = canonical_skills
+            job["skill"] = canonical_skills[0] if canonical_skills else None
+            job["skill_bindings"] = skill_bindings
             changed = True
 
             rewrites.append({
                 "job_id": job.get("id"),
                 "job_name": job.get("name") or job.get("id"),
                 "before": list(skills_before),
-                "after": list(new_skills),
+                "after": list(canonical_skills),
                 "mapped": mapped,
                 "dropped": dropped,
             })
@@ -2606,4 +5893,222 @@ def rewrite_skill_refs(
             "rewrites": rewrites,
             "jobs_updated": len(rewrites),
             "jobs_scanned": len(jobs),
+        }
+
+
+_SKILL_BINDING_MIGRATION_SCHEMA = "cron-skill-binding-migration/v1"
+
+
+def _read_jobs_document(path: Path) -> Tuple[bytes, Dict[str, Any]]:
+    if not path.exists():
+        return b"", {"jobs": []}
+    raw = path.read_bytes()
+    try:
+        document = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cron database corrupted: {path} is not valid JSON") from exc
+    if isinstance(document, list):
+        document = {"jobs": document}
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), list):
+        raise RuntimeError(
+            "Cron database corrupted: expected {'jobs': [...] } for skill migration"
+        )
+    return raw, document
+
+
+def _skill_binding_state(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "skill": copy.deepcopy(job.get("skill")),
+        "skills": copy.deepcopy(job.get("skills")),
+        "skill_bindings": copy.deepcopy(job.get("skill_bindings")),
+    }
+
+
+def _resolved_skill_binding_state(
+    job: Dict[str, Any], profile_home: Path
+) -> Dict[str, Any]:
+    selectors = _normalize_skill_list(job.get("skill"), job.get("skills"))
+    canonical, bindings = _resolve_skill_fields(
+        selectors,
+        profile_home=profile_home,
+    )
+    return {
+        "skill": canonical[0] if canonical else None,
+        "skills": canonical,
+        "skill_bindings": bindings,
+    }
+
+
+def plan_skill_binding_migration(
+    profile_home: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Build a read-only canonical-binding migration plan for one profile."""
+    profile = Path(profile_home or _active_profile_home()).expanduser().resolve(
+        strict=False
+    )
+    jobs_file = profile / "cron" / "jobs.json"
+    raw, document = _read_jobs_document(jobs_file)
+    changes: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    for job in document["jobs"]:
+        if not isinstance(job, dict):
+            errors.append({"job_id": "", "reason": "job_record_invalid"})
+            continue
+        before = _skill_binding_state(job)
+        selectors = _normalize_skill_list(job.get("skill"), job.get("skills"))
+        if not selectors and "skill_bindings" not in job:
+            continue
+        try:
+            after = _resolved_skill_binding_state(job, profile)
+        except Exception as exc:
+            errors.append(
+                {
+                    "job_id": str(job.get("id") or ""),
+                    "reason": getattr(exc, "code", type(exc).__name__),
+                    "detail": str(exc),
+                }
+            )
+            continue
+        if before != after:
+            changes.append(
+                {
+                    "job_id": str(job.get("id") or ""),
+                    "before": before,
+                    "after": after,
+                }
+            )
+
+    return {
+        "schema_version": _SKILL_BINDING_MIGRATION_SCHEMA,
+        "profile_home": str(profile),
+        "jobs_file": str(jobs_file),
+        "store_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        "jobs_scanned": len(document["jobs"]),
+        "changes": changes,
+        "errors": errors,
+        "applicable": bool(changes) and not errors,
+    }
+
+
+def _migration_already_applied(
+    jobs: List[Dict[str, Any]], changes: List[Dict[str, Any]]
+) -> bool:
+    by_id = {
+        str(job.get("id") or ""): job for job in jobs if isinstance(job, dict)
+    }
+    return bool(changes) and all(
+        change.get("job_id") in by_id
+        and _skill_binding_state(by_id[change["job_id"]]) == change.get("after")
+        for change in changes
+    )
+
+
+def apply_skill_binding_migration(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply one unchanged, error-free plan after a durable store backup."""
+    if not isinstance(plan, dict) or plan.get("schema_version") != _SKILL_BINDING_MIGRATION_SCHEMA:
+        raise ValueError("invalid skill binding migration plan")
+    if plan.get("errors"):
+        raise ValueError("skill binding migration plan contains resolution errors")
+
+    profile = Path(str(plan.get("profile_home") or "")).expanduser().resolve(
+        strict=False
+    )
+    jobs_file = profile / "cron" / "jobs.json"
+    if str(jobs_file) != str(plan.get("jobs_file") or ""):
+        raise ValueError("skill binding migration plan path mismatch")
+    changes = plan.get("changes")
+    if not isinstance(changes, list):
+        raise ValueError("skill binding migration plan changes are invalid")
+    if not changes:
+        return {
+            "status": "noop",
+            "jobs_updated": 0,
+            "backup_path": None,
+        }
+
+    with use_cron_store(profile), _jobs_lock():
+        raw, document = _read_jobs_document(jobs_file)
+        jobs = document["jobs"]
+        if _migration_already_applied(jobs, changes):
+            return {
+                "status": "already_applied",
+                "jobs_updated": 0,
+                "backup_path": None,
+            }
+
+        current_digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if current_digest != plan.get("store_digest"):
+            raise RuntimeError("cron jobs changed after the skill binding migration plan")
+
+        changes_by_id = {change["job_id"]: change for change in changes}
+        seen: set[str] = set()
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            job_id = str(job.get("id") or "")
+            change = changes_by_id.get(job_id)
+            if change is None:
+                continue
+            if _skill_binding_state(job) != change.get("before"):
+                raise RuntimeError(f"cron job {job_id} changed after migration planning")
+            if _resolved_skill_binding_state(job, profile) != change.get("after"):
+                raise RuntimeError(
+                    f"cron job {job_id} skill resolution changed after migration planning"
+                )
+            job.update(copy.deepcopy(change["after"]))
+            seen.add(job_id)
+        if seen != set(changes_by_id):
+            raise RuntimeError("one or more planned cron jobs are missing")
+
+        digest_token = str(plan["store_digest"]).split(":", 1)[-1][:16]
+        backup_path = jobs_file.with_name(
+            f"{jobs_file.name}.skill-bindings.{digest_token}.bak"
+        )
+        if backup_path.exists():
+            if backup_path.read_bytes() != raw:
+                raise RuntimeError("existing skill binding migration backup does not match")
+        else:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as backup:
+                    backup.write(raw)
+                    backup.flush()
+                    os.fsync(backup.fileno())
+            except BaseException:
+                try:
+                    backup_path.unlink()
+                except OSError:
+                    pass
+                raise
+
+        original_stat = os.stat(jobs_file)
+        try:
+            _save_jobs_unlocked(jobs)
+        except BaseException as save_exc:
+            fd, restore_tmp = tempfile.mkstemp(
+                dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_restore_"
+            )
+            try:
+                with os.fdopen(fd, "wb") as restored:
+                    restored.write(raw)
+                    restored.flush()
+                    os.fsync(restored.fileno())
+                atomic_replace(restore_tmp, jobs_file)
+                _secure_file(jobs_file)
+                _preserve_file_ownership(jobs_file, original_stat)
+            except BaseException as restore_exc:
+                try:
+                    os.unlink(restore_tmp)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    "skill binding migration failed and rollback could not restore jobs.json"
+                ) from restore_exc
+            raise save_exc
+        return {
+            "status": "applied",
+            "jobs_updated": len(changes),
+            "backup_path": str(backup_path),
         }

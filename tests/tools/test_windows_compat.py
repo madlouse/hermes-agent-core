@@ -10,6 +10,7 @@ from pathlib import Path
 
 # Files that must have Windows-safe process management
 GUARDED_FILES = [
+    "cron/scheduler.py",
     "tools/environments/local.py",
     "tools/process_registry.py",
     "tools/code_execution_tool.py",
@@ -60,7 +61,10 @@ class TestStartNewSession:
         assert "preexec_fn" not in source, (
             f"{relpath} still uses preexec_fn; use start_new_session=True instead"
         )
-        assert "start_new_session=True" in source, (
+        assert "start_new_session=True" in source or (
+            relpath == "cron/scheduler.py"
+            and 'popen_kwargs["start_new_session"] = True' in source
+        ), (
             f"{relpath} missing start_new_session=True in Popen call"
         )
 

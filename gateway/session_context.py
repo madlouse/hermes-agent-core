@@ -36,9 +36,12 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+import json
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator
+from dataclasses import dataclass
+from threading import Lock
+from typing import Any, Iterator, Mapping
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -95,6 +98,12 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Per-session cron marker. Unlike the process-global legacy env var, this is
+# scoped to one cron job / inbound session. _UNSET preserves the legacy env
+# fallback for CLI/tests; "1" marks cron; "" explicitly marks non-cron and
+# masks any leaked process env value.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -121,6 +130,98 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Durable cron authorization identity. These values are intentionally kept out
+# of _VAR_MAP: that map is exported to local subprocesses for compatibility,
+# while authorization must remain in-process and task-local so a child process
+# cannot retain or replay a completed job's authority.
+_CRON_JOB_ID: ContextVar = ContextVar("HERMES_CRON_JOB_ID", default=_UNSET)
+_CRON_AUTHORIZED_BEHAVIOR_REF: ContextVar = ContextVar(
+    "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF", default=_UNSET
+)
+_CRON_PROCESS_CHARTER_REF: ContextVar = ContextVar(
+    "HERMES_CRON_PROCESS_CHARTER_REF", default=_UNSET
+)
+_CRON_RISK_TIER: ContextVar = ContextVar("HERMES_CRON_RISK_TIER", default=_UNSET)
+_CRON_IMPLEMENTATION_CATEGORIES: ContextVar = ContextVar(
+    "HERMES_CRON_IMPLEMENTATION_CATEGORIES", default=_UNSET
+)
+_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF: ContextVar = ContextVar(
+    "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF", default=_UNSET
+)
+_CRON_OBSERVED_SCOPE_EVIDENCE_REF: ContextVar = ContextVar(
+    "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF", default=_UNSET
+)
+_CRON_CANDIDATE_HASH: ContextVar = ContextVar(
+    "HERMES_CRON_CANDIDATE_HASH", default=_UNSET
+)
+# Every copied cron/delegate context shares this revocation lease. Resetting the
+# root scope clears it before restoring local tokens, so an agent thread still
+# unwinding after a deadline can no longer read durable authorization identity.
+_CRON_AUTH_SCOPE: ContextVar = ContextVar(
+    "HERMES_CRON_AUTH_SCOPE", default=_UNSET
+)
+
+
+@dataclass(frozen=True)
+class CronRuntimeContext:
+    """Verified in-process identity for one scheduled execution.
+
+    Plugins should consume this API instead of process-global ``os.environ``.
+    ``get_cron_runtime_context()`` returns ``None`` as soon as the scheduler
+    revokes the shared lease, including in worker contexts copied before a
+    timeout.
+    """
+
+    job_id: str
+    authorized_behavior_ref: str
+    process_charter_ref: str
+    risk_tier: str
+    implementation_categories: tuple[str, ...]
+    implementation_path_evidence_ref: str
+    observed_scope_evidence_ref: str
+    candidate_hash: str
+
+
+class _CronRuntimeLease:
+    """One-way activation/revocation fence shared by copied ContextVars."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._active = False
+        self._revoked = False
+
+    def activate(self) -> bool:
+        with self._lock:
+            if self._revoked:
+                return False
+            self._active = True
+            return True
+
+    def revoke(self) -> None:
+        with self._lock:
+            self._active = False
+            self._revoked = True
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._active and not self._revoked
+
+
+_CRON_RUNTIME_CONTEXT: ContextVar = ContextVar(
+    "HERMES_CRON_RUNTIME_CONTEXT", default=_UNSET
+)
+
+_CRON_AUTH_VAR_MAP = {
+    "HERMES_CRON_JOB_ID": _CRON_JOB_ID,
+    "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": _CRON_AUTHORIZED_BEHAVIOR_REF,
+    "HERMES_CRON_PROCESS_CHARTER_REF": _CRON_PROCESS_CHARTER_REF,
+    "HERMES_CRON_RISK_TIER": _CRON_RISK_TIER,
+    "HERMES_CRON_IMPLEMENTATION_CATEGORIES": _CRON_IMPLEMENTATION_CATEGORIES,
+    "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": _CRON_IMPLEMENTATION_PATH_EVIDENCE_REF,
+    "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": _CRON_OBSERVED_SCOPE_EVIDENCE_REF,
+    "HERMES_CRON_CANDIDATE_HASH": _CRON_CANDIDATE_HASH,
+}
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -135,6 +236,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -196,6 +298,112 @@ def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
         _SESSION_ID.set(previous)
 
 
+@contextmanager
+def scoped_cron_authorization(values: Mapping[str, Any]) -> Iterator[None]:
+    """Bind cron authorization identity and restore the prior context on exit.
+
+    Unknown names are ignored so callers can pass a wider metadata mapping.
+    Tokens make this boundary safely nestable and guarantee cleanup on errors;
+    unlike ordinary session variables, an unset authorization value never falls
+    back to process-global environment state.
+    """
+    tokens = set_cron_authorization(values)
+    try:
+        yield
+    finally:
+        reset_cron_authorization(tokens)
+
+
+def new_cron_runtime_lease() -> _CronRuntimeLease:
+    """Create an inactive one-shot lease for scheduler handoff to a worker."""
+    return _CronRuntimeLease()
+
+
+def set_cron_authorization(
+    values: Mapping[str, Any], *, lease: _CronRuntimeLease | None = None
+) -> list[tuple[ContextVar, Any]]:
+    """Bind cron authorization values and return tokens for exact restoration."""
+    active = lease or _CronRuntimeLease()
+    if not active.activate():
+        raise RuntimeError("cron runtime authorization lease is already revoked")
+    raw_categories = values.get("HERMES_CRON_IMPLEMENTATION_CATEGORIES")
+    if isinstance(raw_categories, str):
+        try:
+            parsed_categories = json.loads(raw_categories)
+        except json.JSONDecodeError:
+            parsed_categories = raw_categories.split(",")
+    else:
+        parsed_categories = raw_categories
+    if not isinstance(parsed_categories, (list, tuple, set)):
+        parsed_categories = []
+    categories = tuple(
+        str(item).strip() for item in parsed_categories if str(item or "").strip()
+    )
+    runtime_context = CronRuntimeContext(
+        job_id=str(values.get("HERMES_CRON_JOB_ID") or ""),
+        authorized_behavior_ref=str(
+            values.get("HERMES_CRON_AUTHORIZED_BEHAVIOR_REF") or ""
+        ),
+        process_charter_ref=str(
+            values.get("HERMES_CRON_PROCESS_CHARTER_REF") or ""
+        ),
+        risk_tier=str(values.get("HERMES_CRON_RISK_TIER") or ""),
+        implementation_categories=categories,
+        implementation_path_evidence_ref=str(
+            values.get("HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF") or ""
+        ),
+        observed_scope_evidence_ref=str(
+            values.get("HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF") or ""
+        ),
+        candidate_hash=str(values.get("HERMES_CRON_CANDIDATE_HASH") or ""),
+    )
+    tokens = [
+        (_CRON_AUTH_SCOPE, _CRON_AUTH_SCOPE.set(active)),
+        (
+            _CRON_RUNTIME_CONTEXT,
+            _CRON_RUNTIME_CONTEXT.set(runtime_context),
+        ),
+    ]
+    for name, var in _CRON_AUTH_VAR_MAP.items():
+        value = values.get(name, "")
+        tokens.append((var, var.set(str(value or ""))))
+    return tokens
+
+
+def reset_cron_authorization(tokens: list[tuple[ContextVar, Any]]) -> None:
+    """Restore a prior cron authorization context from binding tokens."""
+    if tokens and tokens[0][0] is _CRON_AUTH_SCOPE:
+        active = _CRON_AUTH_SCOPE.get()
+        if active is not _UNSET and hasattr(active, "revoke"):
+            active.revoke()
+    for var, token in reversed(tokens):
+        var.reset(token)
+
+
+def revoke_cron_runtime_lease(lease: _CronRuntimeLease) -> None:
+    """Revoke a scheduled run from a watchdog or scheduler owner."""
+    lease.revoke()
+
+
+def get_cron_runtime_context() -> CronRuntimeContext | None:
+    """Return the active scheduled-run identity, or ``None`` when unbound.
+
+    This is the stable plugin-facing bridge for cron authorization context.
+    It deliberately has no ``os.environ`` fallback: environment variables are
+    process-global, forgeable, and cannot be revoked in copied worker contexts.
+    """
+    active = _CRON_AUTH_SCOPE.get()
+    runtime_context = _CRON_RUNTIME_CONTEXT.get()
+    if (
+        active is _UNSET
+        or runtime_context is _UNSET
+        or not hasattr(active, "is_active")
+        or not active.is_active()
+    ):
+        return None
+    return runtime_context
+
+
 def set_session_vars(
     platform: str = "",
     source: str = "",
@@ -212,6 +420,7 @@ def set_session_vars(
     cwd: str = "",
     async_delivery: bool = True,
     ui_session_id: str = "",
+    cron_session: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -227,6 +436,10 @@ def set_session_vars(
     background completion back to the agent after the turn ends (see
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
+
+    ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
+    ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
+    and ``""`` explicitly marks a non-cron session while masking leaked env.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -247,6 +460,7 @@ def set_session_vars(
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
+        _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -283,6 +497,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _CRON_SESSION,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -332,8 +547,15 @@ def reset_session_vars() -> None:
     ``async_delivery_supported`` wrongly reports the new turn's channel as
     unable to route a background completion until ``set_session_vars`` runs.
     """
-    for var in _VAR_MAP.values():
+    for var in (
+        *_VAR_MAP.values(),
+        *_CRON_AUTH_VAR_MAP.values(),
+        _CRON_RUNTIME_CONTEXT,
+    ):
         var.set(_UNSET)
+    # Do not clear an inherited lease here: a newly spawned sibling task must
+    # drop its local authority without revoking the still-running parent scope.
+    _CRON_AUTH_SCOPE.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -363,11 +585,32 @@ def get_session_env(name: str, default: str = "") -> str:
     """
     import os
 
+    if name == "HERMES_CRON_SESSION":
+        active = _CRON_AUTH_SCOPE.get()
+        if active is not _UNSET:
+            if not hasattr(active, "is_active") or not active.is_active():
+                return default
+            value = _CRON_SESSION.get()
+            return default if value is _UNSET else value
     var = _VAR_MAP.get(name)
     if var is not None:
         value = var.get()
         if value is not _UNSET:
             return value
+    auth_var = _CRON_AUTH_VAR_MAP.get(name)
+    if auth_var is not None:
+        value = auth_var.get()
+        if value is _UNSET:
+            return default
+        active = _CRON_AUTH_SCOPE.get()
+        # Direct ContextVar binding remains available to in-process tests and
+        # compatibility callers. Scheduler-created scopes always carry a lease,
+        # whose cleared state revokes already-copied worker contexts.
+        if active is _UNSET:
+            return value
+        if not hasattr(active, "is_active") or not active.is_active():
+            return default
+        return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
 

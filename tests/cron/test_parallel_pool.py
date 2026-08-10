@@ -71,8 +71,8 @@ class TestRunningJobGuard:
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
+        monkeypatch.setattr(sched, "_run_job_result", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -83,6 +83,42 @@ class TestRunningJobGuard:
 
         sched._running_job_ids.discard("guard-job")
         sched._shutdown_parallel_pool()
+
+    def test_submit_shutdown_race_releases_running_state(self, monkeypatch):
+        import cron.scheduler as sched
+
+        job = {
+            "id": "shutdown-submit-race",
+            "name": "shutdown submit race",
+            "prompt": "test",
+            "schedule": "every 5m",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+        }
+
+        class RejectingPool:
+            @staticmethod
+            def submit(_callable):
+                sched._interrupted_job_ids.add(job["id"])
+                raise RuntimeError("cannot schedule new futures after interpreter shutdown")
+
+        sched._running_job_ids.clear()
+        sched._running_job_states.clear()
+        sched._interrupted_job_ids.clear()
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "advance_next_runs", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(sched, "_get_parallel_pool", lambda *_args: RejectingPool())
+        monkeypatch.setattr(
+            sched,
+            "_interpreter_shutting_down",
+            lambda error=None: error is not None,
+        )
+
+        assert sched.tick(verbose=False, sync=False) == 0
+        assert job["id"] not in sched._running_job_ids
+        assert job["id"] not in sched._running_job_states
+        assert job["id"] not in sched._interrupted_job_ids
 
 
 class TestSyncMode:
@@ -104,8 +140,8 @@ class TestSyncMode:
         ]
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
+        monkeypatch.setattr(sched, "_run_job_result", lambda j, **_kw: (True, "out", "resp", None))
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -151,8 +187,8 @@ class TestSequentialPool:
             return True, "out", "resp", None
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
-        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
-        monkeypatch.setattr(sched, "run_job", slow_run)
+        monkeypatch.setattr(sched, "advance_next_runs", lambda *_a, **_kw: 0)
+        monkeypatch.setattr(sched, "_run_job_result", slow_run)
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -180,3 +216,42 @@ class TestSequentialPool:
 
         sched._shutdown_parallel_pool()
         assert sched._sequential_pool is None
+
+
+class TestTickBatchAdvance:
+    """The tick's pre-dispatch advance must go through advance_next_runs
+    exactly once with the whole due set — a revert to the per-job loop
+    (or back to advance_next_run) must fail this test, not slip past the
+    helper-level I/O pin."""
+
+    def test_tick_calls_advance_next_runs_once_with_all_due_ids(self, tmp_path, monkeypatch):
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+
+        jobs = [
+            {"id": f"job-{i}", "name": f"Job {i}", "prompt": "test",
+             "schedule": "every 5m", "enabled": True,
+             "next_run_at": "2020-01-01T00:00:00", "deliver": "local"}
+            for i in range(4)
+        ]
+
+        advance_calls = []
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
+        monkeypatch.setattr(
+            sched, "advance_next_runs",
+            lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
+        monkeypatch.setattr(sched, "_run_job_result", lambda j, **_kw: (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        n = sched.tick(verbose=False)
+
+        assert n == 4
+        assert advance_calls == [["job-0", "job-1", "job-2", "job-3"]], (
+            f"tick must batch-advance the due set in ONE call; got {advance_calls}")
+
+        sched._shutdown_parallel_pool()
