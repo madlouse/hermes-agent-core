@@ -1,6 +1,7 @@
 """Tests for the Feishu gateway integration."""
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import socket
@@ -294,23 +295,29 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
         adapter = FeishuAdapter(PlatformConfig())
+        release = threading.Event()
 
         async def _never_returns(_request):
-            await asyncio.Event().wait()
+            while not release.is_set():
+                await asyncio.sleep(0.002)
 
-        with patch(
-            "plugins.platforms.feishu.adapter._FEISHU_SEND_HARD_TIMEOUT_SECONDS",
-            0.01,
-        ):
-            with self.assertRaisesRegex(
-                FeishuDeliveryTimeoutError, "delivery status unknown",
+        try:
+            with patch(
+                "plugins.platforms.feishu.adapter._FEISHU_SEND_HARD_TIMEOUT_SECONDS",
+                0.01,
             ):
-                asyncio.run(
-                    adapter._run_send_sdk(Mock(), _never_returns, object())
-                )
-        self.assertIsNone(adapter._sdk_executor)
+                with self.assertRaisesRegex(
+                    FeishuDeliveryTimeoutError, "delivery status unknown",
+                ):
+                    asyncio.run(
+                        adapter._run_send_sdk(Mock(), _never_returns, object())
+                    )
+            self.assertIsNotNone(adapter._sdk_executor)
+        finally:
+            release.set()
+            adapter._shutdown_sdk_executor()
 
-    def test_send_sdk_prefers_cancellable_async_api(self):
+    def test_send_sdk_uses_async_api_without_sync_fallback(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -318,14 +325,433 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         sync_send = Mock(side_effect=AssertionError("sync path must not run"))
         async_send = AsyncMock(return_value="sent")
 
-        result = asyncio.run(
-            adapter._run_send_sdk(sync_send, async_send, object())
-        )
+        try:
+            result = asyncio.run(
+                adapter._run_send_sdk(sync_send, async_send, object())
+            )
+        finally:
+            adapter._shutdown_sdk_executor()
 
         self.assertEqual(result, "sent")
         async_send.assert_awaited_once()
         sync_send.assert_not_called()
-        self.assertIsNone(adapter._sdk_executor)
+
+    def test_async_send_preawait_block_has_wall_clock_deadline(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+        sync_send = Mock(side_effect=AssertionError("sync path must not run"))
+        entered = threading.Event()
+        release = threading.Event()
+        cancelled = threading.Event()
+        transport_entered = threading.Event()
+        delivered = threading.Event()
+        calls = 0
+
+        async def _blocks_before_first_await(_request):
+            nonlocal calls
+            calls += 1
+            entered.set()
+            release.wait(timeout=1)
+            transport_entered.set()
+            try:
+                await asyncio.sleep(1)
+                delivered.set()
+                return "late result"
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def _exercise():
+            heartbeats = 0
+
+            async def _heartbeat():
+                nonlocal heartbeats
+                while True:
+                    heartbeats += 1
+                    await asyncio.sleep(0.002)
+
+            heartbeat = asyncio.create_task(_heartbeat())
+            try:
+                started = time.monotonic()
+                with self.assertRaisesRegex(
+                    feishu_module.FeishuDeliveryTimeoutError,
+                    "delivery status unknown",
+                ):
+                    await adapter._run_send_sdk(
+                        sync_send, _blocks_before_first_await, object(),
+                    )
+                elapsed = time.monotonic() - started
+                self.assertTrue(entered.is_set())
+                self.assertLess(elapsed, 0.2)
+                self.assertGreater(heartbeats, 1)
+
+                second_started = time.monotonic()
+                with self.assertRaisesRegex(
+                    feishu_module.FeishuDeliveryTimeoutError,
+                    "still blocked",
+                ):
+                    await adapter._run_send_sdk(
+                        sync_send, _blocks_before_first_await, object(),
+                    )
+                self.assertLess(time.monotonic() - second_started, 0.05)
+                self.assertEqual(calls, 1)
+                self.assertLessEqual(len(adapter._get_sdk_executor()._threads), 1)
+
+                release.set()
+                cancellation_observed = await asyncio.to_thread(
+                    cancelled.wait, 0.2,
+                )
+                self.assertTrue(cancellation_observed)
+                self.assertTrue(transport_entered.is_set())
+                self.assertFalse(delivered.is_set())
+            finally:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+
+        try:
+            with patch.object(
+                feishu_module, "_FEISHU_SEND_HARD_TIMEOUT_SECONDS", 0.02,
+            ):
+                asyncio.run(_exercise())
+        finally:
+            release.set()
+            adapter._shutdown_sdk_executor()
+
+        self.assertEqual(calls, 1)
+        sync_send.assert_not_called()
+
+    def test_send_endpoint_uses_primed_token_without_shared_config_mutation(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+        shared_config = SimpleNamespace(enable_set_token=False)
+        adapter._client = SimpleNamespace(config=shared_config)
+        observed = {}
+
+        class _RequestOption:
+            def __init__(self):
+                self.tenant_access_token = None
+
+        class _TokenManager:
+            @staticmethod
+            def get_self_tenant_token(config):
+                self.assertIs(config, shared_config)
+                return "primed-token"
+
+        class _MessageResource:
+            def __init__(self, config):
+                self.config = config
+
+            async def acreate(self, _request, option=None):
+                observed["enable_set_token"] = self.config.enable_set_token
+                observed["token"] = option.tenant_access_token
+                await asyncio.sleep(0)
+                return "sent"
+
+        resource = _MessageResource(shared_config)
+        try:
+            with (
+                patch.object(feishu_module, "LarkTokenManager", _TokenManager),
+                patch.object(feishu_module, "LarkRequestOption", _RequestOption),
+            ):
+                result = asyncio.run(
+                    adapter._run_send_sdk(Mock(), resource.acreate, object())
+                )
+        finally:
+            adapter._shutdown_sdk_executor()
+
+        self.assertEqual(result, "sent")
+        self.assertEqual(observed["token"], "primed-token")
+        self.assertTrue(observed["enable_set_token"])
+        self.assertFalse(shared_config.enable_set_token)
+
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark_oapi is not installed")
+    def test_pinned_sdk_create_and_reply_use_primed_token(self):
+        from gateway.config import PlatformConfig
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+            ReplyMessageRequest,
+            ReplyMessageRequestBody,
+        )
+        from lark_oapi.api.im.v1.resource import message as message_resource
+        from lark_oapi.core.model import Config
+        from lark_oapi.core.model.raw_response import RawResponse
+        from lark_oapi.core.token import auth as token_auth
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        self.assertTrue(feishu_module._load_lark_oapi())
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+        shared_config = Config()
+        shared_config.app_id = "cli_test"
+        shared_config.app_secret = "secret_test"
+        adapter._client = SimpleNamespace(config=shared_config)
+        resource = message_resource.Message(shared_config)
+        observations = []
+
+        class _PrimingTokenManager:
+            @staticmethod
+            def get_self_tenant_token(config):
+                self.assertIs(config, shared_config)
+                return "primed-token"
+
+        async def _fake_transport(config, request, option=None):
+            observations.append(
+                (request.uri, config.enable_set_token, option.tenant_access_token)
+            )
+            response = RawResponse()
+            response.status_code = 200
+            response.headers = {}
+            response.content = b'{"code":0,"msg":"success","data":{}}'
+            return response
+
+        create_request = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id("oc_test")
+                .msg_type("text")
+                .content('{"text":"test"}')
+                .uuid("stable-create")
+                .build()
+            )
+            .build()
+        )
+        reply_request = (
+            ReplyMessageRequest.builder()
+            .message_id("om_test")
+            .request_body(
+                ReplyMessageRequestBody.builder()
+                .msg_type("text")
+                .content('{"text":"test"}')
+                .uuid("stable-reply")
+                .build()
+            )
+            .build()
+        )
+
+        async def _exercise():
+            await adapter._run_send_sdk(Mock(), resource.acreate, create_request)
+            await adapter._run_send_sdk(Mock(), resource.areply, reply_request)
+
+        try:
+            with (
+                patch.object(
+                    feishu_module,
+                    "LarkTokenManager",
+                    _PrimingTokenManager,
+                ),
+                patch.object(
+                    token_auth.TokenManager,
+                    "get_self_tenant_token",
+                    side_effect=AssertionError("SDK verify must use primed token"),
+                ),
+                patch.object(
+                    message_resource.Transport,
+                    "aexecute",
+                    new=staticmethod(_fake_transport),
+                ),
+            ):
+                asyncio.run(_exercise())
+        finally:
+            adapter._shutdown_sdk_executor()
+
+        self.assertEqual(len(observations), 2)
+        self.assertTrue(all(item[1] for item in observations))
+        self.assertTrue(all(item[2] == "primed-token" for item in observations))
+        self.assertFalse(shared_config.enable_set_token)
+
+    def test_late_send_worker_failure_is_logged(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+        release = threading.Event()
+
+        async def _late_failure(_request):
+            release.wait(timeout=1)
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError as exc:
+                raise RuntimeError("late worker failure") from exc
+
+        async def _exercise():
+            with self.assertRaises(feishu_module.FeishuDeliveryTimeoutError):
+                await adapter._run_send_sdk(Mock(), _late_failure, object())
+            release.set()
+            for _ in range(20):
+                if not adapter._send_executions:
+                    return
+                await asyncio.sleep(0.01)
+            self.fail("late send worker did not exit")
+
+        try:
+            with (
+                patch.object(
+                    feishu_module, "_FEISHU_SEND_HARD_TIMEOUT_SECONDS", 0.02,
+                ),
+                self.assertLogs(
+                    "plugins.platforms.feishu.adapter", level="WARNING",
+                ) as captured,
+            ):
+                asyncio.run(_exercise())
+        finally:
+            release.set()
+            adapter._shutdown_sdk_executor()
+
+        self.assertTrue(
+            any("late worker failure" in line for line in captured.output)
+        )
+
+    def test_completed_worker_failure_is_logged_when_caller_detaches_late(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+
+        async def _exercise():
+            future = concurrent.futures.Future()
+            future.set_exception(RuntimeError("completed before detach"))
+            wrapped = asyncio.wrap_future(future)
+            adapter._track_send_execution(future, None, wrapped)
+            adapter._quarantine_send_execution(future)
+
+        with self.assertLogs(
+            "plugins.platforms.feishu.adapter", level="WARNING",
+        ) as captured:
+            asyncio.run(_exercise())
+
+        self.assertTrue(
+            any("completed before detach" in line for line in captured.output)
+        )
+        self.assertFalse(adapter._detached_send_futures)
+
+    def test_deadline_logs_worker_failure_that_completes_before_handler(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+        worker_future = concurrent.futures.Future()
+        executor = SimpleNamespace(submit=Mock(return_value=worker_future))
+
+        async def _deadline_then_worker_finishes(wrapped, timeout):
+            self.assertEqual(timeout, 0.02)
+            wrapped.cancel()
+            worker_future.set_exception(RuntimeError("deadline completion race"))
+            raise asyncio.TimeoutError
+
+        try:
+            with (
+                patch.object(adapter, "_get_sdk_executor", return_value=executor),
+                patch.object(
+                    feishu_module, "_FEISHU_SEND_HARD_TIMEOUT_SECONDS", 0.02,
+                ),
+                patch.object(
+                    feishu_module.asyncio,
+                    "wait_for",
+                    side_effect=_deadline_then_worker_finishes,
+                ),
+                self.assertLogs(
+                    "plugins.platforms.feishu.adapter", level="WARNING",
+                ) as captured,
+            ):
+                with self.assertRaises(feishu_module.FeishuDeliveryTimeoutError):
+                    asyncio.run(
+                        adapter._run_send_sdk(Mock(), None, object())
+                    )
+        finally:
+            adapter._shutdown_sdk_executor()
+
+        self.assertTrue(
+            any("deadline completion race" in line for line in captured.output)
+        )
+        self.assertFalse(adapter._detached_send_futures)
+
+    def test_normal_endpoint_failure_is_not_logged_as_late_delivery(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+
+        async def _immediate_failure(_request):
+            raise ValueError("ordinary endpoint failure")
+
+        try:
+            with self.assertNoLogs(
+                "plugins.platforms.feishu.adapter", level="WARNING",
+            ):
+                with self.assertRaisesRegex(ValueError, "ordinary endpoint failure"):
+                    asyncio.run(
+                        adapter._run_send_sdk(
+                            Mock(), _immediate_failure, object(),
+                        )
+                    )
+        finally:
+            adapter._shutdown_sdk_executor()
+
+        self.assertFalse(adapter._detached_send_futures)
+
+    def test_shutdown_cancels_preawait_send_before_reconnect(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+        entered = threading.Event()
+        release = threading.Event()
+        cancelled = threading.Event()
+
+        async def _blocked_send(_request):
+            entered.set()
+            release.wait(timeout=1)
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def _exercise():
+            send_task = asyncio.create_task(
+                adapter._run_send_sdk(Mock(), _blocked_send, object())
+            )
+            self.assertTrue(await asyncio.to_thread(entered.wait, 0.2))
+            adapter._shutdown_sdk_executor()
+            with self.assertRaises(asyncio.CancelledError):
+                await send_task
+
+            adapter._rearm_sdk_executor()
+            with self.assertRaisesRegex(
+                feishu_module.FeishuDeliveryTimeoutError,
+                "still blocked",
+            ):
+                await adapter._run_send_sdk(
+                    Mock(), AsyncMock(return_value="must not start"), object(),
+                )
+
+            release.set()
+            self.assertTrue(await asyncio.to_thread(cancelled.wait, 0.2))
+            for _ in range(20):
+                if not adapter._send_executions:
+                    break
+                await asyncio.sleep(0.01)
+
+            self.assertEqual(
+                await adapter._run_send_sdk(
+                    Mock(side_effect=AssertionError("sync path must not run")),
+                    AsyncMock(return_value="reconnected"),
+                    object(),
+                ),
+                "reconnected",
+            )
+
+        try:
+            asyncio.run(_exercise())
+        finally:
+            release.set()
+            adapter._shutdown_sdk_executor()
 
     def test_blocked_token_refresh_does_not_freeze_loop_or_fill_pool(self):
         from gateway.config import PlatformConfig

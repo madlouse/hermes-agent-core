@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import concurrent.futures
+import copy
 import hashlib
 import hmac
 import itertools
@@ -114,6 +115,7 @@ P2CardActionTriggerResponse = None  # type: ignore[assignment]
 EventDispatcherHandler = None  # type: ignore[assignment]
 FeishuWSClient = None  # type: ignore[assignment]
 LarkTokenManager = None  # type: ignore[assignment]
+LarkRequestOption = None  # type: ignore[assignment]
 FEISHU_AVAILABLE = False
 _lark_import_lock = threading.Lock()
 
@@ -374,6 +376,54 @@ _SKIP_TEXT_KEYS = {
 
 class FeishuDeliveryTimeoutError(TimeoutError):
     """A send timed out after delivery may already have occurred."""
+
+
+class _AsyncEndpointExecution:
+    """Own one SDK coroutine and expose best-effort cross-thread cancellation."""
+
+    def __init__(self, async_func, request, request_option=None):
+        self._async_func = async_func
+        self._request = request
+        self._request_option = request_option
+        self._lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._task: Optional[asyncio.Task] = None
+        self._cancel_requested = False
+
+    def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        if self._request_option is None:
+            coroutine = self._async_func(self._request)
+        else:
+            coroutine = self._async_func(self._request, self._request_option)
+        task = loop.create_task(coroutine)
+        with self._lock:
+            self._loop = loop
+            self._task = task
+            cancel_requested = self._cancel_requested
+        if cancel_requested:
+            task.cancel()
+        try:
+            return loop.run_until_complete(task)
+        finally:
+            with self._lock:
+                self._loop = None
+                self._task = None
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._cancel_requested = True
+            loop = self._loop
+            task = self._task
+        if loop is None or task is None:
+            return
+        try:
+            loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -1435,6 +1485,7 @@ def _load_lark_oapi() -> bool:
             from lark_oapi.core import AccessTokenType, HttpMethod
             from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
             from lark_oapi.core.model import BaseRequest
+            from lark_oapi.core.model import RequestOption as LarkRequestOption
             from lark_oapi.event.callback.model.p2_card_action_trigger import (
                 CallBackCard, P2CardActionTriggerResponse,
             )
@@ -1472,6 +1523,7 @@ def _load_lark_oapi() -> bool:
             "EventDispatcherHandler": EventDispatcherHandler,
             "FeishuWSClient": FeishuWSClient,
             "LarkTokenManager": LarkTokenManager,
+            "LarkRequestOption": LarkRequestOption,
             "FEISHU_AVAILABLE": True,
         })
         return True
@@ -1528,6 +1580,20 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sdk_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._send_token_refresh_lock: Optional[asyncio.Lock] = None
         self._send_token_refresh_future: Optional[
+            concurrent.futures.Future
+        ] = None
+        self._send_endpoint_lock = asyncio.Lock()
+        self._send_execution_lock = threading.Lock()
+        self._send_executions: Dict[
+            concurrent.futures.Future,
+            tuple[
+                Optional[_AsyncEndpointExecution],
+                asyncio.AbstractEventLoop,
+                asyncio.Future,
+            ],
+        ] = {}
+        self._detached_send_futures: set[concurrent.futures.Future] = set()
+        self._quarantined_send_future: Optional[
             concurrent.futures.Future
         ] = None
         # Set on disconnect/shutdown so a real teardown can't be resurrected
@@ -1776,13 +1842,13 @@ class FeishuAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
 
-    async def _ensure_send_token_ready(self) -> None:
+    async def _ensure_send_token_ready(self) -> Optional[str]:
         """Prime the SDK token cache off-loop before entering async send APIs."""
         if LarkTokenManager is None or self._client is None:
-            return
+            return None
         config = getattr(self._client, "config", None)
         if config is None:
-            return
+            return None
         lock = self._send_token_refresh_lock
         if lock is None:
             lock = asyncio.Lock()
@@ -1800,7 +1866,7 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             self._send_token_refresh_future = future
             try:
-                await asyncio.wait_for(
+                return await asyncio.wait_for(
                     asyncio.shield(asyncio.wrap_future(future)),
                     timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
                 )
@@ -1813,23 +1879,47 @@ class FeishuAdapter(BasePlatformAdapter):
                     self._send_token_refresh_future = None
 
     async def _run_send_sdk(self, sync_func, async_func, request):
-        """Run a message send on the cancellable SDK path with a hard deadline."""
-        try:
-            if callable(async_func):
-                await self._ensure_send_token_ready()
-                return await asyncio.wait_for(
-                    async_func(request),
-                    timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
-                )
+        """Run a message send off-loop with a gateway-owned hard deadline.
 
-            # Compatibility fallback for SDKs older than the repository pin.
-            loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(
-                self._get_sdk_executor(), sync_func, request,
-            )
-            return await asyncio.wait_for(
-                future, timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
-            )
+        Lark's async endpoints perform synchronous request verification before
+        their first await.  Invoke the entire endpoint in a worker-owned event
+        loop so that a blocked verification cannot freeze the gateway loop or
+        prevent its wall-clock deadline from firing.
+        """
+        try:
+            async with self._send_endpoint_lock:
+                self._raise_if_send_quarantined()
+                if callable(async_func):
+                    token = await self._ensure_send_token_ready()
+                    async_func, request_option = self._prepare_send_endpoint(
+                        async_func, token,
+                    )
+                    execution = _AsyncEndpointExecution(
+                        async_func, request, request_option,
+                    )
+                    future = self._get_sdk_executor().submit(execution.run)
+                else:
+                    # Compatibility fallback for SDKs older than the repository pin.
+                    execution = None
+                    future = self._get_sdk_executor().submit(sync_func, request)
+                wrapped = asyncio.wrap_future(future)
+                self._track_send_execution(future, execution, wrapped)
+                try:
+                    return await asyncio.wait_for(
+                        wrapped,
+                        timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    if wrapped.cancelled():
+                        self._quarantine_send_execution(future)
+                        if not future.done():
+                            if execution is not None:
+                                execution.cancel()
+                            else:
+                                future.cancel()
+                    raise
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             if isinstance(exc, FeishuDeliveryTimeoutError):
                 raise
@@ -1840,8 +1930,108 @@ class FeishuAdapter(BasePlatformAdapter):
                 f"{_FEISHU_SEND_HARD_TIMEOUT_SECONDS:g}s; delivery status unknown"
             ) from exc
 
+    def _prepare_send_endpoint(self, async_func, token):
+        """Bind a primed token to an isolated SDK resource for send verification."""
+        if token is None or LarkRequestOption is None:
+            return async_func, None
+        resource = getattr(async_func, "__self__", None)
+        method_name = getattr(async_func, "__name__", None)
+        config = getattr(resource, "config", None)
+        if resource is None or method_name is None or config is None:
+            return async_func, None
+        try:
+            isolated_config = copy.copy(config)
+            isolated_config.enable_set_token = True
+            isolated_resource = type(resource)(isolated_config)
+            isolated_func = getattr(isolated_resource, method_name)
+        except (AttributeError, TypeError):
+            return async_func, None
+        option = LarkRequestOption()
+        option.tenant_access_token = token
+        return isolated_func, option
+
+    def _raise_if_send_quarantined(self) -> None:
+        with self._send_execution_lock:
+            future = self._quarantined_send_future
+            if future is None:
+                return
+            if future.done():
+                self._quarantined_send_future = None
+                return
+        raise FeishuDeliveryTimeoutError(
+            "Previous Feishu send is still blocked; new send not attempted"
+        )
+
+    def _track_send_execution(self, future, execution, wrapped) -> None:
+        loop = asyncio.get_running_loop()
+        with self._send_execution_lock:
+            self._send_executions[future] = (execution, loop, wrapped)
+
+        def forget(done_future) -> None:
+            with self._send_execution_lock:
+                self._send_executions.pop(done_future, None)
+                if self._quarantined_send_future is done_future:
+                    self._quarantined_send_future = None
+                log_late_exception = self._claim_detached_send_locked(done_future)
+            if log_late_exception:
+                self._log_late_send_exception(done_future)
+        future.add_done_callback(forget)
+
+    def _quarantine_send_execution(self, future) -> None:
+        with self._send_execution_lock:
+            self._detached_send_futures.add(future)
+            if not future.done():
+                self._quarantined_send_future = future
+            log_late_exception = self._claim_detached_send_locked(future)
+        if log_late_exception:
+            self._log_late_send_exception(future)
+
+    def _claim_detached_send_locked(self, future) -> bool:
+        if future not in self._detached_send_futures or not future.done():
+            return False
+        self._detached_send_futures.remove(future)
+        return True
+
+    @staticmethod
+    def _log_late_send_exception(future) -> None:
+        try:
+            late_exception = future.exception()
+        except concurrent.futures.CancelledError:
+            return
+        if late_exception is None or isinstance(
+            late_exception, asyncio.CancelledError,
+        ):
+            return
+        logger.warning(
+            "[Feishu] Send worker exited after caller completion; "
+            "delivery status remains unknown: %s",
+            late_exception,
+            exc_info=(
+                type(late_exception),
+                late_exception,
+                late_exception.__traceback__,
+            ),
+        )
+
+    def _cancel_send_executions(self) -> None:
+        lock = getattr(self, "_send_execution_lock", None)
+        if lock is None:
+            return
+        with lock:
+            executions = list(self._send_executions.items())
+        for future, (execution, loop, wrapped) in executions:
+            if execution is not None:
+                execution.cancel()
+            if not wrapped.done():
+                try:
+                    loop.call_soon_threadsafe(wrapped.cancel)
+                except RuntimeError:
+                    pass
+            future.cancel()
+
     def _shutdown_sdk_executor(self) -> None:
         """Stop the adapter-owned SDK executor without touching the loop default."""
+        self._cancel_send_executions()
         lock = getattr(self, "_sdk_executor_lock", None)
         if lock is None:
             return
@@ -1860,7 +2050,7 @@ class FeishuAdapter(BasePlatformAdapter):
         """Connect to Feishu/Lark."""
         # A fresh connect (or reconnect) re-arms the SDK executor after a prior
         # disconnect set the closing flag.
-        self._sdk_executor_closing = False
+        self._rearm_sdk_executor()
         if not self._app_id or not self._app_secret:
             logger.error("[Feishu] FEISHU_APP_ID or FEISHU_APP_SECRET not set")
             return False
@@ -2869,6 +3059,9 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
         future.add_done_callback(self._log_background_failure)
         return True
+
+    def _rearm_sdk_executor(self) -> None:
+        self._sdk_executor_closing = False
 
     def _is_interactive_operator_authorized(self, open_id: str) -> bool:
         """Return whether this card-action operator may answer gated prompts."""
