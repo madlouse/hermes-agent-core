@@ -583,6 +583,8 @@ def classify_transport_outcome(result: Any) -> str:
         return explicit
     native_ids = extract_native_ids(result)
     if result.get("success") is True:
+        if result.get("delivered") is False:
+            return OUTCOME_DEFINITIVELY_REJECTED
         return OUTCOME_CONFIRMED
     if native_ids:
         return OUTCOME_INDETERMINATE

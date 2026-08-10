@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -19,7 +20,7 @@ def _selector(content: str = "请回复 1 确认") -> dict:
     }
     return {
         "request_id": "request-1",
-        "profile_id": "atlas",
+        "profile_id": "default",
         "frame_id": "frame-1",
         "notification_claim_id": "claim-1",
         "decision_route": route,
@@ -38,7 +39,7 @@ def _context(content: str = "请回复 1 确认") -> dict:
         platform="feishu",
         chat_id="chat-1",
         profile_id="atlas",
-        profile_path="/tmp/atlas",
+        profile_path="/tmp",
         output_screening_required=True,
         looks_actionable=True,
     )
@@ -64,6 +65,7 @@ def _authority_result(selector: dict | None = None) -> dict:
         "delivery_authority": {
             "schema_version": "transport-outbox-hook/v1",
             "required": True,
+            "business_profile_id": "atlas",
             "request": selector or _selector(),
         },
     }
@@ -96,6 +98,28 @@ def test_before_send_rejects_required_post_send_without_delivery_authority():
         _post_send_result(),
         ("output-screening", "transport-outbox-authority"),
     )
+
+    assert decision.transmit is False
+    assert decision.reason == "missing_delivery_authority"
+
+
+def test_any_required_post_send_result_cannot_be_masked_by_later_allow():
+    registry = HookRegistry()
+
+    def required(_event_type, _context):
+        return _post_send_result()
+
+    def plain(_event_type, _context):
+        return {"decision": "allow", "reason": "plain"}
+
+    registry._handlers[ob.BEFORE_SEND] = [required, plain]
+    for handler in (required, plain):
+        registry._handler_owners[id(handler)] = "outbound-actionable"
+        registry._handler_capabilities[id(handler)] = frozenset(
+            ("output-screening", "transport-outbox-authority")
+        )
+
+    decision = asyncio.run(ob.outbound_before_send(registry, _context()))
 
     assert decision.transmit is False
     assert decision.reason == "missing_delivery_authority"
@@ -241,15 +265,26 @@ def test_provider_rejection_commits_receipt_but_skips_after_send(monkeypatch):
         lambda hooks, context: calls.append("after"),
     )
 
-    execution = ob.execute_authorized_outbound_send_sync(
-        hooks=Hooks({}, ()),
-        context=_context(),
-        decision=decision,
-        send=lambda: {"success": False, "transport_outcome": "definitively_rejected"},
-    )
+    with pytest.raises(
+        ob.OutboundDeliveryAuthorityError,
+        match="definitively_rejected outcome",
+    ):
+        ob.execute_authorized_outbound_send_sync(
+            hooks=Hooks({}, ()),
+            context=_context(),
+            decision=decision,
+            send=lambda: {"success": False, "transport_outcome": "definitively_rejected"},
+        )
 
-    assert execution.outcome == "definitively_rejected"
     assert calls == [("request-1", "definitively_rejected")]
+
+
+def test_filtered_success_is_definitively_rejected():
+    from gateway.transport_outbox import classify_transport_outcome
+
+    assert classify_transport_outcome(
+        {"success": True, "delivered": False, "filtered": "silence_narration"}
+    ) == "definitively_rejected"
 
 
 def test_receipt_commit_failure_skips_after_send(monkeypatch):
@@ -321,3 +356,128 @@ def test_confirmed_send_passes_full_authority_to_after_send(monkeypatch):
     assert contexts[0]["delivery_authority"] == decision.delivery_authority
     assert contexts[0]["delivery_authority_selector"] == execution.request
     assert contexts[0]["send_result"]["message_id"] == "om-1"
+
+
+def test_confirmed_idless_send_uses_receipt_as_durable_source_reference(monkeypatch):
+    decision = _decision(
+        _authority_result(),
+        ("output-screening", "transport-outbox-authority"),
+    )
+    contexts: list[dict] = []
+    monkeypatch.setattr(
+        "gateway.transport_outbox.begin_transport_request",
+        lambda *args, **kwargs: {"state": "new", "request": _selector()},
+    )
+    monkeypatch.setattr(
+        "gateway.transport_outbox.commit_transport_receipt",
+        lambda request_id, result, outcome, **kwargs: {
+            "receipt_id": "receipt-idless",
+            "request_id": request_id,
+            "status": outcome,
+            "native_ids": [],
+        },
+    )
+    monkeypatch.setattr(
+        ob,
+        "outbound_after_send_sync",
+        lambda hooks, context: contexts.append(context),
+    )
+
+    execution = ob.execute_authorized_outbound_send_sync(
+        hooks=Hooks({}, ()),
+        context=_context(),
+        decision=decision,
+        send=lambda: {"success": True},
+    )
+
+    assert execution.outcome == "confirmed"
+    assert contexts[0]["source_outbox_id"] == "receipt-idless"
+
+
+def test_root_business_profile_executes_against_real_transport_outbox(
+    tmp_path,
+    monkeypatch,
+):
+    context = _context()
+    context["profile_path"] = str(tmp_path)
+    decision = asyncio.run(
+        ob.outbound_before_send(
+            Hooks(
+                _authority_result(),
+                ("output-screening", "transport-outbox-authority"),
+            ),
+            context,
+        )
+    )
+    after_contexts: list[dict] = []
+    monkeypatch.setattr(
+        ob,
+        "outbound_after_send_sync",
+        lambda hooks, payload: after_contexts.append(payload),
+    )
+
+    execution = ob.execute_authorized_outbound_send_sync(
+        hooks=Hooks({}, ()),
+        context=context,
+        decision=decision,
+        send=lambda: {"success": True},
+    )
+
+    assert execution.outcome == "confirmed"
+    assert execution.provider_called is True
+    assert execution.receipt is not None
+    assert after_contexts[0]["source_outbox_id"] == execution.receipt["receipt_id"]
+
+
+def test_concurrent_authority_execution_never_calls_provider_twice(
+    tmp_path,
+    monkeypatch,
+):
+    context = _context()
+    context["profile_path"] = str(tmp_path)
+    decision = asyncio.run(
+        ob.outbound_before_send(
+            Hooks(
+                _authority_result(),
+                ("output-screening", "transport-outbox-authority"),
+            ),
+            context,
+        )
+    )
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+    provider_calls: list[str] = []
+    outcomes: list[str] = []
+
+    monkeypatch.setattr(ob, "outbound_after_send_sync", lambda *args, **kwargs: None)
+
+    def provider():
+        provider_calls.append("send")
+        provider_started.set()
+        assert release_provider.wait(timeout=5)
+        return {"success": True, "message_id": "om-concurrent"}
+
+    def execute():
+        try:
+            result = ob.execute_authorized_outbound_send_sync(
+                hooks=Hooks({}, ()),
+                context=context,
+                decision=decision,
+                send=provider,
+            )
+            outcomes.append(result.outcome)
+        except ob.OutboundDeliveryAuthorityError as exc:
+            outcomes.append(str(exc))
+
+    first = threading.Thread(target=execute)
+    second = threading.Thread(target=execute)
+    first.start()
+    assert provider_started.wait(timeout=5)
+    second.start()
+    second.join(timeout=5)
+    release_provider.set()
+    first.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert provider_calls == ["send"]
+    assert sorted(outcomes) == ["confirmed", "transport request already has indeterminate outcome"]

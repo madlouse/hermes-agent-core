@@ -332,7 +332,7 @@ def test_send_message_hook_authority_uses_core_executor_once() -> None:
     }
     request = {
         "request_id": "request-send-message-hook",
-        "profile_id": "atlas",
+        "profile_id": "default",
         "frame_id": "frame-send-message-hook",
         "notification_claim_id": "claim-send-message-hook",
         "decision_route": route,
@@ -345,6 +345,7 @@ def test_send_message_hook_authority_uses_core_executor_once() -> None:
     authority = {
         "schema_version": "transport-outbox-hook/v1",
         "required": True,
+        "business_profile_id": "atlas",
         "request": request,
     }
     runner = _runner_with_boundary_result(

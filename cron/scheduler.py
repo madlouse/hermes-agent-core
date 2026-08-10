@@ -3199,6 +3199,13 @@ def _deliver_result(
                     # from metadata, deriving the routing from target.thread_id
                     # or the explicit direct_messages_topic_id above.
                     async def _send_live_payload():
+                        if authority_active:
+                            return await transport.send(
+                                platform,
+                                str(chat_id),
+                                text_to_send,
+                                route_metadata,
+                            )
                         return await router._deliver_to_platform(
                             route_target,
                             text_to_send,

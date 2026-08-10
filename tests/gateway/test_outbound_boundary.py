@@ -316,7 +316,7 @@ def test_gateway_final_reply_hook_authority_uses_core_executor(monkeypatch):
     }
     request = {
         "request_id": "request-gateway-reply",
-        "profile_id": "atlas",
+        "profile_id": "default",
         "frame_id": "frame-gateway-reply",
         "notification_claim_id": "claim-gateway-reply",
         "decision_route": route,
@@ -329,6 +329,7 @@ def test_gateway_final_reply_hook_authority_uses_core_executor(monkeypatch):
     authority = {
         "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
         "required": True,
+        "business_profile_id": "atlas",
         "request": request,
     }
     executions = []
@@ -377,6 +378,7 @@ def test_gateway_notice_hook_authority_uses_core_executor(monkeypatch):
     authority = {
         "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
         "required": True,
+        "business_profile_id": "atlas",
         "request": {"request_id": "request-gateway-notice"},
     }
     decision = SimpleNamespace(

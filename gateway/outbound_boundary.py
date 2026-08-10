@@ -174,6 +174,18 @@ def _normalized_route(value: Any) -> dict[str, str] | None:
     return route if route["transport_id"] and route["channel_id"] else None
 
 
+def _canonical_profile_id_from_home(profile_path: Any) -> str:
+    try:
+        resolved = Path(profile_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError):
+        return ""
+    if not resolved.is_dir():
+        return ""
+    if resolved.parent.name == "profiles":
+        return resolved.name if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", resolved.name) else ""
+    return "default"
+
+
 def _source_kind(context: dict[str, Any]) -> str:
     value = _string(context.get("source_kind") or context.get("producer_kind"))
     if value in {"cron_notice", "cron_job"}:
@@ -518,6 +530,10 @@ def _validate_delivery_authority(
         return None, "invalid_delivery_authority"
     if authority.get("required") is not True:
         return None, "invalid_delivery_authority"
+    if _string(authority.get("business_profile_id")) != _string(
+        context.get("profile_id")
+    ):
+        return None, "delivery_authority_profile_mismatch"
     if any(key in authority for key in ("requests", "selectors", "frame_ids")):
         return None, "multiple_delivery_frames"
     request = authority.get("request")
@@ -532,7 +548,9 @@ def _validate_delivery_authority(
     if not isinstance(request.get("frame_id"), str) or not _string(request.get("frame_id")):
         return None, "invalid_delivery_authority"
 
-    if _string(request.get("profile_id")) != _string(context.get("profile_id")):
+    if _string(request.get("profile_id")) != _canonical_profile_id_from_home(
+        context.get("profile_path")
+    ):
         return None, "delivery_authority_profile_mismatch"
     actual_route = _route_from_context(context)
     authority_route = _normalized_route(request.get("notification_route"))
@@ -553,19 +571,13 @@ def _delivery_authority_decision(
     normalized_results: list[tuple[Any, BoundaryDecision]],
     selected: BoundaryDecision,
 ) -> BoundaryDecision:
-    selected_result = next(
-        (
-            result
-            for result, normalized in normalized_results
-            if normalized is selected
-        ),
-        None,
-    )
-    selected_public = _without_hook_identity(selected_result)
-    authority_required = bool(
-        isinstance(selected_public, dict)
-        and isinstance(selected_public.get("post_send"), dict)
-        and selected_public["post_send"].get("required") is True
+    authority_required = any(
+        isinstance(public, dict)
+        and isinstance(public.get("post_send"), dict)
+        and public["post_send"].get("required") is True
+        for result, normalized in normalized_results
+        if normalized.transmit
+        for public in (_without_hook_identity(result),)
     )
     authority_results = [
         (result, normalized)
@@ -874,7 +886,7 @@ def _source_outbox_id(payload: Mapping[str, Any], receipt: Mapping[str, Any]) ->
         for item in native_ids:
             if isinstance(item, Mapping) and _string(item.get("value")):
                 return _string(item.get("value"))
-    return ""
+    return _string(receipt.get("receipt_id"))
 
 
 def _confirmed_duplicate_result(
@@ -1048,11 +1060,14 @@ def execute_authorized_outbound_send_sync(
         ) from exc
 
     outcome, receipt, _ = _commit_authorized_delivery(context, commit, result)
-    if outcome == "confirmed":
-        outbound_after_send_sync(
-            hooks,
-            _authority_after_context(context, authority, request, receipt, result),
+    if outcome != "confirmed":
+        raise OutboundDeliveryAuthorityError(
+            f"provider send completed with {outcome} outcome"
         )
+    outbound_after_send_sync(
+        hooks,
+        _authority_after_context(context, authority, request, receipt, result),
+    )
     return AuthorizedOutboundExecution(
         result=result,
         outcome=outcome,
@@ -1122,11 +1137,14 @@ async def execute_authorized_outbound_send(
         commit,
         result,
     )
-    if outcome == "confirmed":
-        await outbound_after_send(
-            hooks,
-            _authority_after_context(context, authority, request, receipt, result),
+    if outcome != "confirmed":
+        raise OutboundDeliveryAuthorityError(
+            f"provider send completed with {outcome} outcome"
         )
+    await outbound_after_send(
+        hooks,
+        _authority_after_context(context, authority, request, receipt, result),
+    )
     return AuthorizedOutboundExecution(
         result=result,
         outcome=outcome,

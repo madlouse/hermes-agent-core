@@ -723,6 +723,7 @@ class TestDeliverResultWrapping:
         authority = {
             "schema_version": "transport-outbox-hook/v1",
             "required": True,
+            "business_profile_id": "atlas",
             "request": {"request_id": "request-cron-hook"},
         }
         boundary_decision = MagicMock(
@@ -786,6 +787,7 @@ class TestDeliverResultWrapping:
             delivery_authority={
                 "schema_version": "transport-outbox-hook/v1",
                 "required": True,
+                "business_profile_id": "atlas",
                 "request": {"request_id": "request-cron-live"},
             },
         )
@@ -811,6 +813,9 @@ class TestDeliverResultWrapping:
             return future
 
         adapter = AsyncMock()
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="cron-live-1")
+        )
         loop = MagicMock()
         loop.is_running.return_value = True
         standalone_send = AsyncMock(return_value={"success": True})
@@ -836,7 +841,12 @@ class TestDeliverResultWrapping:
 
         assert result is None
         assert len(executions) == 1
-        live_send.assert_awaited_once()
+        adapter.send.assert_awaited_once_with(
+            "123",
+            "请回复 1 确认",
+            metadata={"job_id": "authority-cron-live-job"},
+        )
+        live_send.assert_not_awaited()
         standalone_send.assert_not_awaited()
 
 
