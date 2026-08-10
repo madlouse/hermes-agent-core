@@ -85,6 +85,7 @@ def process_gateway_reply(
     source_profile=None,
     profile_config=None,
     enforced_channel=False,
+    auto_voice_requested=False,
 ):
     from gateway import run as gateway_run
 
@@ -95,6 +96,7 @@ def process_gateway_reply(
         encoding="utf-8",
     )
 
+    voice_sender = AsyncMock()
     monkeypatch.setattr(
         gateway_run,
         "_gateway_runner_ref",
@@ -103,6 +105,7 @@ def process_gateway_reply(
             _resolve_profile_home_for_source=lambda _source: profile_home,
             _profile_name_for_source=lambda source: source.profile or profile_id,
             _active_profile_name=lambda: profile_id,
+            _send_voice_reply=voice_sender,
         ),
     )
     monkeypatch.setattr(
@@ -151,7 +154,9 @@ def process_gateway_reply(
         ),
         message_id="inbound",
     )
+    event._hermes_auto_voice_reply_requested = auto_voice_requested
     run(adapter._process_message_background(event, "telegram:admin-dm"))
+    adapter._test_auto_voice_sender = voice_sender
     return adapter
 
 
@@ -445,6 +450,73 @@ def test_gateway_authority_revalidates_payload_after_local_file_suppression(
 
     adapter.send_authorized.assert_not_awaited()
     adapter._send_with_retry.assert_not_awaited()
+
+
+def test_gateway_authority_never_sends_deferred_auto_voice(monkeypatch):
+    content = "请回复 1 确认"
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "telegram",
+        "channel_id": "admin-dm",
+        "thread_id": "",
+    }
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": {
+            "request_id": "request-gateway-voice",
+            "profile_id": "default",
+            "frame_id": "frame-gateway-voice",
+            "notification_claim_id": "claim-gateway-voice",
+            "decision_route": route,
+            "notification_route": route,
+            "items_content_hash": "sha256:items",
+            "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "claim_created_at": now.isoformat(),
+            "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+    }
+
+    def boundary(_event_type, _payload):
+        return {
+            "decision": "allow",
+            "reason": "registered",
+            "delivery_authority": authority,
+        }
+
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(
+            named_handler(
+                boundary,
+                capabilities={
+                    ob.REQUIRED_SCREENING_CAPABILITY,
+                    ob.TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY,
+                },
+            )
+        ),
+        response=content,
+        auto_voice_requested=True,
+    )
+
+    adapter._test_auto_voice_sender.assert_not_awaited()
+    adapter.send_authorized.assert_awaited_once()
+
+
+def test_gateway_rewrite_sends_deferred_auto_voice_with_final_text(monkeypatch):
+    def boundary(_event_type, _payload):
+        return {"decision": "rewrite", "reason": "safe", "content": "safe final"}
+
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(named_handler(boundary)),
+        response="unsafe draft",
+        auto_voice_requested=True,
+    )
+
+    adapter._test_auto_voice_sender.assert_awaited_once()
+    assert adapter._test_auto_voice_sender.await_args.args[1] == "safe final"
 
 
 def test_gateway_notice_hook_authority_uses_core_executor(monkeypatch):

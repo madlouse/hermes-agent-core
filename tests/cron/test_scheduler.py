@@ -713,7 +713,7 @@ class TestDeliverResultWrapping:
         assert send_mock.await_args.kwargs["media_files"] == []
         assert mirror_mock.call_args.args[3] == "safe projected result"
 
-    def test_hook_authority_rejects_standalone_cron_provider(self):
+    def test_hook_authority_uses_registered_strict_standalone_cron_provider(self):
         from gateway.config import Platform
         from gateway.outbound_boundary import AuthorizedOutboundExecution
 
@@ -733,7 +733,10 @@ class TestDeliverResultWrapping:
             raw={"decision": "allow"},
             delivery_authority=authority,
         )
-        send_mock = AsyncMock(
+        legacy_send = AsyncMock(
+            return_value={"success": True, "message_id": "cron-message-1"}
+        )
+        strict_send = AsyncMock(
             return_value={"success": True, "message_id": "cron-message-1"}
         )
         executions = []
@@ -754,7 +757,8 @@ class TestDeliverResultWrapping:
              patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
              patch("gateway.outbound_boundary.execute_authorized_outbound_send", side_effect=execute), \
              patch("gateway.outbound_boundary.outbound_after_send_sync") as after_send, \
-             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+             patch("tools.send_message_tool._send_to_platform", new=legacy_send), \
+             patch("tools.send_message_tool._send_authorized_to_platform", new=strict_send):
             result = _deliver_result(
                 {
                     "id": "authority-cron-job",
@@ -765,9 +769,17 @@ class TestDeliverResultWrapping:
                 "请回复 1 确认",
             )
 
-        assert result == "strict authority delivery requires a live telegram adapter"
-        assert executions == []
-        send_mock.assert_not_awaited()
+        assert result is None
+        assert len(executions) == 1
+        strict_send.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            pconfig,
+            "123",
+            "请回复 1 确认",
+            thread_id=None,
+            transport_request_id="request-cron-hook",
+        )
+        legacy_send.assert_not_awaited()
         after_send.assert_not_called()
 
     def test_hook_authority_wraps_live_cron_provider_once(self, tmp_path):
@@ -854,7 +866,10 @@ class TestDeliverResultWrapping:
         live_send.assert_not_awaited()
         standalone_send.assert_not_awaited()
 
-    @pytest.mark.parametrize("schedule_mode", ["missing", "cancelled_timeout"])
+    @pytest.mark.parametrize(
+        "schedule_mode",
+        ["missing", "cancelled_timeout", "schedule_exception", "future_exception"],
+    )
     def test_hook_authority_scheduling_failure_never_falls_back_standalone(
         self, tmp_path, schedule_mode
     ):
@@ -884,11 +899,16 @@ class TestDeliverResultWrapping:
 
         def schedule(coro, _loop):
             coro.close()
+            if schedule_mode == "schedule_exception":
+                raise RuntimeError("scheduler unavailable")
             if schedule_mode == "missing":
                 return None
             future = MagicMock()
-            future.result.side_effect = TimeoutError
-            future.cancel.return_value = True
+            if schedule_mode == "future_exception":
+                future.result.side_effect = RuntimeError("future failed")
+            else:
+                future.result.side_effect = TimeoutError
+                future.cancel.return_value = True
             return future
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
@@ -913,6 +933,65 @@ class TestDeliverResultWrapping:
         assert "live adapter" in result
         adapter.send_authorized.assert_not_awaited()
         standalone_send.assert_not_awaited()
+
+    def test_hook_authority_inflight_timeout_is_bounded_and_never_falls_back(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="请回复 1 确认",
+            raw={"decision": "allow"},
+            delivery_authority={
+                "schema_version": "transport-outbox-hook/v1",
+                "required": True,
+                "business_profile_id": "atlas",
+                "request": {"request_id": "request-cron-inflight"},
+            },
+        )
+        adapter = AsyncMock()
+        adapter.supports_transport_authority = True
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        future = MagicMock()
+        future.result.side_effect = TimeoutError
+        future.cancel.return_value = False
+        legacy_send = AsyncMock(return_value={"success": True})
+        strict_send = AsyncMock(return_value={"success": True})
+        (tmp_path / "config.yaml").write_text("profile_id: atlas\n", encoding="utf-8")
+        monkeypatch.setattr("cron.scheduler._CRON_AUTHORITY_RECEIPT_WAIT_SECONDS", 0.0)
+
+        def schedule(coro, _loop):
+            coro.close()
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=legacy_send), \
+             patch("tools.send_message_tool._send_authorized_to_platform", new=strict_send):
+            result = _deliver_result(
+                {
+                    "id": "authority-cron-inflight",
+                    "profile_id": "default",
+                    "profile_path": str(tmp_path),
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "请回复 1 确认",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert "remained in flight without an authoritative receipt" in result
+        legacy_send.assert_not_awaited()
+        strict_send.assert_not_awaited()
 
 
 class TestDeliverResultErrorReturns:

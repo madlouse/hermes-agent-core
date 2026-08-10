@@ -2787,6 +2787,7 @@ def _is_channel_dm_topic(
 
 
 _CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS = 60.0
+_CRON_AUTHORITY_RECEIPT_WAIT_SECONDS = 300.0
 
 
 def _run_coro_in_new_loop(coro):
@@ -2840,7 +2841,7 @@ def _deliver_result(
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
 
-    from tools.send_message_tool import _send_to_platform
+    from tools.send_message_tool import _send_authorized_to_platform, _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
     # Optionally wrap the content with a header/footer so the user knows this
@@ -3126,10 +3127,10 @@ def _deliver_result(
             authority_active = isinstance(
                 getattr(boundary_decision, "delivery_authority", None), dict
             )
-            # Once a Hook authority owns this target, no scheduling, timeout,
-            # adapter, or provider failure may reopen the legacy standalone
-            # path. A confirmed execution can still mark delivery successful.
-            authority_terminal = authority_active
+            # A live-adapter attempt owns the authority once selected. Without
+            # a live adapter, the registered strict standalone seam may execute
+            # the same request; the legacy sender is never eligible.
+            authority_terminal = authority_active and live_adapter_ready
             if authority_active and boundary_media_files:
                 raise RuntimeError(
                     "trusted outbound delivery authority does not support multipart sends"
@@ -3358,6 +3359,40 @@ def _deliver_result(
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
                                 timeout_handled = True
+                            elif authority_active:
+                                logger.warning(
+                                    "Job '%s': trusted live adapter send to %s:%s "
+                                    "is in flight; waiting boundedly for an authoritative receipt",
+                                    job["id"], platform_name, chat_id,
+                                )
+                                receipt_deadline = (
+                                    time.monotonic()
+                                    + _CRON_AUTHORITY_RECEIPT_WAIT_SECONDS
+                                )
+                                while time.monotonic() < receipt_deadline:
+                                    if heartbeat is not None:
+                                        heartbeat()
+                                    try:
+                                        authority_execution = future.result(
+                                            timeout=min(
+                                                _CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS,
+                                                max(0.001, receipt_deadline - time.monotonic()),
+                                            )
+                                        )
+                                        send_result = authority_execution.result
+                                        authority_terminal = (
+                                            authority_execution.outcome != "confirmed"
+                                        )
+                                        break
+                                    except TimeoutError:
+                                        continue
+                                else:
+                                    target_errors.append(
+                                        "trusted live adapter send remained in flight without "
+                                        "an authoritative receipt"
+                                    )
+                                    adapter_ok = False
+                                    timeout_handled = True
                             elif heartbeat is not None:
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
@@ -3371,30 +3406,6 @@ def _deliver_result(
                                     try:
                                         send_result = future.result(
                                             timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
-                                        )
-                                        if authority_active:
-                                            authority_execution = send_result
-                                            send_result = authority_execution.result
-                                            authority_terminal = (
-                                                authority_execution.outcome != "confirmed"
-                                            )
-                                        break
-                                    except TimeoutError:
-                                        continue
-                            elif authority_active:
-                                logger.warning(
-                                    "Job '%s': trusted live adapter send to %s:%s "
-                                    "is in flight; waiting for an authoritative receipt",
-                                    job["id"], platform_name, chat_id,
-                                )
-                                while True:
-                                    try:
-                                        authority_execution = future.result(
-                                            timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
-                                        )
-                                        send_result = authority_execution.result
-                                        authority_terminal = (
-                                            authority_execution.outcome != "confirmed"
                                         )
                                         break
                                     except TimeoutError:
@@ -3588,12 +3599,6 @@ def _deliver_result(
                         job["id"], err_msg,
                     )
 
-        if not delivered and authority_active and not live_adapter_ready:
-            delivery_errors.extend(target_errors or [
-                f"strict authority delivery requires a live {platform_name} adapter"
-            ])
-            continue
-
         if not delivered and authority_terminal:
             delivery_errors.extend(target_errors or [
                 f"trusted delivery to {platform_name}:{chat_id} was not confirmed"
@@ -3626,6 +3631,18 @@ def _deliver_result(
             # Standalone delivery remains owned by the active run claim while the
             # async transport is in flight.
             def _standalone_delivery():
+                if authority_active:
+                    request_id = str(
+                        boundary_decision.delivery_authority["request"]["request_id"]
+                    )
+                    return _send_authorized_to_platform(
+                        platform,
+                        pconfig,
+                        chat_id,
+                        boundary_delivery_content,
+                        thread_id=thread_id,
+                        transport_request_id=request_id,
+                    )
                 return _send_to_platform(
                     platform,
                     pconfig,

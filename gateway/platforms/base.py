@@ -6168,6 +6168,20 @@ class BasePlatformAdapter(ABC):
                     # No extraction or history suppression may run after it.
                     outbound_boundary_context["content"] = text_content
 
+                # GatewayRunner defers /voice-all TTS until the exact final text
+                # has passed this Hook boundary. Authority requests remain one
+                # provider attempt and therefore never add an audio send.
+                auto_voice_requested = bool(
+                    getattr(event, "_hermes_auto_voice_reply_requested", False)
+                )
+                authority_active = boundary_decision is not None and isinstance(
+                    getattr(boundary_decision, "delivery_authority", None), dict
+                )
+                if auto_voice_requested and not authority_active and text_content:
+                    voice_sender = getattr(runner, "_send_voice_reply", None)
+                    if callable(voice_sender):
+                        await voice_sender(event, text_content)
+
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain

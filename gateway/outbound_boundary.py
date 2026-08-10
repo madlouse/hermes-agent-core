@@ -1172,20 +1172,47 @@ async def execute_authorized_outbound_send(
 
 def send_result_payload(result: Any) -> dict[str, Any]:
     if isinstance(result, dict):
-        return dict(result)
-    if result is None:
+        payload = dict(result)
+    elif result is None:
         return {}
-    payload: dict[str, Any] = {}
-    for key in (
-        "success",
-        "message_id",
-        "outbox_id",
-        "error",
-        "raw_response",
-        "transport_outcome",
-    ):
-        if hasattr(result, key):
-            value = getattr(result, key)
-            if value is not None:
-                payload[key] = value
-    return payload
+    else:
+        payload = {}
+        for key in (
+            "success",
+            "message_id",
+            "outbox_id",
+            "error",
+            "raw_response",
+            "transport_outcome",
+        ):
+            if hasattr(result, key):
+                value = getattr(result, key)
+                if value is not None:
+                    payload[key] = value
+    return _json_safe_transport_result(payload)
+
+
+def _json_safe_transport_result(value: Any, *, _depth: int = 0) -> Any:
+    """Keep receipt evidence deterministic without serializing provider objects."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_transport_result(item, _depth=_depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _json_safe_transport_result(item, _depth=_depth + 1)
+            for item in value
+        ]
+    if _depth >= 4:
+        return {"provider_object_type": type(value).__name__}
+    allowed = {}
+    for key in ("code", "msg", "request_id", "message_id", "outbox_id", "status", "data"):
+        if not hasattr(value, key):
+            continue
+        item = getattr(value, key)
+        if item is not None and not callable(item):
+            allowed[key] = _json_safe_transport_result(item, _depth=_depth + 1)
+    return allowed or {"provider_object_type": type(value).__name__}

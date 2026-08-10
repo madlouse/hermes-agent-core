@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -84,6 +86,32 @@ def _post_send_result(*, authority: dict | None = None) -> dict:
 
 def _decision(result: dict, capabilities: tuple[str, ...]) -> ob.BoundaryDecision:
     return asyncio.run(ob.outbound_before_send(Hooks(result, capabilities), _context()))
+
+
+def test_send_result_payload_normalizes_nonserializable_provider_response():
+    provider_response = SimpleNamespace(
+        code=0,
+        msg="ok",
+        data=SimpleNamespace(message_id="om-sdk-response"),
+        success=lambda: True,
+    )
+    result = {
+        "success": True,
+        "message_id": "om-sdk-response",
+        "raw_response": provider_response,
+    }
+
+    payload = ob.send_result_payload(result)
+
+    assert json.loads(json.dumps(payload)) == {
+        "success": True,
+        "message_id": "om-sdk-response",
+        "raw_response": {
+            "code": 0,
+            "msg": "ok",
+            "data": {"message_id": "om-sdk-response"},
+        },
+    }
 
 
 def test_before_send_rejects_delivery_authority_without_capability():
@@ -447,17 +475,30 @@ def test_root_business_profile_executes_against_real_transport_outbox(
         lambda hooks, payload: after_contexts.append(payload),
     )
 
+    sdk_response = SimpleNamespace(
+        code=0,
+        msg="ok",
+        data=SimpleNamespace(message_id="om-real-sdk"),
+        success=lambda: True,
+    )
     execution = ob.execute_authorized_outbound_send_sync(
         hooks=Hooks({}, ()),
         context=context,
         decision=decision,
-        send=lambda: {"success": True},
+        send=lambda: {
+            "success": True,
+            "message_id": "om-real-sdk",
+            "raw_response": sdk_response,
+        },
     )
 
     assert execution.outcome == "confirmed"
     assert execution.provider_called is True
     assert execution.receipt is not None
-    assert after_contexts[0]["source_outbox_id"] == execution.receipt["receipt_id"]
+    assert after_contexts[0]["source_outbox_id"] == "om-real-sdk"
+    assert after_contexts[0]["send_result"]["raw_response"]["data"] == {
+        "message_id": "om-real-sdk"
+    }
 
 
 def test_concurrent_authority_execution_never_calls_provider_twice(
