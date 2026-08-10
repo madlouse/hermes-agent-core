@@ -557,6 +557,7 @@ def _handle_send(args, *, after_send=None):
             execute_authorized_outbound_send,
             outbound_after_send_sync,
             outbound_before_send_sync,
+            profile_id_from_home,
             send_result_payload,
         )
 
@@ -578,18 +579,15 @@ def _handle_send(args, *, after_send=None):
             except Exception:
                 outbound_hooks = None
 
+        active_profile_home = get_hermes_home()
         boundary_context = build_outbound_context(
             source_kind="send_message",
             content=message,
             platform=platform_name,
             chat_id=chat_id,
             thread_id=thread_id,
-            profile_id=(
-                str(args.get("profile_id") or "")
-                if "profile_id" in args
-                else None
-            ),
-            profile_path=str(get_hermes_home()),
+            profile_id=profile_id_from_home(active_profile_home),
+            profile_path=str(active_profile_home),
             producer_id="send_message",
             target={
                 "transport_id": platform_name,
@@ -694,14 +692,14 @@ def _handle_send(args, *, after_send=None):
                     hooks=outbound_hooks,
                     context=boundary_context,
                     decision=boundary_decision,
-                    send=lambda: _send_to_platform(
+                    send=lambda: _send_authorized_to_platform(
                         platform,
-                        pconfig,
                         chat_id,
                         cleaned_message,
                         thread_id=thread_id,
-                        media_files=media_files,
-                        force_document=force_document_attachments,
+                        transport_request_id=boundary_decision.delivery_authority[
+                            "request"
+                        ]["request_id"],
                     ),
                 )
             )
@@ -1025,6 +1023,50 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
             "its final response to that same target. Put the intended user-facing content in "
             "your final response instead, or use a different target if you want an additional message."
         ),
+    }
+
+
+async def _send_authorized_to_platform(
+    platform,
+    chat_id,
+    content,
+    *,
+    thread_id=None,
+    transport_request_id: str,
+):
+    """Use only a live adapter's strict single-attempt authority seam."""
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(platform) if runner is not None else None
+    except Exception:
+        adapter = None
+    if adapter is None:
+        return {
+            "success": False,
+            "error": "strict transport authority requires a live adapter",
+        }
+    if getattr(adapter, "supports_transport_authority", False) is not True:
+        return {
+            "success": False,
+            "error": "adapter does not support strict transport authority",
+        }
+    metadata = {"thread_id": thread_id} if thread_id else None
+    result = await adapter.send_authorized(
+        chat_id,
+        content,
+        metadata=metadata,
+        transport_request_id=transport_request_id,
+    )
+    if isinstance(result, dict):
+        return result
+    return {
+        "success": bool(getattr(result, "success", False)),
+        "message_id": getattr(result, "message_id", None),
+        "error": getattr(result, "error", None),
+        "raw_response": getattr(result, "raw_response", None),
+        "transport_outcome": getattr(result, "transport_outcome", None),
     }
 
 

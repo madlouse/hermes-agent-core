@@ -713,7 +713,7 @@ class TestDeliverResultWrapping:
         assert send_mock.await_args.kwargs["media_files"] == []
         assert mirror_mock.call_args.args[3] == "safe projected result"
 
-    def test_hook_authority_wraps_standalone_cron_provider_once(self):
+    def test_hook_authority_rejects_standalone_cron_provider(self):
         from gateway.config import Platform
         from gateway.outbound_boundary import AuthorizedOutboundExecution
 
@@ -765,12 +765,12 @@ class TestDeliverResultWrapping:
                 "请回复 1 确认",
             )
 
-        assert result is None
-        assert len(executions) == 1
-        send_mock.assert_awaited_once()
+        assert result == "strict authority delivery requires a live telegram adapter"
+        assert executions == []
+        send_mock.assert_not_awaited()
         after_send.assert_not_called()
 
-    def test_hook_authority_wraps_live_cron_provider_once(self):
+    def test_hook_authority_wraps_live_cron_provider_once(self, tmp_path):
         from concurrent.futures import Future
         from gateway.config import Platform
         from gateway.outbound_boundary import AuthorizedOutboundExecution
@@ -813,12 +813,14 @@ class TestDeliverResultWrapping:
             return future
 
         adapter = AsyncMock()
-        adapter.send = AsyncMock(
+        adapter.supports_transport_authority = True
+        adapter.send_authorized = AsyncMock(
             return_value=SendResult(success=True, message_id="cron-live-1")
         )
         loop = MagicMock()
         loop.is_running.return_value = True
         standalone_send = AsyncMock(return_value={"success": True})
+        (tmp_path / "config.yaml").write_text("profile_id: atlas\n", encoding="utf-8")
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
@@ -830,7 +832,8 @@ class TestDeliverResultWrapping:
             result = _deliver_result(
                 {
                     "id": "authority-cron-live-job",
-                    "profile_id": "atlas",
+                    "profile_id": "default",
+                    "profile_path": str(tmp_path),
                     "deliver": "origin",
                     "origin": {"platform": "telegram", "chat_id": "123"},
                 },
@@ -841,10 +844,12 @@ class TestDeliverResultWrapping:
 
         assert result is None
         assert len(executions) == 1
-        adapter.send.assert_awaited_once_with(
+        assert executions[0]["context"]["profile_id"] == "atlas"
+        adapter.send_authorized.assert_awaited_once_with(
             "123",
             "请回复 1 确认",
             metadata={"job_id": "authority-cron-live-job"},
+            transport_request_id="request-cron-live",
         )
         live_send.assert_not_awaited()
         standalone_send.assert_not_awaited()

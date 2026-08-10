@@ -571,14 +571,20 @@ def _delivery_authority_decision(
     normalized_results: list[tuple[Any, BoundaryDecision]],
     selected: BoundaryDecision,
 ) -> BoundaryDecision:
-    authority_required = any(
-        isinstance(public, dict)
-        and isinstance(public.get("post_send"), dict)
-        and public["post_send"].get("required") is True
+    required_results = [
+        (result, normalized)
         for result, normalized in normalized_results
         if normalized.transmit
-        for public in (_without_hook_identity(result),)
-    )
+        and isinstance((public := _without_hook_identity(result)), dict)
+        and isinstance(public.get("post_send"), dict)
+        and public["post_send"].get("required") is True
+    ]
+    authority_required = bool(required_results)
+    if any(
+        "delivery_authority" not in _without_hook_identity(result)
+        for result, _ in required_results
+    ):
+        return _closed_decision(context, "missing_delivery_authority")
     authority_results = [
         (result, normalized)
         for result, normalized in normalized_results
@@ -597,7 +603,17 @@ def _delivery_authority_decision(
     if len(authority_results) != 1:
         return _closed_decision(context, "multiple_delivery_authorities")
     result, authority_decision = authority_results[0]
-    if authority_decision is not selected:
+    if authority_required:
+        if (
+            selected.decision in {"rewrite", "downgrade"}
+            and authority_decision is not selected
+        ):
+            return _closed_decision(
+                context,
+                "delivery_authority_decision_mismatch",
+            )
+        selected = authority_decision
+    elif authority_decision is not selected:
         return _closed_decision(context, "delivery_authority_decision_mismatch")
     authority, reason = _validate_delivery_authority(
         context,

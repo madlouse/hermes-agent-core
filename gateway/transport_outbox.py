@@ -576,15 +576,19 @@ def classify_transport_outcome(result: Any) -> str:
     """
     if not isinstance(result, Mapping):
         return OUTCOME_INDETERMINATE
+    if result.get("delivered") is False:
+        return OUTCOME_DEFINITIVELY_REJECTED
     explicit = str(result.get("transport_outcome") or "").strip()
     if explicit:
         if explicit not in TRANSPORT_OUTCOMES:
             raise TransportOutboxError("transport_outcome is invalid")
+        if explicit == OUTCOME_CONFIRMED and result.get("success") is not True:
+            raise TransportOutboxError(
+                "confirmed transport_outcome requires explicit success"
+            )
         return explicit
     native_ids = extract_native_ids(result)
     if result.get("success") is True:
-        if result.get("delivered") is False:
-            return OUTCOME_DEFINITIVELY_REJECTED
         return OUTCOME_CONFIRMED
     if native_ids:
         return OUTCOME_INDETERMINATE

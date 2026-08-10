@@ -125,6 +125,30 @@ def test_any_required_post_send_result_cannot_be_masked_by_later_allow():
     assert decision.reason == "missing_delivery_authority"
 
 
+def test_valid_required_authority_is_not_order_dependent():
+    registry = HookRegistry()
+    authority_result = _authority_result()
+    authority_result["post_send"] = {"required": True}
+
+    def authority(_event_type, _context):
+        return authority_result
+
+    def plain(_event_type, _context):
+        return {"decision": "allow", "reason": "plain"}
+
+    registry._handlers[ob.BEFORE_SEND] = [authority, plain]
+    for handler in (authority, plain):
+        registry._handler_owners[id(handler)] = "outbound-actionable"
+        registry._handler_capabilities[id(handler)] = frozenset(
+            ("output-screening", "transport-outbox-authority")
+        )
+
+    decision = asyncio.run(ob.outbound_before_send(registry, _context()))
+
+    assert decision.transmit is True
+    assert decision.delivery_authority == authority_result["delivery_authority"]
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason"),
     [
@@ -284,6 +308,13 @@ def test_filtered_success_is_definitively_rejected():
 
     assert classify_transport_outcome(
         {"success": True, "delivered": False, "filtered": "silence_narration"}
+    ) == "definitively_rejected"
+    assert classify_transport_outcome(
+        {
+            "success": True,
+            "delivered": False,
+            "transport_outcome": "confirmed",
+        }
     ) == "definitively_rejected"
 
 

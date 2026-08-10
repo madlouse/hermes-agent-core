@@ -26,6 +26,7 @@ def _reset_signal_scheduler():
     _reset_scheduler()
 
 from gateway.config import Platform
+from gateway.hooks import HookRegistry
 from tools.send_message_tool import (
     _parse_target_ref,
     _resolve_slack_user_target,
@@ -239,6 +240,19 @@ def _make_config():
     ), telegram_cfg
 
 
+def _screening_runner():
+    registry = HookRegistry()
+
+    def handler(_event_type, _context):
+        return {"decision": "allow", "reason": "screened"}
+
+    for event_type in ("outbound:before_send", "outbound:after_send"):
+        registry._handlers[event_type] = [handler]
+    registry._handler_owners[id(handler)] = "outbound-actionable"
+    registry._handler_capabilities[id(handler)] = frozenset({"output-screening"})
+    return SimpleNamespace(hooks=registry)
+
+
 def _install_telegram_mock(monkeypatch, bot):
     parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
     constants_mod = SimpleNamespace(ParseMode=parse_mode)
@@ -287,6 +301,7 @@ class TestSendMessageTool:
         with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("gateway.channel_directory.resolve_channel_name", side_effect=AssertionError("should not resolve ntfy topics")), \
+             patch("gateway.run._gateway_runner_ref", return_value=_screening_runner()), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True):
@@ -326,6 +341,7 @@ class TestSendMessageTool:
 
         with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.run._gateway_runner_ref", return_value=_screening_runner()), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True):
@@ -362,6 +378,7 @@ class TestSendMessageTool:
 
         with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.run._gateway_runner_ref", return_value=_screening_runner()), \
              patch("model_tools._run_async", side_effect=_raise_and_close):
             result = json.loads(
                 send_message_tool(

@@ -2300,6 +2300,53 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    supports_transport_authority = True
+
+    async def send_authorized(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        transport_request_id: str,
+    ) -> SendResult:
+        """Perform one exact Feishu API attempt for a Core-authorized notice."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        formatted = self.format_message(content)
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        if len(chunks) != 1:
+            return SendResult(
+                success=False,
+                error="strict transport authority does not support chunked Feishu sends",
+            )
+        strict_metadata = {
+            **dict(metadata or {}),
+            "hermes_delivery_idempotency_key": transport_request_id,
+            "hermes_delivery_part": "authorized-text",
+            "hermes_transport_authority_strict": True,
+        }
+        msg_type, payload = self._build_outbound_payload(
+            chunks[0],
+            prefer_post=bool(_MARKDOWN_HINT_RE.search(formatted)),
+        )
+        try:
+            response = await self._send_raw_message(
+                chat_id=chat_id,
+                msg_type=msg_type,
+                payload=payload,
+                reply_to=reply_to,
+                metadata=strict_metadata,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                retryable=False,
+            )
+        return self._finalize_send_result(response, "strict authorized send failed")
+
     async def edit_message(
         self,
         chat_id: str,

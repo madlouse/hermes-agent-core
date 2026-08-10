@@ -5511,12 +5511,27 @@ class TurnRunner:
             msg = approval_decision.content
             try:
                 def _send_approval_text():
-                    _approval_send_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send(
+                    authority = getattr(
+                        approval_decision,
+                        "delivery_authority",
+                        None,
+                    )
+                    if isinstance(authority, dict):
+                        request_id = authority["request"]["request_id"]
+                        send_coro = ctx._status_adapter.send_authorized(
                             ctx._status_chat_id,
                             msg,
                             metadata=ctx._status_thread_metadata,
-                        ),
+                            transport_request_id=request_id,
+                        )
+                    else:
+                        send_coro = ctx._status_adapter.send(
+                            ctx._status_chat_id,
+                            msg,
+                            metadata=ctx._status_thread_metadata,
+                        )
+                    _approval_send_fut = safe_schedule_threadsafe(
+                        send_coro,
                         ctx._loop_for_step,
                         logger=logger,
                         log_message="Approval text-send scheduling error",
@@ -26004,10 +26019,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         hooks=getattr(self, "hooks", None),
                                         context=_boundary_context,
                                         decision=_boundary_decision,
-                                        send=lambda: adapter.send(
+                                        send=lambda: adapter.send_authorized(
                                             source.chat_id,
                                             first_response,
                                             metadata=_status_thread_metadata,
+                                            transport_request_id=_boundary_decision.delivery_authority[
+                                                "request"
+                                            ]["request_id"],
                                         ),
                                     )
                                 else:

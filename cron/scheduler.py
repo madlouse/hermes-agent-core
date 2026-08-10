@@ -1133,7 +1133,9 @@ def _deliver_operational_notice_in_profile(
     try:
         from gateway.outbound_boundary import (
             build_outbound_context,
+            execute_authorized_outbound_send,
             outbound_before_send_sync,
+            profile_id_from_home,
         )
 
         context = build_outbound_context(
@@ -1141,7 +1143,7 @@ def _deliver_operational_notice_in_profile(
             content=notice["admin_content"],
             platform=route["transport_id"],
             chat_id=route["channel_id"],
-            profile_id=profile_id,
+            profile_id=profile_id_from_home(owning_profile_home),
             profile_path=str(owning_profile_home),
             producer_id="cron-operational-notice",
             job_id=str(job.get("id") or ""),
@@ -1163,61 +1165,134 @@ def _deliver_operational_notice_in_profile(
             heartbeat.stop()
             return "screening_rejected"
         screened_content = decision.content
-        from gateway.transport_outbox import visible_content_sha256
-        from tools.send_message_tool import send_message_tool
+        context["content"] = screened_content
 
-        request_material = json.dumps(
-            {
-                "profile_id": profile_id,
-                "job_id": str(job.get("id") or ""),
-                "idempotency_key": notice["idempotency_key"],
-                "route": route,
-                "content": screened_content,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        request_digest = hashlib.sha256(request_material.encode("utf-8")).hexdigest()
-        transport_request = {
-            "request_id": f"cron-operational-notice:{request_digest}",
-            "profile_id": profile_id,
-            "frame_id": notice["evidence_ref"],
-            "notification_claim_id": notice["idempotency_key"],
-            "decision_route": route,
-            "notification_route": route,
-            "items_content_hash": f"sha256:{request_digest}",
-            "visible_content_sha256": visible_content_sha256(screened_content),
-            "claim_created_at": "1970-01-01T00:00:00+00:00",
-            "claim_expires_at": expires_at.isoformat(timespec="microseconds"),
-        }
-        existing_request_id = str(claim.get("transport_request_id") or "")
-        if existing_request_id and existing_request_id != transport_request["request_id"]:
-            heartbeat.stop()
-            return "request_conflict"
-        binding = bind_operational_notice_transport_request(
-            str(job.get("id") or ""),
-            notice["idempotency_key"],
-            claim_owner=claim_owner,
-            transport_request_id=transport_request["request_id"],
-        )
-        if binding.get("status") != "bound":
-            heartbeat.stop()
-            return str(binding.get("status") or "ownership_lost")
-        heartbeat.bind_request(transport_request["request_id"])
-        result = json.loads(
-            send_message_tool(
-                {
-                    "action": "send",
-                    "target": f"{route['transport_id']}:{route['channel_id']}",
-                    "message": screened_content,
-                    "profile_id": profile_id,
-                    "transport_request": transport_request,
-                }
+        if isinstance(decision.delivery_authority, dict):
+            from gateway.config import Platform, load_gateway_config
+
+            try:
+                platform = Platform(route["transport_id"])
+            except (ValueError, KeyError):
+                heartbeat.stop()
+                return "strict_adapter_unavailable"
+
+            config = load_gateway_config()
+            from gateway.delivery import resolve_delivery_transport
+
+            transport = resolve_delivery_transport(platform, config, adapters)
+            if (
+                transport is None
+                or loop is None
+                or not getattr(loop, "is_running", lambda: False)()
+            ):
+                heartbeat.stop()
+                return "strict_adapter_unavailable"
+            transport_request = dict(decision.delivery_authority["request"])
+            existing_request_id = str(claim.get("transport_request_id") or "")
+            if existing_request_id and existing_request_id != transport_request["request_id"]:
+                heartbeat.stop()
+                return "request_conflict"
+            binding = bind_operational_notice_transport_request(
+                str(job.get("id") or ""),
+                notice["idempotency_key"],
+                claim_owner=claim_owner,
+                transport_request_id=transport_request["request_id"],
             )
-        )
+            if binding.get("status") != "bound":
+                heartbeat.stop()
+                return str(binding.get("status") or "ownership_lost")
+            heartbeat.bind_request(transport_request["request_id"])
+
+            async def _send_operational_notice():
+                return await transport.send_authorized(
+                    platform,
+                    route["channel_id"],
+                    screened_content,
+                    None,
+                    transport_request_id=transport_request["request_id"],
+                )
+
+            from agent.async_utils import safe_schedule_threadsafe
+
+            future = safe_schedule_threadsafe(
+                execute_authorized_outbound_send(
+                    hooks=_active_outbound_hooks(),
+                    context=context,
+                    decision=decision,
+                    send=_send_operational_notice,
+                ),
+                loop,
+            )
+            if future is None:
+                heartbeat.stop()
+                return "strict_adapter_unavailable"
+            execution = future.result(timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS)
+            result = {
+                "success": True,
+                "transport_request_id": execution.request["request_id"],
+                "transport_receipt_id": execution.receipt["receipt_id"],
+            }
+        else:
+            from gateway.transport_outbox import visible_content_sha256
+            from tools.send_message_tool import send_message_tool
+
+            request_material = json.dumps(
+                {
+                    "profile_id": profile_id,
+                    "job_id": str(job.get("id") or ""),
+                    "idempotency_key": notice["idempotency_key"],
+                    "route": route,
+                    "content": screened_content,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            request_digest = hashlib.sha256(request_material.encode("utf-8")).hexdigest()
+            transport_request = {
+                "request_id": f"cron-operational-notice:{request_digest}",
+                "profile_id": profile_id,
+                "frame_id": notice["evidence_ref"],
+                "notification_claim_id": notice["idempotency_key"],
+                "decision_route": route,
+                "notification_route": route,
+                "items_content_hash": f"sha256:{request_digest}",
+                "visible_content_sha256": visible_content_sha256(screened_content),
+                "claim_created_at": "1970-01-01T00:00:00+00:00",
+                "claim_expires_at": expires_at.isoformat(timespec="microseconds"),
+            }
+            existing_request_id = str(claim.get("transport_request_id") or "")
+            if existing_request_id and existing_request_id != transport_request["request_id"]:
+                heartbeat.stop()
+                return "request_conflict"
+            binding = bind_operational_notice_transport_request(
+                str(job.get("id") or ""),
+                notice["idempotency_key"],
+                claim_owner=claim_owner,
+                transport_request_id=transport_request["request_id"],
+            )
+            if binding.get("status") != "bound":
+                heartbeat.stop()
+                return str(binding.get("status") or "ownership_lost")
+            heartbeat.bind_request(transport_request["request_id"])
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": f"{route['transport_id']}:{route['channel_id']}",
+                        "message": screened_content,
+                        "profile_id": profile_id,
+                        "transport_request": transport_request,
+                    }
+                )
+            )
         heartbeat.ensure_owner()
-    except Exception:
-        result = {}
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': operational notice delivery failed closed: %s",
+            job.get("id", "?"),
+            exc,
+        )
+        result = {"success": False, "error": str(exc)}
     try:
         if transport_request is not None:
             from gateway.transport_outbox import verify_transport_receipt
@@ -2995,17 +3070,19 @@ def _deliver_result(
             from gateway.outbound_boundary import (
                 build_outbound_context,
                 outbound_before_send_sync,
+                profile_id_from_home,
             )
 
             outbound_hooks = _active_outbound_hooks()
+            outbound_profile_path = str(job.get("profile_path") or _get_hermes_home())
             boundary_context = build_outbound_context(
                 source_kind="cron",
                 content=delivery_content,
                 platform=platform_name,
                 chat_id=chat_id,
                 thread_id=thread_id,
-                profile_id=str(job.get("profile_id") or ""),
-                profile_path=str(job.get("profile_path") or _get_hermes_home()),
+                profile_id=profile_id_from_home(outbound_profile_path),
+                profile_path=outbound_profile_path,
                 producer_id="cron",
                 job_id=str(job.get("id", "")),
                 run_id=str(job.get("last_run_id") or job.get("id", "")),
@@ -3200,11 +3277,13 @@ def _deliver_result(
                     # or the explicit direct_messages_topic_id above.
                     async def _send_live_payload():
                         if authority_active:
-                            return await transport.send(
+                            authority_request = boundary_decision.delivery_authority["request"]
+                            return await transport.send_authorized(
                                 platform,
                                 str(chat_id),
                                 text_to_send,
                                 route_metadata,
+                                transport_request_id=authority_request["request_id"],
                             )
                         return await router._deliver_to_platform(
                             route_target,
@@ -3509,6 +3588,12 @@ def _deliver_result(
         if not delivered and authority_terminal:
             delivery_errors.extend(target_errors or [
                 f"trusted delivery to {platform_name}:{chat_id} was not confirmed"
+            ])
+            continue
+
+        if not delivered and authority_active and not live_adapter_ready:
+            delivery_errors.extend(target_errors or [
+                f"strict authority delivery requires a live {platform_name} adapter"
             ])
             continue
 

@@ -232,7 +232,7 @@ def test_send_message_rejects_unrelated_allow_hook() -> None:
     send_mock.assert_not_awaited()
 
 
-def test_send_message_allow_rebuilds_media_from_screened_content() -> None:
+def test_send_message_allow_rebuilds_media_from_screened_content(tmp_path) -> None:
     whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"api_url": "http://bridge"})
     config = SimpleNamespace(
         platforms={Platform.WHATSAPP: whatsapp_cfg},
@@ -247,13 +247,15 @@ def test_send_message_allow_rebuilds_media_from_screened_content() -> None:
     )
 
     observed = {}
+    (tmp_path / "config.yaml").write_text("profile_id: atlas\n", encoding="utf-8")
 
     def allow(_hooks, context):
         observed.update(context)
         return decision
 
     with patch.dict("os.environ", {"HERMES_PROFILE_ID": "atlas"}), \
-         patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.send_message_tool.get_hermes_home", return_value=tmp_path), \
          patch("tools.interrupt.is_interrupted", return_value=False), \
          patch("model_tools._run_async", side_effect=_run_async_immediately), \
          patch("gateway.outbound_boundary.outbound_before_send_sync", side_effect=allow), \
@@ -320,7 +322,7 @@ def test_send_message_rewrite_drops_media_from_the_unscreened_source() -> None:
     )
 
 
-def test_send_message_hook_authority_uses_core_executor_once() -> None:
+def test_send_message_hook_authority_uses_core_executor_once(tmp_path) -> None:
     from gateway.outbound_boundary import AuthorizedOutboundExecution
 
     content = "请回复 1 确认"
@@ -359,6 +361,7 @@ def test_send_message_hook_authority_uses_core_executor_once() -> None:
         get_home_channel=lambda _platform: None,
     )
     executions = []
+    (tmp_path / "config.yaml").write_text("profile_id: atlas\n", encoding="utf-8")
 
     async def execute(**kwargs):
         executions.append(kwargs)
@@ -373,11 +376,12 @@ def test_send_message_hook_authority_uses_core_executor_once() -> None:
 
     with patch.dict("os.environ", {"HERMES_PROFILE_ID": "atlas"}), \
          patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("tools.send_message_tool.get_hermes_home", return_value=tmp_path), \
          patch("tools.interrupt.is_interrupted", return_value=False), \
          patch("model_tools._run_async", side_effect=_run_async_immediately), \
          patch("gateway.run._gateway_runner_ref", return_value=runner), \
          patch("gateway.outbound_boundary.execute_authorized_outbound_send", side_effect=execute), \
-         patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "om-1"})) as send_mock, \
+         patch("tools.send_message_tool._send_authorized_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "om-1"})) as send_mock, \
          patch("gateway.mirror.mirror_to_session", return_value=True):
         result = json.loads(
             send_message_tool(

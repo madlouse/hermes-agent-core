@@ -3536,6 +3536,25 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    supports_transport_authority: bool = False
+
+    async def send_authorized(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        transport_request_id: str,
+    ) -> SendResult:
+        """Send one exact authority-bound text without retry, fallback, or chunking."""
+        return SendResult(
+            success=False,
+            error=(
+                f"{self.platform.value} adapter does not support strict transport authority"
+            ),
+        )
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close
@@ -6274,6 +6293,13 @@ class BasePlatformAdapter(ABC):
                         event.source.chat_id,
                     )
                     _reply_anchor = _reply_anchor_for_event(event)
+                    authority_active = bool(
+                        boundary_decision is not None
+                        and isinstance(
+                            getattr(boundary_decision, "delivery_authority", None),
+                            dict,
+                        )
+                    )
                     # Delivery-obligation ledger: durably record the final
                     # response BEFORE the send attempt so a gateway crash
                     # between finalize and platform ACK can redeliver it on
@@ -6283,7 +6309,7 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    if not authority_active and not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
                         try:
@@ -6321,6 +6347,17 @@ class BasePlatformAdapter(ABC):
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
                     async def _send_final_text():
+                        if authority_active:
+                            authority_request = boundary_decision.delivery_authority[
+                                "request"
+                            ]
+                            return await delivery_adapter.send_authorized(
+                                chat_id=event.source.chat_id,
+                                content=text_content,
+                                reply_to=_reply_anchor,
+                                metadata=_final_thread_metadata,
+                                transport_request_id=authority_request["request_id"],
+                            )
                         return await delivery_adapter._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=text_content,
@@ -6336,10 +6373,7 @@ class BasePlatformAdapter(ABC):
                             ),
                         )
 
-                    if (
-                        boundary_decision is not None
-                        and isinstance(getattr(boundary_decision, "delivery_authority", None), dict)
-                    ):
+                    if authority_active:
                         from gateway.outbound_boundary import (
                             execute_authorized_outbound_send,
                         )

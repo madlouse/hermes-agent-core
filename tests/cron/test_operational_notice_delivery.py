@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import Future
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,6 +19,7 @@ import pytest
 from cron import jobs, scheduler
 from gateway.config import Platform
 from gateway.outbound_boundary import BoundaryDecision
+from gateway.platforms.base import SendResult
 from tools import send_message_tool as send_module
 
 
@@ -205,6 +209,96 @@ def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
         assert conn.execute("SELECT count(*) FROM transport_outbox_receipts").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_operational_notice_executes_hook_authority_through_strict_adapter(
+    operational_profile,
+    monkeypatch,
+):
+    (operational_profile / "config.yaml").write_text(
+        "profile_id: atlas\n",
+        encoding="utf-8",
+    )
+    content = _notice()["admin_content"]
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "feishu",
+        "channel_id": "ou_admin",
+        "thread_id": "",
+    }
+    request = {
+        "request_id": "request-operational-authority",
+        "profile_id": "default",
+        "frame_id": _notice()["evidence_ref"],
+        "notification_claim_id": _notice()["idempotency_key"],
+        "decision_route": route,
+        "notification_route": route,
+        "items_content_hash": "sha256:" + "b" * 64,
+        "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "claim_created_at": (now - timedelta(minutes=1)).isoformat(),
+        "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    authority = {
+        "schema_version": "transport-outbox-hook/v1",
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": request,
+    }
+
+    def authorize(_hooks, context):
+        assert context["profile_id"] == "atlas"
+        return BoundaryDecision(
+            transmit=True,
+            decision="allow",
+            content=content,
+            reason="authorized",
+            raw={"decision": "allow"},
+            delivery_authority=authority,
+        )
+
+    def run_now(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    adapter = SimpleNamespace(
+        supports_transport_authority=True,
+        send_authorized=AsyncMock(
+            return_value=SendResult(success=True, message_id="om-operational")
+        ),
+    )
+    loop = SimpleNamespace(is_running=lambda: True)
+    config = SimpleNamespace(
+        platforms={
+            Platform.FEISHU: SimpleNamespace(enabled=True, token="test", extra={})
+        },
+        get_home_channel=lambda _platform: None,
+    )
+    monkeypatch.setattr("gateway.outbound_boundary.outbound_before_send_sync", authorize)
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    legacy_send = AsyncMock()
+    monkeypatch.setattr(send_module, "_send_to_platform", legacy_send)
+
+    with jobs.use_cron_store(operational_profile):
+        status = scheduler._deliver_operational_notice(
+            _job(profile_home=operational_profile),
+            {"operational_notice": _notice()},
+            adapters={Platform.FEISHU: adapter},
+            loop=loop,
+        )
+
+    assert status == "sent"
+    adapter.send_authorized.assert_awaited_once_with(
+        "ou_admin",
+        content,
+        metadata=None,
+        transport_request_id=request["request_id"],
+    )
+    legacy_send.assert_not_awaited()
 
 
 def test_worker_admission_denial_reaches_notice_outbox_and_terminal_receipt(

@@ -122,6 +122,14 @@ def process_gateway_reply(
             else SendResult(success=True, message_id="sent")
         )
     )
+    adapter.supports_transport_authority = True
+    adapter.send_authorized = AsyncMock(
+        return_value=(
+            send_result
+            if send_result is not None
+            else SendResult(success=True, message_id="sent")
+        )
+    )
     adapter._run_processing_hook = AsyncMock()
     adapter._stop_typing_refresh = AsyncMock()
     adapter._flush_text_debounce_now = AsyncMock(return_value=False)
@@ -353,6 +361,11 @@ def test_gateway_final_reply_hook_authority_uses_core_executor(monkeypatch):
         )
 
     monkeypatch.setattr(ob, "execute_authorized_outbound_send", execute)
+    monkeypatch.setattr("gateway.delivery_ledger.ledger_enabled", lambda: True)
+    monkeypatch.setattr(
+        "gateway.delivery_ledger.record_obligation",
+        lambda **kwargs: pytest.fail("authority send must not enter legacy ledger"),
+    )
     adapter = process_gateway_reply(
         monkeypatch,
         hooks=Hooks(
@@ -368,7 +381,8 @@ def test_gateway_final_reply_hook_authority_uses_core_executor(monkeypatch):
     )
 
     assert len(executions) == 1
-    adapter._send_with_retry.assert_awaited_once()
+    adapter.send_authorized.assert_awaited_once()
+    adapter._send_with_retry.assert_not_awaited()
     assert executions[0]["decision"].delivery_authority == authority
 
 

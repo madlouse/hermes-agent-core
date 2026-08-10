@@ -821,6 +821,57 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             )
         adapter._send_raw_message.assert_awaited_once()
 
+    def test_authorized_send_is_one_exact_attempt_with_stable_request_key(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="om-authorized"),
+        )
+        adapter._send_raw_message = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            adapter.send_authorized(
+                "oc_chat",
+                "请回复 1 确认",
+                metadata={"thread_id": "omt_thread"},
+                transport_request_id="request-authorized",
+            )
+        )
+
+        self.assertTrue(result.success)
+        adapter._send_raw_message.assert_awaited_once()
+        metadata = adapter._send_raw_message.await_args.kwargs["metadata"]
+        self.assertEqual(metadata["thread_id"], "omt_thread")
+        self.assertEqual(
+            metadata["hermes_delivery_idempotency_key"],
+            "request-authorized",
+        )
+        self.assertTrue(metadata["hermes_transport_authority_strict"])
+
+    def test_authorized_send_rejects_chunking_before_provider(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        adapter._send_raw_message = AsyncMock()
+        adapter.truncate_message = Mock(return_value=["first", "second"])
+
+        result = asyncio.run(
+            adapter.send_authorized(
+                "oc_chat",
+                "too long",
+                transport_request_id="request-chunked",
+            )
+        )
+
+        self.assertFalse(result.success)
+        adapter._send_raw_message.assert_not_awaited()
+
     def test_outer_send_retry_does_not_duplicate_timeout(self):
         import httpx
         import requests
