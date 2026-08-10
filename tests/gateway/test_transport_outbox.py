@@ -61,6 +61,13 @@ def _begin(home, request: dict | None = None, *, now: datetime = NOW):
     )
 
 
+def test_explicit_confirmed_outcome_requires_success():
+    with pytest.raises(TransportOutboxError, match="requires explicit success"):
+        classify_transport_outcome(
+            {"success": False, "transport_outcome": OUTCOME_CONFIRMED}
+        )
+
+
 @pytest.fixture
 def profile_home(tmp_path, monkeypatch):
     home = tmp_path / "profiles" / "atlas"

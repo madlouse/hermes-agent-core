@@ -58,6 +58,19 @@ class StubAdapter(BasePlatformAdapter):
         return {}
 
 
+def test_base_adapter_default_authorized_send_fails_closed():
+    adapter = StubAdapter(PlatformConfig(), Platform.TELEGRAM)
+    result = run(
+        adapter.send_authorized(
+            "chat-1",
+            "notice",
+            transport_request_id="request-1",
+        )
+    )
+    assert result.success is False
+    assert "does not support strict transport authority" in (result.error or "")
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -394,6 +407,8 @@ def test_gateway_final_reply_hook_authority_uses_core_executor(monkeypatch):
 def test_gateway_authority_revalidates_payload_after_local_file_suppression(
     monkeypatch, tmp_path
 ):
+    legacy_error_send = AsyncMock(return_value=SendResult(success=True))
+    monkeypatch.setattr(StubAdapter, "send", legacy_error_send)
     local_file = tmp_path / "already-delivered.txt"
     local_file.write_text("internal", encoding="utf-8")
     content = f"Please review {local_file}"
@@ -450,6 +465,7 @@ def test_gateway_authority_revalidates_payload_after_local_file_suppression(
 
     adapter.send_authorized.assert_not_awaited()
     adapter._send_with_retry.assert_not_awaited()
+    legacy_error_send.assert_not_awaited()
 
 
 def test_gateway_authority_never_sends_deferred_auto_voice(monkeypatch):
@@ -563,6 +579,64 @@ def test_gateway_notice_hook_authority_uses_core_executor(monkeypatch):
     assert result.message_id == "notice-1"
     assert len(executions) == 1
     assert executions[0]["context"]["content"] == "最终通知内容"
+
+
+def test_gateway_notice_helpers_cover_legacy_success_and_deferred_voice(monkeypatch):
+    from gateway import run as gateway_run
+
+    audits = []
+    monkeypatch.setattr(
+        gateway_run,
+        "_operator_enforce_outbound_after_send",
+        lambda hooks, context, result: audits.append((hooks, context, result)),
+    )
+    decision = SimpleNamespace(content="notice", delivery_authority=None)
+    result = gateway_run._send_screened_gateway_notice(
+        "hooks",
+        {"content": "notice"},
+        decision,
+        lambda: SendResult(success=True, message_id="om-notice"),
+    )
+    assert result.success is True
+    assert len(audits) == 1
+
+    event = SimpleNamespace()
+    runner = SimpleNamespace(_should_send_voice_reply=lambda *_args, **_kwargs: True)
+    assert gateway_run.GatewayRunner._defer_auto_voice_reply(
+        runner,
+        event,
+        "final",
+        [],
+        already_sent=False,
+        streaming_tts_done=False,
+    ) is True
+    assert event._hermes_auto_voice_reply_requested is True
+    assert gateway_run.GatewayRunner._defer_auto_voice_reply(
+        runner,
+        SimpleNamespace(),
+        "final",
+        [],
+        already_sent=False,
+        streaming_tts_done=True,
+    ) is False
+
+
+def test_gateway_after_send_helper_removes_private_decision(monkeypatch):
+    from gateway import run as gateway_run
+
+    captured = []
+    monkeypatch.setattr(
+        ob,
+        "outbound_after_send_sync",
+        lambda hooks, evidence: captured.append(evidence),
+    )
+    gateway_run._operator_enforce_outbound_after_send(
+        None,
+        {"content": "notice", "_boundary_decision": object()},
+        SendResult(success=True, message_id="om-after"),
+    )
+    assert captured[0]["send_result"]["message_id"] == "om-after"
+    assert "_boundary_decision" not in captured[0]
 
 
 def test_armed_adapter_screens_terminal_result_without_actionable_escalation(monkeypatch):

@@ -370,3 +370,112 @@ def test_strict_transport_request_rejects_unregistered_standalone_sender(monkeyp
 
     assert result["success"] is False
     assert "conforming adapter" in result["error"]
+
+
+def test_strict_transport_live_adapter_fail_closed_and_object_result(monkeypatch):
+    unsupported = SimpleNamespace(supports_transport_authority=False)
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(adapters={Platform.FEISHU: unsupported}),
+    )
+    rejected = asyncio.run(
+        send_module._send_authorized_to_platform(
+            Platform.FEISHU,
+            SimpleNamespace(),
+            "oc_admin",
+            CONTENT,
+            transport_request_id="request-unsupported-live",
+        )
+    )
+    assert rejected["success"] is False
+
+    sender = AsyncMock(
+        return_value=SimpleNamespace(
+            success=True,
+            message_id="om-live",
+            error=None,
+            raw_response={"code": 0},
+            transport_outcome="confirmed",
+        )
+    )
+    adapter = SimpleNamespace(
+        supports_transport_authority=True,
+        send_authorized=sender,
+    )
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(adapters={Platform.FEISHU: adapter}),
+    )
+    result = asyncio.run(
+        send_module._send_authorized_to_platform(
+            Platform.FEISHU,
+            SimpleNamespace(),
+            "oc_admin",
+            CONTENT,
+            thread_id="omt-1",
+            transport_request_id="request-live",
+        )
+    )
+    assert result["message_id"] == "om-live"
+    sender.assert_awaited_once_with(
+        "oc_admin",
+        CONTENT,
+        metadata={"thread_id": "omt-1"},
+        transport_request_id="request-live",
+    )
+
+
+def test_strict_transport_registry_lookup_exception_fails_closed(monkeypatch):
+    from gateway.platform_registry import platform_registry
+
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: (_ for _ in ()).throw(RuntimeError("runner unavailable")),
+    )
+    monkeypatch.setattr(
+        platform_registry,
+        "get",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+    )
+    result = asyncio.run(
+        send_module._send_authorized_to_platform(
+            Platform.FEISHU,
+            SimpleNamespace(),
+            "oc_admin",
+            CONTENT,
+            transport_request_id="request-registry-error",
+        )
+    )
+    assert result["success"] is False
+    assert "conforming adapter" in result["error"]
+
+
+def test_trusted_sdk_response_is_json_safe_before_receipt_commit(
+    standalone_send, monkeypatch
+):
+    sdk_response = SimpleNamespace(
+        code=0,
+        msg="ok",
+        data=SimpleNamespace(message_id="om-sdk-direct"),
+    )
+    monkeypatch.setattr(
+        send_module,
+        "_send_authorized_to_platform",
+        AsyncMock(
+            return_value={
+                "success": True,
+                "message_id": "om-sdk-direct",
+                "raw_response": sdk_response,
+            }
+        ),
+    )
+
+    result = _send("request-sdk-direct")
+
+    assert result["success"] is True
+    assert result["raw_response"] == {
+        "code": 0,
+        "msg": "ok",
+        "data": {"message_id": "om-sdk-direct"},
+    }
+    assert result["transport_outcome"] == "confirmed"

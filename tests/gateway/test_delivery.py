@@ -4,7 +4,7 @@ import pytest
 from typing import Any, cast
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
-from gateway.delivery import DeliveryRouter, DeliveryTarget
+from gateway.delivery import DeliveryRouter, DeliveryTarget, DeliveryTransport
 from gateway.platforms.base import SendResult
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
@@ -141,6 +141,29 @@ class RecordingAdapter:
             {"chat_id": chat_id, "topic_name": topic_name, "force_create": force_create}
         )
         return "38049"
+
+
+@pytest.mark.asyncio
+async def test_strict_delivery_transport_rejects_relay_and_unsupported_adapter():
+    relay = DeliveryTransport(RecordingAdapter(), None, Platform.RELAY)
+    assert (await relay.send_authorized(
+        Platform.FEISHU,
+        "chat-1",
+        "notice",
+        None,
+        transport_request_id="request-1",
+    ))["error"].startswith("relay transport")
+
+    unsupported = DeliveryTransport(RecordingAdapter(), None, Platform.FEISHU)
+    result = await unsupported.send_authorized(
+        Platform.FEISHU,
+        "chat-1",
+        "notice",
+        None,
+        transport_request_id="request-1",
+    )
+    assert result["success"] is False
+    assert "does not support strict transport authority" in result["error"]
 
 
 @pytest.mark.asyncio
@@ -327,5 +350,3 @@ async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypa
     saved_files = list(tmp_path.glob("cron/output/job1_*.txt"))
     assert len(saved_files) == 1
     assert saved_files[0].read_text() == long_content
-
-

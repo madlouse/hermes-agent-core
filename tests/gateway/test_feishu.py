@@ -872,6 +872,34 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertFalse(result.success)
         adapter._send_raw_message.assert_not_awaited()
 
+    def test_authorized_send_rejects_disconnected_or_provider_exception(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        disconnected = asyncio.run(
+            adapter.send_authorized(
+                "oc_chat",
+                "notice",
+                transport_request_id="request-disconnected",
+            )
+        )
+        self.assertFalse(disconnected.success)
+        self.assertEqual(disconnected.error, "Not connected")
+
+        adapter._client = object()
+        adapter._send_raw_message = AsyncMock(side_effect=RuntimeError("provider down"))
+        failed = asyncio.run(
+            adapter.send_authorized(
+                "oc_chat",
+                "notice",
+                transport_request_id="request-provider-error",
+            )
+        )
+        self.assertFalse(failed.success)
+        self.assertFalse(failed.retryable)
+        self.assertEqual(failed.error, "provider down")
+
     def test_standalone_authorized_send_reuses_strict_adapter_seam(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.base import SendResult
@@ -906,6 +934,52 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             metadata=None,
             transport_request_id="request-standalone-strict",
         )
+
+    def test_standalone_authorized_send_fail_closed_branches(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        with patch.object(feishu_module, "_load_lark_oapi", return_value=False):
+            missing = asyncio.run(
+                feishu_module._standalone_send_authorized(
+                    PlatformConfig(),
+                    "oc_chat",
+                    "notice",
+                    transport_request_id="request-missing-deps",
+                )
+            )
+        self.assertFalse(missing["success"])
+
+        with patch.object(feishu_module, "_load_lark_oapi", return_value=True), patch.object(
+            feishu_module.FeishuAdapter,
+            "_build_lark_client",
+            side_effect=RuntimeError("client failed"),
+        ):
+            failed = asyncio.run(
+                feishu_module._standalone_send_authorized(
+                    PlatformConfig(),
+                    "oc_chat",
+                    "notice",
+                    transport_request_id="request-client-error",
+                )
+            )
+        self.assertEqual(failed["error"], "Feishu strict send failed: client failed")
+
+        async def cancelled():
+            with patch.object(feishu_module, "_load_lark_oapi", return_value=True), patch.object(
+                feishu_module.FeishuAdapter,
+                "_build_lark_client",
+                side_effect=asyncio.CancelledError,
+            ):
+                await feishu_module._standalone_send_authorized(
+                    PlatformConfig(),
+                    "oc_chat",
+                    "notice",
+                    transport_request_id="request-cancelled",
+                )
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(cancelled())
 
     def test_outer_send_retry_does_not_duplicate_timeout(self):
         import httpx

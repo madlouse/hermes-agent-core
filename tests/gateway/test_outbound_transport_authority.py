@@ -553,3 +553,229 @@ def test_concurrent_authority_execution_never_calls_provider_twice(
     assert not first.is_alive() and not second.is_alive()
     assert provider_calls == ["send"]
     assert sorted(outcomes) == ["confirmed", "transport request already has indeterminate outcome"]
+
+
+def test_authority_value_helpers_cover_fail_closed_shapes(tmp_path):
+    selector = _selector()
+    decision = ob.BoundaryDecision(
+        transmit=True,
+        decision="allow",
+        content="请回复 1 确认",
+        reason="registered",
+        delivery_authority={"request": selector},
+    )
+    assert decision.as_dict()["delivery_authority"] == {"request": selector}
+    assert ob._normalized_route("bad") is None
+    assert ob._canonical_profile_id_from_home(object()) == ""
+    missing = tmp_path / "missing"
+    assert ob._canonical_profile_id_from_home(missing) == ""
+    regular = tmp_path / "regular.txt"
+    regular.write_text("x", encoding="utf-8")
+    assert ob._canonical_profile_id_from_home(regular) == ""
+    profiles = tmp_path / "profiles"
+    invalid = profiles / "Invalid.Profile"
+    invalid.mkdir(parents=True)
+    assert ob._canonical_profile_id_from_home(invalid) == ""
+
+    assert ob._source_outbox_id({}, {"native_ids": [None, {"value": "om-native"}]}) == "om-native"
+    assert ob._source_outbox_id({}, {"native_ids": None, "receipt_id": "receipt-only"}) == "receipt-only"
+    recovered = ob._confirmed_duplicate_result(
+        _selector(),
+        {"receipt_id": "receipt-1", "native_ids": [{"kind": "", "value": "om-1"}]},
+    )
+    assert recovered["message_id"] == "om-1"
+    assert "message_id" not in ob._confirmed_duplicate_result(
+        _selector(), {"receipt_id": "receipt-2", "native_ids": ["invalid"]}
+    )
+    assert ob._json_safe_transport_result(SimpleNamespace(data=SimpleNamespace(data=SimpleNamespace(data=SimpleNamespace(data=object()))))) == {
+        "data": {"data": {"data": {"data": {"provider_object_type": "object"}}}}
+    }
+
+
+def test_multiple_or_mismatched_authority_results_fail_closed():
+    capabilities = frozenset(("output-screening", "transport-outbox-authority"))
+
+    def registry_for(*results):
+        registry = HookRegistry()
+        handlers = []
+        for result in results:
+            def handler(_event_type, _context, selected=result):
+                return selected
+            handlers.append(handler)
+            registry._handler_owners[id(handler)] = "outbound-actionable"
+            registry._handler_capabilities[id(handler)] = capabilities
+        registry._handlers[ob.BEFORE_SEND] = handlers
+        return registry
+
+    first = _authority_result()
+    second = _authority_result()
+    second["delivery_authority"]["request"]["request_id"] = "request-2"
+    multiple = asyncio.run(
+        ob.outbound_before_send(registry_for(first, second), _context())
+    )
+    assert multiple.reason == "multiple_delivery_authorities"
+
+    authority_required = _authority_result()
+    authority_required["post_send"] = {"required": True}
+    mismatch = asyncio.run(
+        ob.outbound_before_send(
+            registry_for(
+                {"decision": "rewrite", "content": "safe rewrite", "reason": "rewrite"},
+                authority_required,
+            ),
+            _context(),
+        )
+    )
+    assert mismatch.reason == "delivery_authority_decision_mismatch"
+
+    optional_mismatch = asyncio.run(
+        ob.outbound_before_send(
+            registry_for(
+                {"decision": "rewrite", "content": "safe rewrite", "reason": "rewrite"},
+                _authority_result(),
+            ),
+            _context(),
+        )
+    )
+    assert optional_mismatch.reason == "delivery_authority_decision_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("authority", "reason"),
+    [
+        (None, "invalid_delivery_authority"),
+        ({}, "invalid_delivery_authority"),
+        ({"schema_version": "transport-outbox-hook/v1"}, "invalid_delivery_authority"),
+        ({"schema_version": "transport-outbox-hook/v1", "required": True, "business_profile_id": "yuange", "request": {}}, "delivery_authority_profile_mismatch"),
+        ({"schema_version": "transport-outbox-hook/v1", "required": True, "business_profile_id": "atlas", "requests": [], "request": {}}, "multiple_delivery_frames"),
+        ({"schema_version": "transport-outbox-hook/v1", "required": True, "business_profile_id": "atlas", "request": "bad"}, "invalid_delivery_authority"),
+    ],
+)
+def test_validate_delivery_authority_rejects_top_level_shapes(authority, reason):
+    decision = ob.BoundaryDecision(True, "allow", "请回复 1 确认", "registered")
+    assert ob._validate_delivery_authority(_context(), decision, authority)[1] == reason
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (lambda request: request.__setitem__("requests", []), "multiple_delivery_frames"),
+        (lambda request: request.pop("claim_created_at"), "invalid_delivery_authority"),
+        (lambda request: request.__setitem__("frame_id", []), "multiple_delivery_frames"),
+        (lambda request: request.__setitem__("frame_id", ""), "invalid_delivery_authority"),
+    ],
+)
+def test_validate_delivery_authority_rejects_request_shapes(mutate, reason):
+    authority = _authority_result()["delivery_authority"]
+    mutate(authority["request"])
+    decision = ob.BoundaryDecision(True, "allow", "请回复 1 确认", "registered")
+    assert ob._validate_delivery_authority(_context(), decision, authority)[1] == reason
+
+
+@pytest.mark.parametrize(
+    "commit",
+    [
+        {},
+        {"request": "bad", "state": "new"},
+        {"request": _selector(), "state": "unexpected"},
+    ],
+)
+def test_begin_authorized_delivery_rejects_invalid_commit_state(monkeypatch, commit):
+    decision = _decision(
+        _authority_result(),
+        ("output-screening", "transport-outbox-authority"),
+    )
+    monkeypatch.setattr("gateway.transport_outbox.begin_transport_request", lambda *args, **kwargs: commit)
+    with pytest.raises(ob.OutboundDeliveryAuthorityError):
+        ob._begin_authorized_delivery(_context(), decision)
+
+
+def test_begin_authorized_delivery_rejects_missing_authority_or_request():
+    with pytest.raises(ob.OutboundDeliveryAuthorityError, match="authority is missing"):
+        ob._begin_authorized_delivery(_context(), ob.BoundaryDecision(True, "allow", "x", "missing"))
+    with pytest.raises(ob.OutboundDeliveryAuthorityError, match="request is invalid"):
+        ob._begin_authorized_delivery(
+            _context(),
+            ob.BoundaryDecision(True, "allow", "x", "invalid", delivery_authority={}),
+        )
+
+
+def test_sync_authority_executor_commits_provider_exception(monkeypatch):
+    decision = _decision(
+        _authority_result(),
+        ("output-screening", "transport-outbox-authority"),
+    )
+    monkeypatch.setattr(
+        ob,
+        "_begin_authorized_delivery",
+        lambda *_args: (decision.delivery_authority, {"state": "new", "request": _selector()}),
+    )
+    commits = []
+    monkeypatch.setattr(
+        ob,
+        "_commit_authorized_delivery",
+        lambda _context, _commit, result: commits.append(result) or ("indeterminate", {}, result),
+    )
+    with pytest.raises(ob.OutboundDeliveryAuthorityError, match="provider send failed"):
+        ob.execute_authorized_outbound_send_sync(
+            hooks=None,
+            context=_context(),
+            decision=decision,
+            send=lambda: (_ for _ in ()).throw(RuntimeError("provider down")),
+        )
+    assert commits[0]["transport_outcome"] == "indeterminate"
+
+
+@pytest.mark.asyncio
+async def test_async_authority_executor_fail_closed_matrix(monkeypatch):
+    decision = await ob.outbound_before_send(
+        Hooks(
+            _authority_result(),
+            ("output-screening", "transport-outbox-authority"),
+        ),
+        _context(),
+    )
+    receipt = {"receipt_id": "receipt-1", "native_ids": []}
+    monkeypatch.setattr(ob, "outbound_after_send", lambda *_args, **_kwargs: asyncio.sleep(0))
+
+    monkeypatch.setattr(
+        ob,
+        "_begin_authorized_delivery",
+        lambda *_args: (decision.delivery_authority, {"state": "confirmed", "request": _selector(), "receipt": receipt}),
+    )
+    confirmed = await ob.execute_authorized_outbound_send(
+        hooks=None, context=_context(), decision=decision, send=lambda: asyncio.sleep(0)
+    )
+    assert confirmed.recovered is True
+
+    monkeypatch.setattr(
+        ob,
+        "_begin_authorized_delivery",
+        lambda *_args: (decision.delivery_authority, {"state": "indeterminate", "request": _selector()}),
+    )
+    with pytest.raises(ob.OutboundDeliveryAuthorityError, match="indeterminate"):
+        await ob.execute_authorized_outbound_send(
+            hooks=None, context=_context(), decision=decision, send=lambda: asyncio.sleep(0)
+        )
+
+    monkeypatch.setattr(
+        ob,
+        "_begin_authorized_delivery",
+        lambda *_args: (decision.delivery_authority, {"state": "new", "request": _selector()}),
+    )
+    monkeypatch.setattr(ob, "_commit_authorized_delivery", lambda *_args: ("indeterminate", receipt, {}))
+
+    async def explode():
+        raise RuntimeError("provider failed")
+
+    with pytest.raises(ob.OutboundDeliveryAuthorityError, match="provider send failed"):
+        await ob.execute_authorized_outbound_send(
+            hooks=None, context=_context(), decision=decision, send=explode
+        )
+    with pytest.raises(ob.OutboundDeliveryAuthorityError, match="completed with indeterminate"):
+        await ob.execute_authorized_outbound_send(
+            hooks=None,
+            context=_context(),
+            decision=decision,
+            send=lambda: asyncio.sleep(0, result={"success": False}),
+        )

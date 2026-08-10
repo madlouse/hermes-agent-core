@@ -732,6 +732,8 @@ def _handle_send(args, *, after_send=None):
                     force_document=force_document_attachments,
                 )
             )
+        if trusted_commit is not None or authority_execution is not None:
+            result = send_result_payload(result)
         transport_receipt = None
         if trusted_commit is not None:
             from gateway.transport_outbox import (
@@ -741,10 +743,6 @@ def _handle_send(args, *, after_send=None):
             )
 
             request_id = str(trusted_commit["request"]["request_id"])
-            result = dict(result) if isinstance(result, dict) else {
-                "success": False,
-                "error": "Transport returned an invalid result",
-            }
             outcome = classify_transport_outcome(result)
             try:
                 transport_receipt = commit_transport_receipt(

@@ -5874,6 +5874,7 @@ class BasePlatformAdapter(ABC):
         last_delivery_result = None
         confirmed_delivery_result = None
         recovery_delivery_results: list[SendResult] = []
+        authority_delivery_owned = False
 
         async def _settle_recovery_delivery(*, delivered: bool, reason: str) -> None:
             recovery = event.recovery_delivery
@@ -6156,6 +6157,7 @@ class BasePlatformAdapter(ABC):
                 if boundary_decision is not None and isinstance(
                     getattr(boundary_decision, "delivery_authority", None), dict
                 ):
+                    authority_delivery_owned = True
                     if images or local_files or media_files:
                         raise RuntimeError(
                             "trusted outbound delivery authority does not support multipart sends"
@@ -6736,25 +6738,27 @@ class BasePlatformAdapter(ABC):
             )
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception as notify_err:
-                logger.error(
-                    "[%s] Failed to send error notification to user: %s",
-                    self.name, notify_err, exc_info=True,
-                )  # Last resort — don't let error reporting crash the handler
+            # Once Hook authority owns this delivery, any ordinary error send
+            # would be an unauthorized second provider attempt.
+            if not authority_delivery_owned:
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception as notify_err:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name, notify_err, exc_info=True,
+                    )  # Last resort — don't let error reporting crash the handler
         finally:
             await _settle_recovery_delivery(
                 delivered=False, reason="recovered_delivery_not_confirmed"

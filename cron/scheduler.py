@@ -3259,10 +3259,10 @@ def _deliver_result(
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = boundary_delivery_content.strip()
+                text_to_send = boundary_delivery_content
                 adapter_ok = True
                 timed_out = False
-                if text_to_send:
+                if text_to_send.strip():
                     if heartbeat is not None:
                         heartbeat()
                     from agent.async_utils import safe_schedule_threadsafe

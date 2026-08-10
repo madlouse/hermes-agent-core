@@ -878,7 +878,7 @@ class TestDeliverResultWrapping:
         boundary_decision = MagicMock(
             transmit=True,
             decision="allow",
-            content="请回复 1 确认",
+            content="  请回复 1 确认  ",
             raw={"decision": "allow"},
             delivery_authority={
                 "schema_version": "transport-outbox-hook/v1",
@@ -933,7 +933,7 @@ class TestDeliverResultWrapping:
                     "deliver": "origin",
                     "origin": {"platform": "telegram", "chat_id": "123"},
                 },
-                "请回复 1 确认",
+                "  请回复 1 确认  ",
                 adapters={Platform.TELEGRAM: adapter},
                 loop=loop,
             )
@@ -943,7 +943,7 @@ class TestDeliverResultWrapping:
         assert executions[0]["context"]["profile_id"] == "atlas"
         adapter.send_authorized.assert_awaited_once_with(
             "123",
-            "请回复 1 确认",
+            "  请回复 1 确认  ",
             metadata={"job_id": "authority-cron-live-job"},
             transport_request_id="request-cron-live",
         )
