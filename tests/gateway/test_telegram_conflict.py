@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -361,6 +362,34 @@ async def test_connect_does_not_block_on_post_connect_housekeeping(monkeypatch):
     await adapter.disconnect()
     assert adapter._post_connect_task is None
     await _cancel_heartbeat(adapter)
+
+
+@pytest.mark.asyncio
+async def test_post_connect_skill_scan_does_not_block_event_loop(monkeypatch):
+    """A large skill tree must not starve gateway liveness or other connects."""
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._bot = SimpleNamespace(set_my_commands=AsyncMock())
+    monkeypatch.setattr(adapter, "_set_status_indicator", AsyncMock())
+    monkeypatch.setattr(adapter, "_setup_dm_topics", AsyncMock())
+
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+
+    def _slow_menu_scan(*, max_commands):
+        scan_started.set()
+        release_scan.wait(timeout=2)
+        return [], 0
+
+    monkeypatch.setattr("hermes_cli.commands.telegram_menu_commands", _slow_menu_scan)
+
+    task = asyncio.create_task(adapter._run_post_connect_housekeeping())
+    try:
+        assert await asyncio.to_thread(scan_started.wait, 1)
+        await asyncio.sleep(0.05)
+        assert not release_scan.is_set()
+    finally:
+        release_scan.set()
+        await asyncio.wait_for(task, timeout=1)
 
 
 @pytest.mark.asyncio

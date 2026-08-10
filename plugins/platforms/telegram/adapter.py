@@ -3591,7 +3591,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 # staying under the threshold; users can tune the cap via
                 # platforms.telegram.extra.command_menu.
                 max_commands = telegram_menu_max_commands()
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+                # Skill discovery walks user-controlled directories and can be
+                # slow on large profiles. Keep it off the gateway event loop so
+                # watchdog heartbeats and other platform connects keep moving.
+                menu_commands, hidden_count = await asyncio.to_thread(
+                    telegram_menu_commands,
+                    max_commands=max_commands,
+                )
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
