@@ -160,6 +160,13 @@ def test_operator_enforced_without_hook_holds():
 
 def test_gateway_reply_source_kind_only_escalates_explicit_action_spec():
     assert ob.gateway_reply_source_kind("请回复 1 或 2 选择下一步") == "gateway_reply"
+    assert (
+        ob.gateway_reply_source_kind(
+            "已完成。两项均已确认，可靠投递回写成功：2/2 completed。",
+            enforced_channel=True,
+        )
+        == "gateway_reply"
+    )
     assert ob.gateway_reply_source_kind("[[ACTION_SPEC]] approve") == "operator_enforce"
 
 
@@ -174,6 +181,39 @@ def test_gateway_reply_context_does_not_force_text_heuristic():
     decision = run(ob.outbound_before_send(None, context))
     assert decision.transmit is True
     assert decision.reason == "not_actionable"
+
+
+def test_enforced_gateway_result_is_screened_without_becoming_actionable():
+    context = ob.build_outbound_context(
+        source_kind=ob.gateway_reply_source_kind(
+            "已完成。两项均已确认，可靠投递回写成功：2/2 completed。",
+            enforced_channel=True,
+        ),
+        content="已完成。两项均已确认，可靠投递回写成功：2/2 completed。",
+        platform="feishu",
+        chat_id="oc_test",
+        enforced_channel=True,
+        output_screening_required=True,
+    )
+
+    assert context["source_kind"] == "gateway_reply"
+    assert context["looks_actionable"] is False
+    assert ob.requires_boundary(context) is True
+
+
+def test_enforced_gateway_reply_with_explicit_actionability_stays_actionable():
+    context = ob.build_outbound_context(
+        source_kind="gateway_reply",
+        content="请回复 1 继续。",
+        platform="feishu",
+        chat_id="oc_test",
+        enforced_channel=True,
+        output_screening_required=True,
+        actionability={"requires_user_reply": True, "intent": "confirmation"},
+    )
+
+    assert context["looks_actionable"] is True
+    assert ob.requires_boundary(context) is True
 
 
 def test_gateway_reply_screening_requires_the_existing_hook_decision():
