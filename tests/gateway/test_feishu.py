@@ -285,18 +285,46 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
         )
 
-    def test_blocking_sdk_call_has_outer_deadline(self):
+    def test_async_send_sdk_call_has_outer_deadline(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import (
+            FeishuAdapter,
+            FeishuDeliveryTimeoutError,
+        )
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        async def _never_returns(_request):
+            await asyncio.Event().wait()
+
+        with patch(
+            "plugins.platforms.feishu.adapter._FEISHU_SEND_HARD_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            with self.assertRaisesRegex(
+                FeishuDeliveryTimeoutError, "delivery status unknown",
+            ):
+                asyncio.run(
+                    adapter._run_send_sdk(Mock(), _never_returns, object())
+                )
+        self.assertIsNone(adapter._sdk_executor)
+
+    def test_send_sdk_prefers_cancellable_async_api(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
-        with patch(
-            "plugins.platforms.feishu.adapter._FEISHU_SDK_HARD_TIMEOUT_SECONDS",
-            0.01,
-        ):
-            with self.assertRaisesRegex(TimeoutError, "delivery status unknown"):
-                asyncio.run(adapter._run_blocking(time.sleep, 0.1))
-        adapter._shutdown_sdk_executor()
+        sync_send = Mock(side_effect=AssertionError("sync path must not run"))
+        async_send = AsyncMock(return_value="sent")
+
+        result = asyncio.run(
+            adapter._run_send_sdk(sync_send, async_send, object())
+        )
+
+        self.assertEqual(result, "sent")
+        async_send.assert_awaited_once()
+        sync_send.assert_not_called()
+        self.assertIsNone(adapter._sdk_executor)
 
     def test_send_timeout_is_not_retried(self):
         from gateway.config import PlatformConfig
@@ -321,22 +349,31 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         adapter._send_raw_message.assert_awaited_once()
 
     def test_outer_send_retry_does_not_duplicate_timeout(self):
+        import httpx
+        import requests
+
         from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        adapter = FeishuAdapter(PlatformConfig())
-        adapter._client = object()
-        adapter._send_raw_message = AsyncMock(
-            side_effect=TimeoutError("ReadTimeout: delivery status unknown")
+        timeout_errors = (
+            requests.exceptions.ReadTimeout(),
+            requests.exceptions.Timeout(),
+            httpx.ReadTimeout(""),
+            asyncio.TimeoutError(),
         )
+        for timeout_error in timeout_errors:
+            with self.subTest(error_type=type(timeout_error).__name__):
+                adapter = FeishuAdapter(PlatformConfig())
+                adapter._client = object()
+                adapter._send_raw_message = AsyncMock(side_effect=timeout_error)
 
-        result = asyncio.run(
-            adapter._send_with_retry(chat_id="oc_chat", content="hello")
-        )
+                result = asyncio.run(
+                    adapter._send_with_retry(chat_id="oc_chat", content="hello")
+                )
 
-        self.assertFalse(result.success)
-        self.assertIn("timeout", (result.error or "").lower())
-        adapter._send_raw_message.assert_awaited_once()
+                self.assertFalse(result.success)
+                self.assertIn("timed out", (result.error or "").lower())
+                adapter._send_raw_message.assert_awaited_once()
 
     def test_sdk_client_uses_explicit_request_timeout(self):
         from gateway.config import PlatformConfig

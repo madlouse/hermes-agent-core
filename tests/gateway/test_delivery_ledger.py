@@ -179,7 +179,11 @@ class TestGatewayRedeliverySweep:
         assert n == 1
         sent = adapter.send.call_args.kwargs
         assert sent["content"] == "the final answer"  # no marker
-        assert sent["metadata"] == {"thread_id": "171.001"}
+        assert sent["metadata"] == {
+            "thread_id": "171.001",
+            "hermes_delivery_idempotency_key": "ob-1",
+            "hermes_delivery_part": "text",
+        }
         assert _row("ob-1")["state"] == "delivered"
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
@@ -296,4 +300,3 @@ class TestUnconnectedPlatformKeepsItsBudget:
             "the obligation was abandoned without a single send being attempted"
         )
         assert _row("ob-1")["attempts"] == 0
-

@@ -33,6 +33,7 @@ class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True), Platform.SLACK)
         self.sent = []
+        self.sent_metadata = []
 
     async def connect(self, *, is_reconnect: bool = False):  # pragma: no cover
         return True
@@ -45,6 +46,7 @@ class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append(content)
+        self.sent_metadata.append(metadata)
         return SendResult(success=True, message_id="m1")
 
 
@@ -109,6 +111,11 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+        assert adapter.sent_metadata == [{
+            "notify": True,
+            "hermes_delivery_idempotency_key": rows[0][0],
+            "hermes_delivery_part": "text",
+        }]
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):

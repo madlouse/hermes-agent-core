@@ -220,8 +220,8 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
-_FEISHU_SDK_REQUEST_TIMEOUT_SECONDS = 20.0
-_FEISHU_SDK_HARD_TIMEOUT_SECONDS = 25.0
+_FEISHU_SDK_REQUEST_TIMEOUT_SECONDS = 30.0
+_FEISHU_SEND_HARD_TIMEOUT_SECONDS = 35.0
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -369,6 +369,10 @@ _SKIP_TEXT_KEYS = {
     "template",
     "locale",
 }
+
+
+class FeishuDeliveryTimeoutError(TimeoutError):
+    """A send timed out after delivery may already have occurred."""
 
 
 @dataclass(frozen=True)
@@ -1757,17 +1761,33 @@ class FeishuAdapter(BasePlatformAdapter):
             return executor
 
     async def _run_blocking(self, func, *args):
-        """Run a blocking Feishu SDK call with a gateway-owned deadline."""
+        """Run a blocking Feishu SDK call on the adapter-owned thread pool."""
         loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(self._get_sdk_executor(), func, *args)
+        return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
+
+    async def _run_send_sdk(self, sync_func, async_func, request):
+        """Run a message send on the cancellable SDK path with a hard deadline."""
         try:
-            return await asyncio.wait_for(
-                future, timeout=_FEISHU_SDK_HARD_TIMEOUT_SECONDS,
+            if callable(async_func):
+                return await asyncio.wait_for(
+                    async_func(request),
+                    timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
+                )
+
+            # Compatibility fallback for SDKs older than the repository pin.
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(
+                self._get_sdk_executor(), sync_func, request,
             )
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError(
-                "Feishu SDK call timed out after "
-                f"{_FEISHU_SDK_HARD_TIMEOUT_SECONDS:g}s; delivery status unknown"
+            return await asyncio.wait_for(
+                future, timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            if not self._is_timeout_exception(exc):
+                raise
+            raise FeishuDeliveryTimeoutError(
+                "Feishu send timed out after "
+                f"{_FEISHU_SEND_HARD_TIMEOUT_SECONDS:g}s; delivery status unknown"
             ) from exc
 
     def _shutdown_sdk_executor(self) -> None:
@@ -4898,7 +4918,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=message_uuid,
             )
             request = self._build_reply_message_request(effective_reply_to, body)
-            return await self._run_blocking(self._client.im.v1.message.reply, request)
+            message_api = self._client.im.v1.message
+            return await self._run_send_sdk(
+                message_api.reply,
+                getattr(message_api, "areply", None),
+                request,
+            )
 
         # For topic/thread messages that fell back from reply→create, use
         # thread_id as receive_id so the message lands in the topic instead of
@@ -4928,11 +4953,28 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=message_uuid,
             )
             request = self._build_create_message_request(receive_id_type, body)
-        return await self._run_blocking(self._client.im.v1.message.create, request)
+        message_api = self._client.im.v1.message
+        return await self._run_send_sdk(
+            message_api.create,
+            getattr(message_api, "acreate", None),
+            request,
+        )
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
         return bool(response and getattr(response, "success", lambda: False)())
+
+    @staticmethod
+    def _is_timeout_exception(exc: BaseException) -> bool:
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return True
+        if any("timeout" in cls.__name__.lower() for cls in type(exc).__mro__):
+            return True
+        lowered = str(exc).lower()
+        return any(
+            marker in lowered
+            for marker in ("timed out", "readtimeout", "writetimeout")
+        )
 
     @staticmethod
     def _extract_response_field(response: Any, field_name: str) -> Any:
@@ -5111,11 +5153,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 # A timeout can happen after Feishu accepted the request. Retrying
                 # here could duplicate a user-visible message, so surface the
                 # uncertain result to the delivery ledger instead.
-                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or any(
-                    marker in str(exc).lower()
-                    for marker in ("timed out", "readtimeout", "writetimeout")
-                ):
-                    raise
+                if self._is_timeout_exception(exc):
+                    if isinstance(exc, FeishuDeliveryTimeoutError):
+                        raise
+                    raise FeishuDeliveryTimeoutError(
+                        "Feishu send timed out; delivery status unknown"
+                    ) from exc
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
                 wait_seconds = 2 ** attempt

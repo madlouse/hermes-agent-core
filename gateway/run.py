@@ -10755,9 +10755,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
-            metadata = (
-                {"thread_id": row["thread_id"]} if row.get("thread_id") else None
-            )
+            metadata = {
+                "hermes_delivery_idempotency_key": row["obligation_id"],
+                "hermes_delivery_part": "text",
+            }
+            if row.get("thread_id"):
+                metadata["thread_id"] = row["thread_id"]
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],

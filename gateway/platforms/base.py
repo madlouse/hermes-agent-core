@@ -6292,7 +6292,15 @@ class BasePlatformAdapter(ABC):
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
-                        metadata=_delivery_metadata("text"),
+                        metadata=(
+                            _delivery_metadata("text")
+                            if _obligation_id is None or recovery_key
+                            else {
+                                **_final_thread_metadata,
+                                "hermes_delivery_idempotency_key": _obligation_id,
+                                "hermes_delivery_part": "text",
+                            }
+                        ),
                     )
                     _record_delivery(result)
                     if _obligation_id is not None:
