@@ -3046,6 +3046,18 @@ def _deliver_result(
                 boundary_media_files
             )
             boundary_context["content"] = boundary_delivery_content
+            authority_active = isinstance(
+                getattr(boundary_decision, "delivery_authority", None), dict
+            )
+            authority_terminal = False
+            if authority_active and boundary_media_files:
+                raise RuntimeError(
+                    "trusted outbound delivery authority does not support multipart sends"
+                )
+            if authority_active and not boundary_delivery_content.strip():
+                raise RuntimeError(
+                    "trusted outbound delivery authority requires one non-empty text send"
+                )
             boundary_unchanged = (
                 boundary_decision.decision == "allow"
                 and boundary_decision.content == delivery_content
@@ -3091,6 +3103,7 @@ def _deliver_result(
             and runtime_adapter is not None
             and loop is not None
             and not thread_id  # never override an explicit origin thread/topic
+            and not authority_active
         ):
             new_thread_id = _open_continuable_cron_thread(
                 job, runtime_adapter, chat_id, loop,
@@ -3185,12 +3198,28 @@ def _deliver_result(
                     # detection when "thread_id"/"message_thread_id" are absent
                     # from metadata, deriving the routing from target.thread_id
                     # or the explicit direct_messages_topic_id above.
-                    future = safe_schedule_threadsafe(
-                        router._deliver_to_platform(
+                    async def _send_live_payload():
+                        return await router._deliver_to_platform(
                             route_target,
                             text_to_send,
                             route_metadata,
-                        ),
+                        )
+
+                    if authority_active:
+                        from gateway.outbound_boundary import (
+                            execute_authorized_outbound_send,
+                        )
+
+                        live_send_coro = execute_authorized_outbound_send(
+                            hooks=outbound_hooks,
+                            context=boundary_context,
+                            decision=boundary_decision,
+                            send=_send_live_payload,
+                        )
+                    else:
+                        live_send_coro = _send_live_payload()
+                    future = safe_schedule_threadsafe(
+                        live_send_coro,
                         loop,
                     )
                     if future is None:
@@ -3203,6 +3232,12 @@ def _deliver_result(
                             send_result = future.result(
                                 timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
                             )
+                            if authority_active:
+                                authority_execution = send_result
+                                send_result = authority_execution.result
+                                authority_terminal = (
+                                    authority_execution.outcome != "confirmed"
+                                )
                         except TimeoutError:
                             # #38922: a slow confirmation does NOT necessarily
                             # mean the send failed — but we must distinguish two
@@ -3247,6 +3282,30 @@ def _deliver_result(
                                     try:
                                         send_result = future.result(
                                             timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
+                                        )
+                                        if authority_active:
+                                            authority_execution = send_result
+                                            send_result = authority_execution.result
+                                            authority_terminal = (
+                                                authority_execution.outcome != "confirmed"
+                                            )
+                                        break
+                                    except TimeoutError:
+                                        continue
+                            elif authority_active:
+                                logger.warning(
+                                    "Job '%s': trusted live adapter send to %s:%s "
+                                    "is in flight; waiting for an authoritative receipt",
+                                    job["id"], platform_name, chat_id,
+                                )
+                                while True:
+                                    try:
+                                        authority_execution = future.result(
+                                            timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
+                                        )
+                                        send_result = authority_execution.result
+                                        authority_terminal = (
+                                            authority_execution.outcome != "confirmed"
                                         )
                                         break
                                     except TimeoutError:
@@ -3297,6 +3356,9 @@ def _deliver_result(
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+
+                            if authority_active and authority_terminal:
+                                send_success = False
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -3390,11 +3452,12 @@ def _deliver_result(
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
-                    _record_confirmed_outbound_send(
-                        outbound_hooks,
-                        boundary_context,
-                        boundary_send_result,
-                    )
+                    if not authority_active:
+                        _record_confirmed_outbound_send(
+                            outbound_hooks,
+                            boundary_context,
+                            boundary_send_result,
+                        )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -3423,6 +3486,8 @@ def _deliver_result(
             except CronRunOutcomeOwnershipLost:
                 raise
             except Exception as e:
+                if authority_active:
+                    authority_terminal = True
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
@@ -3433,6 +3498,12 @@ def _deliver_result(
                         "Job '%s': %s, falling back to standalone",
                         job["id"], err_msg,
                     )
+
+        if not delivered and authority_terminal:
+            delivery_errors.extend(target_errors or [
+                f"trusted delivery to {platform_name}:{chat_id} was not confirmed"
+            ])
+            continue
 
         if not delivered:
             if transport is not None and transport.is_relay:
@@ -3485,11 +3556,29 @@ def _deliver_result(
 
             if heartbeat is not None:
                 heartbeat()
-            coro = (
-                _standalone_delivery()
-                if heartbeat is None
-                else _standalone_delivery_with_heartbeat()
-            )
+            def _standalone_coro():
+                if not authority_active:
+                    return (
+                        _standalone_delivery()
+                        if heartbeat is None
+                        else _standalone_delivery_with_heartbeat()
+                    )
+                from gateway.outbound_boundary import (
+                    execute_authorized_outbound_send,
+                )
+
+                return execute_authorized_outbound_send(
+                    hooks=outbound_hooks,
+                    context=boundary_context,
+                    decision=boundary_decision,
+                    send=lambda: (
+                        _standalone_delivery()
+                        if heartbeat is None
+                        else _standalone_delivery_with_heartbeat()
+                    ),
+                )
+
+            coro = _standalone_coro()
             try:
                 result = asyncio.run(coro)
             except CronRunOutcomeOwnershipLost:
@@ -3520,11 +3609,7 @@ def _deliver_result(
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        fallback_coro = (
-                            _standalone_delivery()
-                            if heartbeat is None
-                            else _standalone_delivery_with_heartbeat()
-                        )
+                        fallback_coro = _standalone_coro()
                         future = pool.submit(_run_coro_in_new_loop, fallback_coro)
                         result = future.result(timeout=30)
                     finally:
@@ -3552,6 +3637,18 @@ def _deliver_result(
                 delivery_errors.extend(target_errors)
                 continue
 
+            if authority_active:
+                authority_execution = result
+                result = authority_execution.result
+                if authority_execution.outcome != "confirmed":
+                    msg = (
+                        "trusted delivery returned "
+                        f"{authority_execution.outcome} outcome"
+                    )
+                    target_errors.append(msg)
+                    delivery_errors.extend(target_errors)
+                    continue
+
             if heartbeat is not None:
                 heartbeat()
             if result and result.get("error"):
@@ -3571,11 +3668,12 @@ def _deliver_result(
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
-            _record_confirmed_outbound_send(
-                outbound_hooks,
-                boundary_context,
-                result,
-            )
+            if not authority_active:
+                _record_confirmed_outbound_send(
+                    outbound_hooks,
+                    boundary_context,
+                    result,
+                )
             _append_delivery_receipt(delivery_receipts, result, kind="payload")
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, boundary_mirror_text,

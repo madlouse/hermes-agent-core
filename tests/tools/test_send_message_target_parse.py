@@ -5,7 +5,9 @@ skips wholesale when optional Telegram dependencies are not installed.
 """
 
 import asyncio
+import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -316,3 +318,77 @@ def test_send_message_rewrite_drops_media_from_the_unscreened_source() -> None:
         media_files=[],
         force_document=False,
     )
+
+
+def test_send_message_hook_authority_uses_core_executor_once() -> None:
+    from gateway.outbound_boundary import AuthorizedOutboundExecution
+
+    content = "请回复 1 确认"
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "whatsapp",
+        "channel_id": "120363408391911677@g.us",
+        "thread_id": "",
+    }
+    request = {
+        "request_id": "request-send-message-hook",
+        "profile_id": "atlas",
+        "frame_id": "frame-send-message-hook",
+        "notification_claim_id": "claim-send-message-hook",
+        "decision_route": route,
+        "notification_route": route,
+        "items_content_hash": "sha256:items",
+        "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "claim_created_at": now.isoformat(),
+        "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    authority = {
+        "schema_version": "transport-outbox-hook/v1",
+        "required": True,
+        "request": request,
+    }
+    runner = _runner_with_boundary_result(
+        {"decision": "allow", "reason": "registered", "delivery_authority": authority},
+        owner="outbound-actionable",
+        capabilities={"output-screening", "transport-outbox-authority"},
+    )
+    whatsapp_cfg = SimpleNamespace(enabled=True, token=None, extra={"api_url": "http://bridge"})
+    config = SimpleNamespace(
+        platforms={Platform.WHATSAPP: whatsapp_cfg},
+        get_home_channel=lambda _platform: None,
+    )
+    executions = []
+
+    async def execute(**kwargs):
+        executions.append(kwargs)
+        provider_result = await kwargs["send"]()
+        return AuthorizedOutboundExecution(
+            result=provider_result,
+            outcome="confirmed",
+            request=request,
+            receipt={"receipt_id": "receipt-send-message-hook"},
+            provider_called=True,
+        )
+
+    with patch.dict("os.environ", {"HERMES_PROFILE_ID": "atlas"}), \
+         patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("tools.interrupt.is_interrupted", return_value=False), \
+         patch("model_tools._run_async", side_effect=_run_async_immediately), \
+         patch("gateway.run._gateway_runner_ref", return_value=runner), \
+         patch("gateway.outbound_boundary.execute_authorized_outbound_send", side_effect=execute), \
+         patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "om-1"})) as send_mock, \
+         patch("gateway.mirror.mirror_to_session", return_value=True):
+        result = json.loads(
+            send_message_tool(
+                {
+                    "action": "send",
+                    "target": "whatsapp:120363408391911677@g.us",
+                    "message": content,
+                }
+            )
+        )
+
+    assert len(executions) == 1
+    send_mock.assert_awaited_once()
+    assert result["transport_request_id"] == request["request_id"]
+    assert result["transport_receipt_id"] == "receipt-send-message-hook"

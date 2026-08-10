@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -302,6 +304,116 @@ def test_adapter_screens_plain_gateway_reply_before_existing_send(monkeypatch):
     assert calls[0][1]["output_screening_required"] is True
     assert calls[0][1]["profile_id"] == "atlas"
     assert calls[0][1]["profile_path"] == str(adapter._test_profile_home)
+
+
+def test_gateway_final_reply_hook_authority_uses_core_executor(monkeypatch):
+    content = "请回复 1 确认"
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "telegram",
+        "channel_id": "admin-dm",
+        "thread_id": "",
+    }
+    request = {
+        "request_id": "request-gateway-reply",
+        "profile_id": "atlas",
+        "frame_id": "frame-gateway-reply",
+        "notification_claim_id": "claim-gateway-reply",
+        "decision_route": route,
+        "notification_route": route,
+        "items_content_hash": "sha256:items",
+        "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "claim_created_at": now.isoformat(),
+        "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "request": request,
+    }
+    executions = []
+
+    def boundary(_event_type, _payload):
+        return {
+            "decision": "allow",
+            "reason": "registered",
+            "delivery_authority": authority,
+        }
+
+    async def execute(**kwargs):
+        executions.append(kwargs)
+        provider_result = await kwargs["send"]()
+        return ob.AuthorizedOutboundExecution(
+            result=provider_result,
+            outcome="confirmed",
+            request=request,
+            receipt={"receipt_id": "receipt-gateway-reply"},
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(ob, "execute_authorized_outbound_send", execute)
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(
+            named_handler(
+                boundary,
+                capabilities={
+                    ob.REQUIRED_SCREENING_CAPABILITY,
+                    ob.TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY,
+                },
+            )
+        ),
+        response=content,
+    )
+
+    assert len(executions) == 1
+    adapter._send_with_retry.assert_awaited_once()
+    assert executions[0]["decision"].delivery_authority == authority
+
+
+def test_gateway_notice_hook_authority_uses_core_executor(monkeypatch):
+    from gateway import run as gateway_run
+
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "request": {"request_id": "request-gateway-notice"},
+    }
+    decision = SimpleNamespace(
+        content="最终通知内容",
+        delivery_authority=authority,
+    )
+    provider = lambda: SendResult(success=True, message_id="notice-1")
+    executions = []
+
+    def execute(**kwargs):
+        executions.append(kwargs)
+        result = kwargs["send"]()
+        return ob.AuthorizedOutboundExecution(
+            result=result,
+            outcome="confirmed",
+            request={"request_id": "request-gateway-notice"},
+            receipt={"receipt_id": "receipt-gateway-notice"},
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(ob, "execute_authorized_outbound_send_sync", execute)
+    monkeypatch.setattr(
+        gateway_run,
+        "_operator_enforce_outbound_after_send",
+        lambda *args: pytest.fail("legacy after_send must not run for authority"),
+    )
+
+    result = gateway_run._send_screened_gateway_notice(
+        Hooks(),
+        {"source_kind": "gateway_notice"},
+        decision,
+        provider,
+    )
+
+    assert result.message_id == "notice-1"
+    assert len(executions) == 1
+    assert executions[0]["context"]["content"] == "最终通知内容"
 
 
 def test_armed_adapter_screens_terminal_result_without_actionable_escalation(monkeypatch):

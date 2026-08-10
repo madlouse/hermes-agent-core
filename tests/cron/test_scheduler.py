@@ -1,5 +1,6 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import asyncio
 import contextlib
 import itertools
 import json
@@ -711,6 +712,132 @@ class TestDeliverResultWrapping:
         assert send_mock.await_args.args[3] == "safe projected result"
         assert send_mock.await_args.kwargs["media_files"] == []
         assert mirror_mock.call_args.args[3] == "safe projected result"
+
+    def test_hook_authority_wraps_standalone_cron_provider_once(self):
+        from gateway.config import Platform
+        from gateway.outbound_boundary import AuthorizedOutboundExecution
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        authority = {
+            "schema_version": "transport-outbox-hook/v1",
+            "required": True,
+            "request": {"request_id": "request-cron-hook"},
+        }
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="请回复 1 确认",
+            raw={"decision": "allow"},
+            delivery_authority=authority,
+        )
+        send_mock = AsyncMock(
+            return_value={"success": True, "message_id": "cron-message-1"}
+        )
+        executions = []
+
+        async def execute(**kwargs):
+            executions.append(kwargs)
+            provider_result = await kwargs["send"]()
+            return AuthorizedOutboundExecution(
+                result=provider_result,
+                outcome="confirmed",
+                request={"request_id": "request-cron-hook"},
+                receipt={"receipt_id": "receipt-cron-hook"},
+                provider_called=True,
+            )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("gateway.outbound_boundary.execute_authorized_outbound_send", side_effect=execute), \
+             patch("gateway.outbound_boundary.outbound_after_send_sync") as after_send, \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(
+                {
+                    "id": "authority-cron-job",
+                    "profile_id": "atlas",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "请回复 1 确认",
+            )
+
+        assert result is None
+        assert len(executions) == 1
+        send_mock.assert_awaited_once()
+        after_send.assert_not_called()
+
+    def test_hook_authority_wraps_live_cron_provider_once(self):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+        from gateway.outbound_boundary import AuthorizedOutboundExecution
+        from gateway.platforms.base import SendResult
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="请回复 1 确认",
+            raw={"decision": "allow"},
+            delivery_authority={
+                "schema_version": "transport-outbox-hook/v1",
+                "required": True,
+                "request": {"request_id": "request-cron-live"},
+            },
+        )
+        executions = []
+
+        async def execute(**kwargs):
+            executions.append(kwargs)
+            provider_result = await kwargs["send"]()
+            return AuthorizedOutboundExecution(
+                result=provider_result,
+                outcome="confirmed",
+                request={"request_id": "request-cron-live"},
+                receipt={"receipt_id": "receipt-cron-live"},
+                provider_called=True,
+            )
+
+        def run_now(coro, _loop):
+            future = Future()
+            try:
+                future.set_result(asyncio.run(coro))
+            except Exception as exc:
+                future.set_exception(exc)
+            return future
+
+        adapter = AsyncMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        standalone_send = AsyncMock(return_value={"success": True})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("gateway.outbound_boundary.execute_authorized_outbound_send", side_effect=execute), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=run_now), \
+             patch("gateway.delivery.DeliveryRouter._deliver_to_platform", new=AsyncMock(return_value=SendResult(success=True, message_id="cron-live-1"))) as live_send, \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                {
+                    "id": "authority-cron-live-job",
+                    "profile_id": "atlas",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "请回复 1 确认",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        assert len(executions) == 1
+        live_send.assert_awaited_once()
+        standalone_send.assert_not_awaited()
 
 
 class TestDeliverResultErrorReturns:

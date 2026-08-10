@@ -5976,6 +5976,8 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             outbound_boundary_context = None
             outbound_hooks = None
+            boundary_decision = None
+            authority_execution = None
             if response:
                 try:
                     from gateway.outbound_boundary import (
@@ -6089,6 +6091,15 @@ class BasePlatformAdapter(ABC):
                 # with an unknown extension is intentionally left in the body for
                 # extract_local_files below to pick up rather than silently dropped (#34517).
                 text_content = _strip_media_directives(text_content).strip()
+                if (
+                    boundary_decision is not None
+                    and isinstance(getattr(boundary_decision, "delivery_authority", None), dict)
+                ):
+                    if not text_content:
+                        raise RuntimeError(
+                            "trusted outbound delivery authority requires one text send"
+                        )
+                    outbound_boundary_context["content"] = text_content
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
@@ -6132,6 +6143,15 @@ class BasePlatformAdapter(ABC):
                         )
                         text_content = _recovered
 
+                if (
+                    boundary_decision is not None
+                    and isinstance(getattr(boundary_decision, "delivery_authority", None), dict)
+                    and (images or local_files or media_files)
+                ):
+                    raise RuntimeError(
+                        "trusted outbound delivery authority does not support multipart sends"
+                    )
+
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
@@ -6165,6 +6185,10 @@ class BasePlatformAdapter(ABC):
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
+                        and not (
+                            boundary_decision is not None
+                            and isinstance(getattr(boundary_decision, "delivery_authority", None), dict)
+                        )
                         and not self._streaming_tts_turn_completed(
                             session_key,
                             getattr(interrupt_event, "_hermes_run_generation", None),
@@ -6296,20 +6320,42 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=(
-                            _delivery_metadata("text")
-                            if _obligation_id is None or recovery_key
-                            else {
-                                **_final_thread_metadata,
-                                "hermes_delivery_idempotency_key": _obligation_id,
-                                "hermes_delivery_part": "text",
-                            }
-                        ),
-                    )
+                    async def _send_final_text():
+                        return await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=(
+                                _delivery_metadata("text")
+                                if _obligation_id is None or recovery_key
+                                else {
+                                    **_final_thread_metadata,
+                                    "hermes_delivery_idempotency_key": _obligation_id,
+                                    "hermes_delivery_part": "text",
+                                }
+                            ),
+                        )
+
+                    if (
+                        boundary_decision is not None
+                        and isinstance(getattr(boundary_decision, "delivery_authority", None), dict)
+                    ):
+                        from gateway.outbound_boundary import (
+                            execute_authorized_outbound_send,
+                        )
+
+                        authority_execution = await execute_authorized_outbound_send(
+                            hooks=outbound_hooks,
+                            context=outbound_boundary_context,
+                            decision=boundary_decision,
+                            send=_send_final_text,
+                        )
+                        result = self.normalize_delivery_result(
+                            authority_execution.result,
+                            operation="trusted outbound delivery",
+                        )
+                    else:
+                        result = await _send_final_text()
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -6519,6 +6565,7 @@ class BasePlatformAdapter(ABC):
                 if (
                     outbound_boundary_context is not None
                     and boundary_delivery_result is not None
+                    and authority_execution is None
                 ):
                     try:
                         from gateway.outbound_boundary import (

@@ -558,6 +558,7 @@ def _operator_enforce_outbound_boundary_for_source(
             decision.reason,
         )
         return False, "", context
+    context["_boundary_decision"] = decision
     return True, decision.content or content, context
 
 
@@ -580,8 +581,10 @@ def _operator_enforce_outbound_after_send(
         )
         return
     payload = send_result_payload(send_result)
+    public_context = dict(context)
+    public_context.pop("_boundary_decision", None)
     evidence = {
-        **context,
+        **public_context,
         "send_result": payload,
         "source_outbox_id": (
             payload.get("outbox_id")
@@ -600,6 +603,29 @@ def _operator_enforce_outbound_after_send(
             "Outbound after-send audit failed after delivery: %s",
             exc,
         )
+
+
+def _send_screened_gateway_notice(
+    hooks: Any,
+    context: dict[str, Any],
+    decision: Any,
+    send: Callable[[], Any],
+) -> Any:
+    """Send one screened notice through the trusted authority path when present."""
+    if isinstance(getattr(decision, "delivery_authority", None), dict):
+        from gateway.outbound_boundary import execute_authorized_outbound_send_sync
+
+        context = {**context, "content": decision.content}
+        return execute_authorized_outbound_send_sync(
+            hooks=hooks,
+            context=context,
+            decision=decision,
+            send=send,
+        ).result
+    result = send()
+    if getattr(result, "success", False):
+        _operator_enforce_outbound_after_send(hooks, context, result)
+    return result
 
 
 def _non_conversational_metadata(
@@ -5439,6 +5465,9 @@ class TurnRunner:
                 is not None
                 and approval_decision.decision == "allow"
                 and approval_decision.content == approval_text
+                and not isinstance(
+                    getattr(approval_decision, "delivery_authority", None), dict
+                )
             ):
                 try:
                     _approval_fut = safe_schedule_threadsafe(
@@ -5481,24 +5510,27 @@ class TurnRunner:
             # Slack threads and reserved by Matrix clients.
             msg = approval_decision.content
             try:
-                _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
-                        ctx._status_chat_id,
-                        msg,
-                        metadata=ctx._status_thread_metadata,
-                    ),
-                    ctx._loop_for_step,
-                    logger=logger,
-                    log_message="Approval text-send scheduling error",
+                def _send_approval_text():
+                    _approval_send_fut = safe_schedule_threadsafe(
+                        ctx._status_adapter.send(
+                            ctx._status_chat_id,
+                            msg,
+                            metadata=ctx._status_thread_metadata,
+                        ),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="Approval text-send scheduling error",
+                    )
+                    if _approval_send_fut is None:
+                        raise RuntimeError("Approval text-send loop unavailable")
+                    return _approval_send_fut.result(timeout=15)
+
+                _send_screened_gateway_notice(
+                    approval_hooks,
+                    approval_context,
+                    approval_decision,
+                    _send_approval_text,
                 )
-                if _approval_send_fut is not None:
-                    _approval_result = _approval_send_fut.result(timeout=15)
-                    if getattr(_approval_result, "success", False):
-                        _operator_enforce_outbound_after_send(
-                            approval_hooks,
-                            approval_context,
-                            _approval_result,
-                        )
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
 
@@ -25951,16 +25983,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
-                                _first_send_result = await adapter.send(
-                                    source.chat_id,
-                                    first_response,
-                                    metadata=_status_thread_metadata,
+                                _boundary_decision = (
+                                    _boundary_context.pop("_boundary_decision", None)
+                                    if _boundary_context is not None
+                                    else None
                                 )
-                                _operator_enforce_outbound_after_send(
-                                    getattr(self, "hooks", None),
-                                    _boundary_context,
-                                    _first_send_result,
-                                )
+                                if (
+                                    _boundary_decision is not None
+                                    and isinstance(
+                                        getattr(_boundary_decision, "delivery_authority", None),
+                                        dict,
+                                    )
+                                ):
+                                    from gateway.outbound_boundary import (
+                                        execute_authorized_outbound_send,
+                                    )
+
+                                    _boundary_context["content"] = first_response
+                                    await execute_authorized_outbound_send(
+                                        hooks=getattr(self, "hooks", None),
+                                        context=_boundary_context,
+                                        decision=_boundary_decision,
+                                        send=lambda: adapter.send(
+                                            source.chat_id,
+                                            first_response,
+                                            metadata=_status_thread_metadata,
+                                        ),
+                                    )
+                                else:
+                                    _first_send_result = await adapter.send(
+                                        source.chat_id,
+                                        first_response,
+                                        metadata=_status_thread_metadata,
+                                    )
+                                    _operator_enforce_outbound_after_send(
+                                        getattr(self, "hooks", None),
+                                        _boundary_context,
+                                        _first_send_result,
+                                    )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
