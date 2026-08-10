@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 RELEASE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "release.py"
+REPO_ROOT = RELEASE_SCRIPT.parent.parent
 
 
 def _load_release_module():
@@ -14,6 +15,33 @@ def _load_release_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_repository_release_versions_are_identical():
+    import re
+
+    init_text = (REPO_ROOT / "hermes_cli" / "__init__.py").read_text()
+    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text()
+    uv_lock_text = (REPO_ROOT / "uv.lock").read_text()
+    desktop = json.loads(
+        (REPO_ROOT / "apps" / "desktop" / "package.json").read_text()
+    )
+    package_lock = json.loads((REPO_ROOT / "package-lock.json").read_text())
+
+    versions = {
+        re.search(r'^__version__ = "([^"]+)"$', init_text, re.MULTILINE).group(1),
+        re.search(
+            r'^version = "([^"]+)"$', pyproject_text, re.MULTILINE
+        ).group(1),
+        re.search(
+            r'\[\[package\]\]\nname = "hermes-agent"\nversion = "([^"]+)"',
+            uv_lock_text,
+        ).group(1),
+        desktop["version"],
+        package_lock["packages"]["apps/desktop"]["version"],
+    }
+
+    assert len(versions) == 1
 
 
 def test_version_update_and_stage_list_cover_desktop_lockfile(tmp_path, monkeypatch):
