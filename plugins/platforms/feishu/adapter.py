@@ -113,6 +113,7 @@ CallBackCard = None  # type: ignore[assignment]
 P2CardActionTriggerResponse = None  # type: ignore[assignment]
 EventDispatcherHandler = None  # type: ignore[assignment]
 FeishuWSClient = None  # type: ignore[assignment]
+LarkTokenManager = None  # type: ignore[assignment]
 FEISHU_AVAILABLE = False
 _lark_import_lock = threading.Lock()
 
@@ -1438,6 +1439,7 @@ def _load_lark_oapi() -> bool:
                 CallBackCard, P2CardActionTriggerResponse,
             )
             from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+            from lark_oapi.core.token.manager import TokenManager as LarkTokenManager
             from lark_oapi.ws import Client as FeishuWSClient
         except ImportError:
             return False
@@ -1469,6 +1471,7 @@ def _load_lark_oapi() -> bool:
             "P2CardActionTriggerResponse": P2CardActionTriggerResponse,
             "EventDispatcherHandler": EventDispatcherHandler,
             "FeishuWSClient": FeishuWSClient,
+            "LarkTokenManager": LarkTokenManager,
             "FEISHU_AVAILABLE": True,
         })
         return True
@@ -1493,6 +1496,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_delivery_idempotency = True
+    # Feishu documents a one-hour UUID deduplication window. Keep ten minutes
+    # of clock/skew margin so recovery never assumes deduplication too late.
+    delivery_idempotency_ttl_seconds = 50 * 60
 
     MAX_MESSAGE_LENGTH = 8000
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
@@ -1519,6 +1526,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # if it has been shut down. See issue #10849.
         self._sdk_executor_lock = threading.Lock()
         self._sdk_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._send_token_refresh_lock: Optional[asyncio.Lock] = None
+        self._send_token_refresh_future: Optional[
+            concurrent.futures.Future
+        ] = None
         # Set on disconnect/shutdown so a real teardown can't be resurrected
         # by the recreate-on-shutdown path; cleared on connect for reconnects.
         self._sdk_executor_closing = False
@@ -1765,10 +1776,47 @@ class FeishuAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
 
+    async def _ensure_send_token_ready(self) -> None:
+        """Prime the SDK token cache off-loop before entering async send APIs."""
+        if LarkTokenManager is None or self._client is None:
+            return
+        config = getattr(self._client, "config", None)
+        if config is None:
+            return
+        lock = self._send_token_refresh_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._send_token_refresh_lock = lock
+
+        async with lock:
+            prior = self._send_token_refresh_future
+            if prior is not None and not prior.done():
+                raise FeishuDeliveryTimeoutError(
+                    "Feishu token refresh is still blocked; send not attempted"
+                )
+            self._send_token_refresh_future = None
+            future = self._get_sdk_executor().submit(
+                LarkTokenManager.get_self_tenant_token, config,
+            )
+            self._send_token_refresh_future = future
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.wrap_future(future)),
+                    timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise FeishuDeliveryTimeoutError(
+                    "Feishu token refresh timed out; send not attempted"
+                ) from exc
+            finally:
+                if future.done():
+                    self._send_token_refresh_future = None
+
     async def _run_send_sdk(self, sync_func, async_func, request):
         """Run a message send on the cancellable SDK path with a hard deadline."""
         try:
             if callable(async_func):
+                await self._ensure_send_token_ready()
                 return await asyncio.wait_for(
                     async_func(request),
                     timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
@@ -1783,6 +1831,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 future, timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
             )
         except Exception as exc:
+            if isinstance(exc, FeishuDeliveryTimeoutError):
+                raise
             if not self._is_timeout_exception(exc):
                 raise
             raise FeishuDeliveryTimeoutError(

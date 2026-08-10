@@ -10715,6 +10715,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
                 ledger_enabled,
+                mark_abandoned,
                 mark_delivered,
                 mark_failed,
                 sweep_recoverable,
@@ -10752,8 +10753,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
+            idempotent_recovery = (
+                getattr(adapter, "supports_delivery_idempotency", False) is True
+            )
+            idempotency_ttl = getattr(
+                adapter, "delivery_idempotency_ttl_seconds", None
+            )
+            if (
+                idempotent_recovery
+                and idempotency_ttl
+                and (time.time() - float(row["created_at"])) >= idempotency_ttl
+            ):
+                await asyncio.to_thread(
+                    mark_abandoned,
+                    row["obligation_id"],
+                    "platform idempotency window expired",
+                )
+                logger.error(
+                    "obligation %s: not redelivered after platform "
+                    "idempotency window expired",
+                    row["obligation_id"],
+                )
+                continue
             content = row["content"]
-            if row.get("needs_marker"):
+            if row.get("needs_marker") and not idempotent_recovery:
                 content = RECOVERED_MARKER + content
             metadata = {
                 "hermes_delivery_idempotency_key": row["obligation_id"],
@@ -10765,6 +10788,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = await adapter.send(
                     chat_id=row["chat_id"],
                     content=content,
+                    reply_to=row.get("reply_to"),
                     metadata=metadata,
                 )
             except Exception as send_err:

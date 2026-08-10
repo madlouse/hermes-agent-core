@@ -9,13 +9,45 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
-import time
+import sqlite3
 import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway import delivery_ledger as dl
+
+
+def test_legacy_schema_migrates_reply_target(tmp_path):
+    conn = sqlite3.connect(tmp_path / "legacy.db")
+    conn.execute(
+        """CREATE TABLE delivery_obligations (
+            obligation_id TEXT PRIMARY KEY,
+            session_key TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT,
+            content TEXT NOT NULL,
+            state TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            owner_pid INTEGER,
+            owner_started_at INTEGER,
+            last_error TEXT
+        )"""
+    )
+
+    dl._initialize_schema(conn)
+
+    columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(delivery_obligations)"
+        ).fetchall()
+    }
+    conn.close()
+    assert "reply_to" in columns
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +68,7 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         chat_id=kw.get("chat_id", "C1"),
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
+        reply_to=kw.get("reply_to"),
     )
 
 
@@ -162,6 +195,8 @@ class TestGatewayRedeliverySweep:
     @staticmethod
     def _adapter(success=True):
         adapter = MagicMock()
+        adapter.supports_delivery_idempotency = False
+        adapter.delivery_idempotency_ttl_seconds = None
         adapter.send = AsyncMock(
             return_value=MagicMock(success=success, error="" if success else "nope")
         )
@@ -202,6 +237,43 @@ class TestGatewayRedeliverySweep:
         sent = adapter.send.call_args.kwargs
         assert sent["content"].startswith(dl.RECOVERED_MARKER)
         assert sent["content"].endswith("the final answer")
+
+    @pytest.mark.asyncio
+    async def test_idempotent_redelivery_preserves_endpoint_payload_and_key(self):
+        _record(reply_to="msg-42")
+        dl.mark_attempting("ob-1")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        adapter.supports_delivery_idempotency = True
+        adapter.delivery_idempotency_ttl_seconds = 3000
+        runner = self._runner(adapter)
+
+        await runner._redeliver_pending_obligations()
+
+        sent = adapter.send.call_args.kwargs
+        assert sent["content"] == "the final answer"
+        assert sent["reply_to"] == "msg-42"
+        assert sent["metadata"]["hermes_delivery_idempotency_key"] == "ob-1"
+        assert sent["metadata"]["hermes_delivery_part"] == "text"
+
+    @pytest.mark.asyncio
+    async def test_idempotent_redelivery_abandons_after_platform_window(self):
+        _record(reply_to="msg-42")
+        dl.mark_attempting("ob-1")
+        _orphan("ob-1")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
+                (time.time() - 60, "ob-1"),
+            )
+        adapter = self._adapter()
+        adapter.supports_delivery_idempotency = True
+        adapter.delivery_idempotency_ttl_seconds = 30
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 0
+        adapter.send.assert_not_awaited()
+        assert _row("ob-1")["state"] == "abandoned"
 
     @pytest.mark.parametrize(
         ("send_success", "ledger_method"),

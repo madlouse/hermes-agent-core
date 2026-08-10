@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import tempfile
+import threading
 import time
 import unittest
 from collections import OrderedDict
@@ -325,6 +326,52 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         async_send.assert_awaited_once()
         sync_send.assert_not_called()
         self.assertIsNone(adapter._sdk_executor)
+
+    def test_blocked_token_refresh_does_not_freeze_loop_or_fill_pool(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(config=object())
+        release = threading.Event()
+
+        class _BlockingTokenManager:
+            @staticmethod
+            def get_self_tenant_token(_config):
+                release.wait(timeout=1)
+                return "token"
+
+        async_send = AsyncMock(return_value="sent")
+        with (
+            patch.object(
+                feishu_module, "LarkTokenManager", _BlockingTokenManager,
+            ),
+            patch.object(
+                feishu_module, "_FEISHU_SEND_HARD_TIMEOUT_SECONDS", 0.01,
+            ),
+        ):
+            started = time.monotonic()
+            with self.assertRaisesRegex(
+                feishu_module.FeishuDeliveryTimeoutError,
+                "token refresh timed out",
+            ):
+                asyncio.run(
+                    adapter._run_send_sdk(Mock(), async_send, object())
+                )
+            self.assertLess(time.monotonic() - started, 0.2)
+
+            with self.assertRaisesRegex(
+                feishu_module.FeishuDeliveryTimeoutError,
+                "still blocked",
+            ):
+                asyncio.run(
+                    adapter._run_send_sdk(Mock(), async_send, object())
+                )
+
+        async_send.assert_not_awaited()
+        self.assertLessEqual(len(adapter._get_sdk_executor()._threads), 1)
+        release.set()
+        adapter._shutdown_sdk_executor()
 
     def test_send_timeout_is_not_retried(self):
         from gateway.config import PlatformConfig
