@@ -1,6 +1,10 @@
 import asyncio
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+import pytest
 
 from gateway import outbound_boundary as ob
 from gateway.config import Platform, PlatformConfig
@@ -75,13 +79,28 @@ def process_gateway_reply(
     send_result=None,
     send_voice_result=None,
     send_document_result=None,
+    profile_id="atlas",
+    source_profile=None,
+    profile_config=None,
 ):
     from gateway import run as gateway_run
+
+    profile_temp = tempfile.TemporaryDirectory()
+    profile_home = Path(profile_temp.name)
+    (profile_home / "config.yaml").write_text(
+        profile_config if profile_config is not None else f"profile_id: {profile_id}\n",
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(
         gateway_run,
         "_gateway_runner_ref",
-        lambda: SimpleNamespace(hooks=hooks),
+        lambda: SimpleNamespace(
+            hooks=hooks,
+            _resolve_profile_home_for_source=lambda _source: profile_home,
+            _profile_name_for_source=lambda source: source.profile or profile_id,
+            _active_profile_name=lambda: profile_id,
+        ),
     )
     adapter = StubAdapter(
         PlatformConfig(enabled=True, token="test", typing_indicator=False),
@@ -99,6 +118,8 @@ def process_gateway_reply(
     adapter._stop_typing_refresh = AsyncMock()
     adapter._flush_text_debounce_now = AsyncMock(return_value=False)
     adapter._notify_media_delivery_failure = AsyncMock()
+    adapter._test_profile_temp = profile_temp
+    adapter._test_profile_home = profile_home
     if send_voice_result is not None:
         adapter.send_voice = AsyncMock(return_value=send_voice_result)
     if send_document_result is not None:
@@ -110,6 +131,7 @@ def process_gateway_reply(
             platform=Platform.TELEGRAM,
             chat_id="admin-dm",
             chat_type="dm",
+            profile=source_profile,
         ),
         message_id="inbound",
     )
@@ -232,6 +254,142 @@ def test_adapter_screens_plain_gateway_reply_before_existing_send(monkeypatch):
     ]
     assert calls[0][1]["source_kind"] == "gateway_reply"
     assert calls[0][1]["output_screening_required"] is True
+    assert calls[0][1]["profile_id"] == "atlas"
+    assert calls[0][1]["profile_path"] == str(adapter._test_profile_home)
+
+
+def test_adapter_binds_named_profile_owner_before_screening(monkeypatch):
+    calls = []
+
+    def boundary(event_type, payload):
+        calls.append((event_type, dict(payload)))
+        return {"decision": "allow", "reason": "screened"}
+
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(named_handler(boundary)),
+        response="猿哥任务已完成。",
+        profile_id="yuange",
+        source_profile="yuange",
+    )
+
+    assert calls[0][0] == "outbound:before_send"
+    assert calls[0][1]["profile_id"] == "yuange"
+    assert calls[0][1]["profile_path"] == str(adapter._test_profile_home)
+
+
+def test_profile_id_from_home_uses_business_owner_not_core_default(tmp_path):
+    (tmp_path / "config.yaml").write_text("profile_id: atlas\n", encoding="utf-8")
+
+    assert ob.profile_id_from_home(tmp_path) == "atlas"
+
+
+def test_profile_id_from_home_does_not_reuse_last_known_good_owner(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("profile_id: atlas\n", encoding="utf-8")
+    assert ob.profile_id_from_home(tmp_path) == "atlas"
+
+    config_path.write_text("profile_id: [\n", encoding="utf-8")
+    assert ob.profile_id_from_home(tmp_path) == ""
+    assert ob.profile_id_from_home(tmp_path) == ""
+
+    config_path.write_text("profile_id: yuange\n", encoding="utf-8")
+    assert ob.profile_id_from_home(tmp_path) == "yuange"
+
+
+def test_profile_id_from_home_does_not_expand_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROFILE_OWNER", "atlas")
+    (tmp_path / "config.yaml").write_text(
+        "profile_id: ${PROFILE_OWNER}\n", encoding="utf-8"
+    )
+
+    assert ob.profile_id_from_home(tmp_path) == ""
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "model: test\n",
+        "profile_id: [atlas]\n",
+        "profile_id: {name: atlas}\n",
+        "profile_id: true\n",
+        "profile_id: 123\n",
+        "profile_id: atlas owner\n",
+        "profile_id: Atlas\n",
+        "profile_id: " + "a" * 65 + "\n",
+        "profile_id: [\n",
+        "profile_id: atlas\nprofile_id: yuange\n",
+        "owner: &owner atlas\nprofile_id: *owner\n",
+        "defaults: &defaults\n  profile_id: atlas\n<<: *defaults\n",
+        (
+            "defaults: &defaults\n"
+            "  profile_id: atlas\n"
+            "<<: *defaults\n"
+            "profile_id: yuange\n"
+        ),
+    ],
+)
+def test_profile_id_from_home_fails_closed_without_valid_owner(tmp_path, config):
+    (tmp_path / "config.yaml").write_text(config, encoding="utf-8")
+
+    assert ob.profile_id_from_home(tmp_path) == ""
+
+
+def test_adapter_preserves_authoritative_empty_owner_despite_environment(monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE_ID", "atlas")
+    calls = []
+
+    def boundary(event_type, payload):
+        calls.append((event_type, dict(payload)))
+        return {"decision": "allow", "reason": "test_capture"}
+
+    process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(named_handler(boundary)),
+        response="测试完成。",
+        profile_config="profile_id: [atlas]\n",
+    )
+
+    assert calls[0][0] == "outbound:before_send"
+    assert calls[0][1]["profile_id"] == ""
+
+
+def test_omitted_profile_owner_keeps_legacy_environment_fallback(monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE_ID", "legacy-owner")
+
+    context = ob.build_outbound_context(
+        source_kind="gateway_reply",
+        content="done",
+        platform="feishu",
+        chat_id="oc_test",
+    )
+
+    assert context["profile_id"] == "legacy-owner"
+
+
+def test_authoritative_empty_owner_cannot_be_revived_by_metadata(monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE_ID", "environment-owner")
+    content = (
+        'status\n<!-- hermes-outbound-actionable '
+        '{"profile_id":"metadata-owner"} -->'
+    )
+
+    authoritative = ob.build_outbound_context(
+        source_kind="send_message",
+        content=content,
+        platform="feishu",
+        chat_id="oc_test",
+        profile_id="",
+    )
+    legacy = ob.build_outbound_context(
+        source_kind="send_message",
+        content=content,
+        platform="feishu",
+        chat_id="oc_test",
+    )
+
+    assert authoritative["profile_id"] == ""
+    assert legacy["profile_id"] == "environment-owner"
 
 
 def test_adapter_blocks_plain_gateway_reply_when_screening_hook_is_missing(monkeypatch):

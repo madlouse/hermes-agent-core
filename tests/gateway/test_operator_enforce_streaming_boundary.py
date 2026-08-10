@@ -190,6 +190,7 @@ def test_non_screened_unarmed_channel_preserves_configured_streaming_modes(tmp_p
 
 
 def test_operator_enforce_outbound_boundary_rewrites_armed_complete_reply(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text("profile_id: yuange\n", encoding="utf-8")
     write_policy(
         tmp_path,
         "\n".join(
@@ -222,6 +223,7 @@ def test_operator_enforce_outbound_boundary_rewrites_armed_complete_reply(tmp_pa
 
     fake_boundary.build_outbound_context = build_outbound_context
     fake_boundary.outbound_before_send_sync = outbound_before_send_sync
+    fake_boundary.profile_id_from_home = lambda _profile: "yuange"
     monkeypatch.setitem(sys.modules, "gateway.outbound_boundary", fake_boundary)
 
     allowed, content, context = gateway_run._operator_enforce_outbound_boundary_for_source(
@@ -234,6 +236,7 @@ def test_operator_enforce_outbound_boundary_rewrites_armed_complete_reply(tmp_pa
 
     assert allowed is True
     assert content == "rewritten"
+    assert context["profile_id"] == "yuange"
     assert context["before_send_decision"] == {"decision": "rewrite"}
 
 
@@ -272,6 +275,33 @@ def test_operator_enforce_streaming_uses_only_capable_screening_result(tmp_path)
 
     assert allowed is True
     assert content == "safe business result"
+
+
+def test_queued_boundary_preserves_authoritative_empty_owner(monkeypatch, tmp_path):
+    (tmp_path / "config.yaml").write_text("profile_id: [atlas]\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_PROFILE_ID", "atlas")
+    observed = []
+
+    def screening(_event_type, context):
+        observed.append(dict(context))
+        return {"decision": "allow", "reason": "test_capture"}
+
+    hooks = HookRegistry()
+    hooks._handlers["outbound:before_send"] = [screening]
+    hooks._handler_owners[id(screening)] = "policy-screen"
+    hooks._handler_capabilities[id(screening)] = frozenset({"output-screening"})
+
+    allowed, content, context = gateway_run._operator_enforce_outbound_boundary_for_source(
+        tmp_path,
+        source(platform="feishu", chat_id="grp"),
+        "business result",
+        hooks=hooks,
+    )
+
+    assert allowed is True
+    assert content == "business result"
+    assert context["profile_id"] == ""
+    assert observed[0]["profile_id"] == ""
 
 
 def test_operator_enforce_outbound_boundary_holds_armed_reply_without_allow(tmp_path):

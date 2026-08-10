@@ -583,7 +583,11 @@ def _handle_send(args, *, after_send=None):
             platform=platform_name,
             chat_id=chat_id,
             thread_id=thread_id,
-            profile_id=str(args.get("profile_id") or ""),
+            profile_id=(
+                str(args.get("profile_id") or "")
+                if "profile_id" in args
+                else None
+            ),
             profile_path=str(get_hermes_home()),
             producer_id="send_message",
             target={
