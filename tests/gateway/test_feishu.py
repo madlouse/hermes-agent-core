@@ -285,6 +285,85 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
         )
 
+    def test_blocking_sdk_call_has_outer_deadline(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        with patch(
+            "plugins.platforms.feishu.adapter._FEISHU_SDK_HARD_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            with self.assertRaisesRegex(TimeoutError, "delivery status unknown"):
+                asyncio.run(adapter._run_blocking(time.sleep, 0.1))
+        adapter._shutdown_sdk_executor()
+
+    def test_send_timeout_is_not_retried(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._send_raw_message = AsyncMock(
+            side_effect=TimeoutError(
+                "Feishu SDK call timed out after 25s; delivery status unknown"
+            )
+        )
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                adapter._feishu_send_with_retry(
+                    chat_id="oc_chat",
+                    msg_type="text",
+                    payload='{"text":"hello"}',
+                    reply_to=None,
+                    metadata=None,
+                )
+            )
+        adapter._send_raw_message.assert_awaited_once()
+
+    def test_outer_send_retry_does_not_duplicate_timeout(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = object()
+        adapter._send_raw_message = AsyncMock(
+            side_effect=TimeoutError("ReadTimeout: delivery status unknown")
+        )
+
+        result = asyncio.run(
+            adapter._send_with_retry(chat_id="oc_chat", content="hello")
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("timeout", (result.error or "").lower())
+        adapter._send_raw_message.assert_awaited_once()
+
+    def test_sdk_client_uses_explicit_request_timeout(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = feishu_module.FeishuAdapter(PlatformConfig())
+        adapter._app_id = "cli_app"
+        adapter._app_secret = "secret_app"
+        builder = Mock()
+        builder.app_id.return_value = builder
+        builder.app_secret.return_value = builder
+        builder.domain.return_value = builder
+        builder.timeout.return_value = builder
+        builder.log_level.return_value = builder
+        builder.build.return_value = object()
+        fake_lark = SimpleNamespace(
+            Client=SimpleNamespace(builder=Mock(return_value=builder)),
+            LogLevel=SimpleNamespace(WARNING="WARNING"),
+        )
+
+        with patch.object(feishu_module, "lark", fake_lark):
+            adapter._build_lark_client("https://open.feishu.cn")
+
+        builder.timeout.assert_called_once_with(
+            feishu_module._FEISHU_SDK_REQUEST_TIMEOUT_SECONDS
+        )
+
 
 class TestAdapterModule(unittest.TestCase):
     def test_load_settings_uses_sdk_defaults_for_invalid_ws_reconnect_values(self):
@@ -2465,5 +2544,3 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
-

@@ -220,6 +220,8 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
+_FEISHU_SDK_REQUEST_TIMEOUT_SECONDS = 20.0
+_FEISHU_SDK_HARD_TIMEOUT_SECONDS = 25.0
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -1755,9 +1757,18 @@ class FeishuAdapter(BasePlatformAdapter):
             return executor
 
     async def _run_blocking(self, func, *args):
-        """Run a blocking Feishu SDK call on the adapter-owned thread pool."""
+        """Run a blocking Feishu SDK call with a gateway-owned deadline."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
+        future = loop.run_in_executor(self._get_sdk_executor(), func, *args)
+        try:
+            return await asyncio.wait_for(
+                future, timeout=_FEISHU_SDK_HARD_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                "Feishu SDK call timed out after "
+                f"{_FEISHU_SDK_HARD_TIMEOUT_SECONDS:g}s; delivery status unknown"
+            ) from exc
 
     def _shutdown_sdk_executor(self) -> None:
         """Stop the adapter-owned SDK executor without touching the loop default."""
@@ -5038,6 +5049,7 @@ class FeishuAdapter(BasePlatformAdapter):
             .app_id(self._app_id)
             .app_secret(self._app_secret)
             .domain(domain)
+            .timeout(_FEISHU_SDK_REQUEST_TIMEOUT_SECONDS)
             .log_level(lark.LogLevel.WARNING)
             .build()
         )
@@ -5095,6 +5107,14 @@ class FeishuAdapter(BasePlatformAdapter):
             except Exception as exc:
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    raise
+                # A timeout can happen after Feishu accepted the request. Retrying
+                # here could duplicate a user-visible message, so surface the
+                # uncertain result to the delivery ledger instead.
+                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or any(
+                    marker in str(exc).lower()
+                    for marker in ("timed out", "readtimeout", "writetimeout")
+                ):
                     raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
