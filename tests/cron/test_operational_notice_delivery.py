@@ -306,6 +306,121 @@ def test_operational_notice_executes_hook_authority_through_strict_adapter(
     legacy_send.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("invalid_platform", "strict_adapter_unavailable"),
+        ("transport_missing", "strict_adapter_unavailable"),
+        ("authority_request_conflict", "request_conflict"),
+        ("authority_binding_lost", "ownership_lost"),
+        ("schedule_missing", "strict_adapter_unavailable"),
+        ("standalone_request_conflict", "request_conflict"),
+        ("standalone_binding_lost", "ownership_lost"),
+        ("screening_exception", "uncertain"),
+    ],
+)
+def test_operational_notice_transport_fail_closed_matrix(
+    operational_profile, monkeypatch, mode, expected
+):
+    notice = _notice()
+    authority_mode = not mode.startswith("standalone") and mode != "screening_exception"
+    if mode == "invalid_platform":
+        notice["target"] = {**notice["target"], "transport_id": "not-a-platform"}
+
+    class Heartbeat:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def ensure_owner(self):
+            pass
+
+        def bind_request(self, _request_id):
+            pass
+
+    monkeypatch.setattr(scheduler, "_OperationalNoticeHeartbeat", Heartbeat)
+    claim = {"claimed": True, "claim_owner": "owner-1"}
+    if "request_conflict" in mode:
+        claim["transport_request_id"] = "different-request"
+    monkeypatch.setattr(scheduler, "claim_operational_notice_delivery", lambda *_args, **_kwargs: claim)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_operational_notice_delivery",
+        lambda *_args, **_kwargs: {"status": "uncertain"},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "bind_operational_notice_transport_request",
+        lambda *_args, **_kwargs: {
+            "status": "ownership_lost" if "binding_lost" in mode else "bound"
+        },
+    )
+
+    if mode == "screening_exception":
+        monkeypatch.setattr(
+            "gateway.outbound_boundary.outbound_before_send_sync",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("screening failed")),
+        )
+    elif authority_mode:
+        decision = BoundaryDecision(
+            transmit=True,
+            decision="allow",
+            content=notice["admin_content"],
+            reason="authorized",
+            delivery_authority={
+                "schema_version": "transport-outbox-hook/v1",
+                "required": True,
+                "business_profile_id": "default",
+                "request": {"request_id": "request-authority-matrix"},
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.outbound_boundary.outbound_before_send_sync",
+            lambda *_args, **_kwargs: decision,
+        )
+
+    transport = SimpleNamespace(
+        send_authorized=AsyncMock(
+            return_value=SendResult(success=True, message_id="om-matrix")
+        )
+    )
+    monkeypatch.setattr(
+        "gateway.delivery.resolve_delivery_transport",
+        lambda *_args, **_kwargs: None if mode == "transport_missing" else transport,
+    )
+
+    def schedule(coro, _loop):
+        if mode == "schedule_missing":
+            coro.close()
+            return None
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", schedule)
+    loop = SimpleNamespace(is_running=lambda: True)
+    adapter = SimpleNamespace(supports_transport_authority=True)
+
+    with jobs.use_cron_store(operational_profile):
+        status = scheduler._deliver_operational_notice_in_profile(
+            _job(profile_home=operational_profile),
+            notice,
+            owning_profile_home=operational_profile,
+            adapters={Platform.FEISHU: adapter},
+            loop=loop,
+        )
+
+    assert status == expected
+
+
 def test_worker_admission_denial_reaches_notice_outbox_and_terminal_receipt(
     operational_profile, monkeypatch
 ):

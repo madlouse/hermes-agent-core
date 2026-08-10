@@ -479,3 +479,50 @@ def test_trusted_sdk_response_is_json_safe_before_receipt_commit(
         "data": {"message_id": "om-sdk-direct"},
     }
     assert result["transport_outcome"] == "confirmed"
+
+
+def test_resident_authority_indeterminate_result_is_json_safe_and_unsuccessful(
+    standalone_send, monkeypatch
+):
+    from gateway import outbound_boundary as ob
+
+    request = _transport_request("request-resident-indeterminate")
+    request["profile_id"] = "default"
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": request,
+    }
+    decision = ob.BoundaryDecision(
+        transmit=True,
+        decision="allow",
+        content=CONTENT,
+        reason="authorized",
+        delivery_authority=authority,
+    )
+    monkeypatch.setattr(ob, "outbound_before_send_sync", lambda *_args, **_kwargs: decision)
+
+    async def execute(**_kwargs):
+        return ob.AuthorizedOutboundExecution(
+            result={
+                "success": True,
+                "raw_response": SimpleNamespace(code=0, msg="accepted"),
+            },
+            outcome="indeterminate",
+            request=request,
+            receipt=None,
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(ob, "execute_authorized_outbound_send", execute)
+    result = json.loads(
+        send_module.send_message_tool(
+            {"action": "send", "target": "feishu:oc_admin", "message": CONTENT}
+        )
+    )
+
+    assert result["success"] is False
+    assert result["transport_outcome"] == "indeterminate"
+    assert result["raw_response"] == {"code": 0, "msg": "accepted"}
+    assert "transport_receipt_id" not in result

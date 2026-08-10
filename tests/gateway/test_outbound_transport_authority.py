@@ -565,6 +565,9 @@ def test_authority_value_helpers_cover_fail_closed_shapes(tmp_path):
         delivery_authority={"request": selector},
     )
     assert decision.as_dict()["delivery_authority"] == {"request": selector}
+    assert ob.BoundaryDecision(True, "allow", "plain", "ok").as_dict().get(
+        "delivery_authority"
+    ) is None
     assert ob._normalized_route("bad") is None
     assert ob._canonical_profile_id_from_home(object()) == ""
     missing = tmp_path / "missing"

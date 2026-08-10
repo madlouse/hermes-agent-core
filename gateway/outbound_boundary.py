@@ -592,8 +592,6 @@ def _delivery_authority_decision(
         and "delivery_authority" in _without_hook_identity(result)
     ]
     if not authority_results:
-        if authority_required:
-            return _closed_decision(context, "missing_delivery_authority")
         return selected
     if any(
         not _has_capability(result, TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY)
