@@ -244,10 +244,17 @@ def test_send_message_allow_rebuilds_media_from_screened_content() -> None:
         reason="screened",
     )
 
-    with patch("gateway.config.load_gateway_config", return_value=config), \
+    observed = {}
+
+    def allow(_hooks, context):
+        observed.update(context)
+        return decision
+
+    with patch.dict("os.environ", {"HERMES_PROFILE_ID": "atlas"}), \
+         patch("gateway.config.load_gateway_config", return_value=config), \
          patch("tools.interrupt.is_interrupted", return_value=False), \
          patch("model_tools._run_async", side_effect=_run_async_immediately), \
-         patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=decision), \
+         patch("gateway.outbound_boundary.outbound_before_send_sync", side_effect=allow), \
          patch("gateway.outbound_boundary.outbound_after_send_sync"), \
          patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
          patch("gateway.mirror.mirror_to_session", return_value=True):
@@ -262,6 +269,7 @@ def test_send_message_allow_rebuilds_media_from_screened_content() -> None:
         )
 
     assert result["success"] is True
+    assert observed["profile_id"] == "atlas"
     assert send_mock.await_args.kwargs["media_files"] == []
     assert send_mock.await_args.args[3] == "safe business result"
 

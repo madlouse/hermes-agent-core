@@ -514,7 +514,11 @@ def _operator_enforce_outbound_boundary_for_source(
         source,
     )
     try:
-        from gateway.outbound_boundary import build_outbound_context, outbound_before_send_sync
+        from gateway.outbound_boundary import (
+            build_outbound_context,
+            outbound_before_send_sync,
+            profile_id_from_home,
+        )
     except Exception as exc:
         logging.getLogger(__name__).warning(
             "Outbound boundary unavailable; holding complete reply: %s",
@@ -533,6 +537,7 @@ def _operator_enforce_outbound_boundary_for_source(
         platform=getattr(source, "platform", ""),
         chat_id=getattr(source, "chat_id", ""),
         thread_id=getattr(source, "thread_id", None),
+        profile_id=profile_id_from_home(profile_path),
         profile_path=str(profile_path),
         producer_id=producer_id,
         message_id=message_id,
@@ -5378,18 +5383,21 @@ class TurnRunner:
                 from gateway.outbound_boundary import (
                     build_outbound_context,
                     outbound_before_send_sync,
+                    profile_id_from_home,
                 )
 
                 approval_hooks = getattr(self._runner, "hooks", None)
+                approval_profile_home = self._runner._resolve_profile_home_for_source(
+                    ctx.source
+                )
                 approval_context = build_outbound_context(
                     source_kind="gateway_notice",
                     content=approval_text,
                     platform=ctx.source.platform,
                     chat_id=ctx._status_chat_id,
                     thread_id=getattr(ctx.source, "thread_id", None),
-                    profile_path=str(
-                        self._runner._resolve_profile_home_for_source(ctx.source)
-                    ),
+                    profile_id=profile_id_from_home(approval_profile_home),
+                    profile_path=str(approval_profile_home),
                     producer_id="gateway_approval",
                     actionability={
                         "requires_user_reply": True,

@@ -18,6 +18,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable
 
 from gateway.hooks import HookRegistry
@@ -49,6 +50,7 @@ _ACTION_SPEC_ENVELOPE_RE = re.compile(
     re.DOTALL,
 )
 _FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 @dataclass
@@ -77,6 +79,30 @@ class BoundaryDecision:
 
 def _string(value: Any) -> str:
     return str(value or "").strip()
+
+
+def profile_id_from_home(profile_path: Any) -> str:
+    """Read the outbound owner from the already-resolved Profile home.
+
+    Core's internal root Profile name is ``default`` and is not necessarily
+    the business owner id used by policy plugins (for example ``atlas``).
+    The resolved Profile config is therefore the authority. Missing or invalid
+    identity stays empty so capability hooks can make the existing fail-closed
+    decision. Core itself remains compatible with Profiles that do not use an
+    owner-aware output-screening hook.
+    """
+    try:
+        from hermes_cli.config import read_profile_id_literal
+
+        raw_profile_id = read_profile_id_literal(
+            Path(profile_path).expanduser().resolve() / "config.yaml"
+        )
+    except (OSError, ValueError, TypeError):
+        return ""
+    if not isinstance(raw_profile_id, str):
+        return ""
+    profile_id = raw_profile_id.strip()
+    return profile_id if _PROFILE_ID_RE.fullmatch(profile_id) else ""
 
 
 def _object(value: Any) -> dict[str, Any]:
@@ -254,12 +280,15 @@ def build_outbound_context(
     platform: Any = "",
     chat_id: Any = "",
     thread_id: Any = "",
-    profile_id: str = "",
+    profile_id: str | None = None,
     profile_path: str = "",
     gate_mode_value: str = "",
     boundary_enabled_value: bool | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
+    authoritative_profile_id = (
+        None if profile_id is None else _string(profile_id)
+    )
     transport_id = _string(getattr(platform, "value", platform))
     channel_id = _string(chat_id)
     source_kind = _source_kind({"source_kind": source_kind})
@@ -291,7 +320,11 @@ def build_outbound_context(
         "channel_id": channel_id,
         "chat_id": channel_id,
         "thread_id": _string(thread_id),
-        "profile_id": profile_id or os.getenv("HERMES_PROFILE_ID", ""),
+        "profile_id": (
+            os.getenv("HERMES_PROFILE_ID", "")
+            if profile_id is None
+            else _string(profile_id)
+        ),
         "profile_path": profile_path or os.getenv("HERMES_PROFILE", ""),
         "gate_mode": gate_mode_value or "",
         "content": text,
@@ -305,6 +338,11 @@ def build_outbound_context(
     for key, value in extra.items():
         if key not in ctx and value not in (None, "", [], {}):
             ctx[key] = value
+    if authoritative_profile_id is not None:
+        # An explicit value, including empty, is the result of Profile-home
+        # authority resolution. Environment and content metadata cannot revive
+        # or replace it.
+        ctx["profile_id"] = authoritative_profile_id
     if envelope_errors:
         ctx["envelope_errors"] = envelope_errors
         ctx.setdefault(

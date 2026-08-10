@@ -2992,7 +2992,6 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
         into the environment. These sites must still apply
         ``managed_scope.apply_managed_overlay`` + ``_expand_env_vars``
         inline, which they do.
-
     Semantics (deliberately mirrors the bare ``open()+yaml.safe_load()``
     pattern this replaces, so migrated sites keep their exact failure
     behavior):
@@ -3015,6 +3014,63 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     except FileNotFoundError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def read_profile_id_literal(config_path: Path) -> Any:
+    """Return the current Profile file's literal ``profile_id`` value.
+
+    Authorization identity must be explicit and current. Missing, unreadable,
+    or malformed config therefore returns ``None`` instead of using defaults,
+    managed scope, environment expansion, cache, or last-known-good state.
+    Duplicate keys, aliases, merge keys, and non-string scalars are rejected.
+    Callers remain responsible for validating the string grammar.
+    """
+    try:
+        with open(config_path, encoding="utf-8") as stream:
+            root = yaml.compose(stream, Loader=yaml.SafeLoader)
+    except Exception:
+        return None
+    if not isinstance(root, yaml.nodes.MappingNode):
+        return None
+
+    references: dict[int, int] = {}
+    expanded: set[int] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        node_id = id(node)
+        references[node_id] = references.get(node_id, 0) + 1
+        if node_id in expanded:
+            continue
+        expanded.add(node_id)
+        if isinstance(node, yaml.nodes.MappingNode):
+            for key_node, value_node in node.value:
+                stack.extend((key_node, value_node))
+        elif isinstance(node, yaml.nodes.SequenceNode):
+            stack.extend(node.value)
+
+    matches = []
+    for key_node, value_node in root.value:
+        if key_node.tag == "tag:yaml.org,2002:merge" or key_node.value == "<<":
+            return None
+        if (
+            isinstance(key_node, yaml.nodes.ScalarNode)
+            and key_node.tag == "tag:yaml.org,2002:str"
+            and key_node.value == "profile_id"
+        ):
+            matches.append((key_node, value_node))
+    if len(matches) != 1:
+        return None
+
+    key_node, value_node = matches[0]
+    if (
+        not isinstance(value_node, yaml.nodes.ScalarNode)
+        or value_node.tag != "tag:yaml.org,2002:str"
+        or references.get(id(key_node)) != 1
+        or references.get(id(value_node)) != 1
+    ):
+        return None
+    return value_node.value
 
 
 def read_raw_config_readonly() -> Dict[str, Any]:

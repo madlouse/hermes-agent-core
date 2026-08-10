@@ -5982,6 +5982,7 @@ class BasePlatformAdapter(ABC):
                         build_outbound_context,
                         gateway_reply_source_kind,
                         outbound_before_send,
+                        profile_id_from_home,
                     )
                     from gateway.run import _gateway_runner_ref
 
@@ -6018,6 +6019,7 @@ class BasePlatformAdapter(ABC):
                         platform=self.platform,
                         chat_id=event.source.chat_id,
                         thread_id=getattr(event.source, "thread_id", None),
+                        profile_id=profile_id_from_home(profile_home),
                         profile_path=str(profile_home),
                         producer_id="gateway_final_reply",
                         message_id=getattr(event, "message_id", None),
