@@ -82,6 +82,7 @@ def process_gateway_reply(
     profile_id="atlas",
     source_profile=None,
     profile_config=None,
+    enforced_channel=False,
 ):
     from gateway import run as gateway_run
 
@@ -101,6 +102,11 @@ def process_gateway_reply(
             _profile_name_for_source=lambda source: source.profile or profile_id,
             _active_profile_name=lambda: profile_id,
         ),
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_operator_enforce_streaming_boundary_source_armed",
+        lambda _profile_home, _source: enforced_channel,
     )
     adapter = StubAdapter(
         PlatformConfig(enabled=True, token="test", typing_indicator=False),
@@ -160,6 +166,13 @@ def test_operator_enforced_without_hook_holds():
 
 def test_gateway_reply_source_kind_only_escalates_explicit_action_spec():
     assert ob.gateway_reply_source_kind("请回复 1 或 2 选择下一步") == "gateway_reply"
+    assert (
+        ob.gateway_reply_source_kind(
+            "已完成。两项均已确认，可靠投递回写成功：2/2 completed。",
+            enforced_channel=True,
+        )
+        == "gateway_reply"
+    )
     assert ob.gateway_reply_source_kind("[[ACTION_SPEC]] approve") == "operator_enforce"
 
 
@@ -174,6 +187,39 @@ def test_gateway_reply_context_does_not_force_text_heuristic():
     decision = run(ob.outbound_before_send(None, context))
     assert decision.transmit is True
     assert decision.reason == "not_actionable"
+
+
+def test_enforced_gateway_result_is_screened_without_becoming_actionable():
+    context = ob.build_outbound_context(
+        source_kind=ob.gateway_reply_source_kind(
+            "已完成。两项均已确认，可靠投递回写成功：2/2 completed。",
+            enforced_channel=True,
+        ),
+        content="已完成。两项均已确认，可靠投递回写成功：2/2 completed。",
+        platform="feishu",
+        chat_id="oc_test",
+        enforced_channel=True,
+        output_screening_required=True,
+    )
+
+    assert context["source_kind"] == "gateway_reply"
+    assert context["looks_actionable"] is False
+    assert ob.requires_boundary(context) is True
+
+
+def test_enforced_gateway_reply_with_explicit_actionability_stays_actionable():
+    context = ob.build_outbound_context(
+        source_kind="gateway_reply",
+        content="请回复 1 继续。",
+        platform="feishu",
+        chat_id="oc_test",
+        enforced_channel=True,
+        output_screening_required=True,
+        actionability={"requires_user_reply": True, "intent": "confirmation"},
+    )
+
+    assert context["looks_actionable"] is True
+    assert ob.requires_boundary(context) is True
 
 
 def test_gateway_reply_screening_requires_the_existing_hook_decision():
@@ -256,6 +302,27 @@ def test_adapter_screens_plain_gateway_reply_before_existing_send(monkeypatch):
     assert calls[0][1]["output_screening_required"] is True
     assert calls[0][1]["profile_id"] == "atlas"
     assert calls[0][1]["profile_path"] == str(adapter._test_profile_home)
+
+
+def test_armed_adapter_screens_terminal_result_without_actionable_escalation(monkeypatch):
+    calls = []
+
+    def boundary(event_type, payload):
+        calls.append((event_type, dict(payload)))
+        return {"decision": "allow", "reason": "screened"}
+
+    process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(named_handler(boundary)),
+        response="已完成。两项均已确认，可靠投递回写成功：2/2 completed。",
+        enforced_channel=True,
+    )
+
+    assert calls[0][0] == "outbound:before_send"
+    assert calls[0][1]["source_kind"] == "gateway_reply"
+    assert calls[0][1]["enforced_channel"] is True
+    assert calls[0][1]["output_screening_required"] is True
+    assert calls[0][1]["looks_actionable"] is False
 
 
 def test_adapter_binds_named_profile_owner_before_screening(monkeypatch):

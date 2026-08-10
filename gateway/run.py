@@ -516,6 +516,7 @@ def _operator_enforce_outbound_boundary_for_source(
     try:
         from gateway.outbound_boundary import (
             build_outbound_context,
+            gateway_reply_source_kind,
             outbound_before_send_sync,
             profile_id_from_home,
         )
@@ -532,7 +533,10 @@ def _operator_enforce_outbound_boundary_for_source(
         }
 
     context = build_outbound_context(
-        source_kind=("streaming_final_reply" if enforced_channel else "gateway_reply"),
+        source_kind=gateway_reply_source_kind(
+            content,
+            enforced_channel=enforced_channel,
+        ),
         content=content,
         platform=getattr(source, "platform", ""),
         chat_id=getattr(source, "chat_id", ""),

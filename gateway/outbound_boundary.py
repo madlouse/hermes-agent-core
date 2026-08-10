@@ -189,7 +189,7 @@ def requires_boundary(context: dict[str, Any]) -> bool:
 
 def gateway_reply_source_kind(content: str, *, enforced_channel: bool = False) -> str:
     ctx = {"source_kind": "gateway_reply", "content": content, "enforced_channel": enforced_channel}
-    if enforced_channel or _declares_actionable_metadata(ctx):
+    if _declares_actionable_metadata(ctx):
         return "operator_enforce"
     return "gateway_reply"
 
@@ -358,7 +358,7 @@ def build_outbound_context(
         ctx["gate_mode"] = os.getenv("HERMES_OUTBOUND_GATE_MODE", "enforce")
     if "looks_actionable" not in ctx:
         if source_kind == "gateway_reply":
-            ctx["looks_actionable"] = _declares_actionable_metadata(ctx) or ctx.get("enforced_channel") is True
+            ctx["looks_actionable"] = _declares_actionable_metadata(ctx)
         else:
             ctx["looks_actionable"] = looks_actionable(ctx)
     return ctx
