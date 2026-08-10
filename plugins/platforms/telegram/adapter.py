@@ -885,6 +885,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # API call (e.g. a set_my_commands stall for certain tokens) cannot
         # blow the gateway's connect timeout (#46298).
         self._post_connect_task: Optional[asyncio.Task] = None
+        # Skill discovery is synchronous and can outlive a cancelled caller
+        # while asyncio.to_thread finishes. Share one task across reconnect and
+        # forum registration paths so cancellation cannot start a second scan.
+        self._command_menu_scan_task: Optional[asyncio.Task] = None
 
     def _mark_connected(self) -> None:
         self._drop_delayed_deliveries = False
@@ -3567,6 +3571,29 @@ class TelegramAdapter(BasePlatformAdapter):
             self._run_post_connect_housekeeping()
         )
 
+    async def _command_menu_off_loop(self, *, max_commands: int):
+        """Build the Telegram menu without blocking or duplicating a live scan."""
+        from hermes_cli.commands import telegram_menu_commands
+
+        task = getattr(self, "_command_menu_scan_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    telegram_menu_commands,
+                    max_commands=max_commands,
+                )
+            )
+            self._command_menu_scan_task = task
+
+            def _finish(completed: asyncio.Task) -> None:
+                if getattr(self, "_command_menu_scan_task", None) is completed:
+                    self._command_menu_scan_task = None
+                if not completed.cancelled():
+                    completed.exception()
+
+            task.add_done_callback(_finish)
+        return await asyncio.shield(task)
+
     async def _run_post_connect_housekeeping(self) -> None:
         """Register the command menu, surface the status indicator, and set up
         DM topics — all off the connect path so a slow Bot API call cannot blow
@@ -3582,7 +3609,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeAllGroupChats,
                     BotCommandScopeDefault,
                 )
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+                from hermes_cli.commands import telegram_menu_max_commands
                 if not self._bot:
                     return
                 # Telegram allows up to 100 commands but has an undocumented
@@ -3594,9 +3621,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Skill discovery walks user-controlled directories and can be
                 # slow on large profiles. Keep it off the gateway event loop so
                 # watchdog heartbeats and other platform connects keep moving.
-                menu_commands, hidden_count = await asyncio.to_thread(
-                    telegram_menu_commands,
-                    max_commands=max_commands,
+                menu_commands, hidden_count = await self._command_menu_off_loop(
+                    max_commands=max_commands
                 )
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
@@ -8750,8 +8776,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
+                from hermes_cli.commands import telegram_menu_max_commands
+                menu_commands, _ = await self._command_menu_off_loop(
+                    max_commands=telegram_menu_max_commands()
+                )
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
