@@ -6110,15 +6110,6 @@ class BasePlatformAdapter(ABC):
                 # with an unknown extension is intentionally left in the body for
                 # extract_local_files below to pick up rather than silently dropped (#34517).
                 text_content = _strip_media_directives(text_content).strip()
-                if (
-                    boundary_decision is not None
-                    and isinstance(getattr(boundary_decision, "delivery_authority", None), dict)
-                ):
-                    if not text_content:
-                        raise RuntimeError(
-                            "trusted outbound delivery authority requires one text send"
-                        )
-                    outbound_boundary_context["content"] = text_content
                 if images:
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
@@ -6162,14 +6153,20 @@ class BasePlatformAdapter(ABC):
                         )
                         text_content = _recovered
 
-                if (
-                    boundary_decision is not None
-                    and isinstance(getattr(boundary_decision, "delivery_authority", None), dict)
-                    and (images or local_files or media_files)
+                if boundary_decision is not None and isinstance(
+                    getattr(boundary_decision, "delivery_authority", None), dict
                 ):
-                    raise RuntimeError(
-                        "trusted outbound delivery authority does not support multipart sends"
-                    )
+                    if images or local_files or media_files:
+                        raise RuntimeError(
+                            "trusted outbound delivery authority does not support multipart sends"
+                        )
+                    if not text_content:
+                        raise RuntimeError(
+                            "trusted outbound delivery authority requires one text send"
+                        )
+                    # Authority execution revalidates this final provider payload.
+                    # No extraction or history suppression may run after it.
+                    outbound_boundary_context["content"] = text_content
 
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status

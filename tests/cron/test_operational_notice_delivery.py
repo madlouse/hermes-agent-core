@@ -182,13 +182,17 @@ def test_confirmed_sent_truth_cannot_be_overwritten_by_uncertain(
     )
 
 
-def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
+def test_operational_notice_uses_strict_sender_and_transport_outbox_once(
     operational_profile, monkeypatch
 ):
     provider_send = AsyncMock(
         return_value={"success": True, "message_id": "om_notice_once"}
     )
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
+    legacy_send = AsyncMock(
+        side_effect=AssertionError("operational notice must not use legacy sender")
+    )
+    monkeypatch.setattr(send_module, "_send_to_platform", legacy_send)
 
     with jobs.use_cron_store(operational_profile):
         first = scheduler._deliver_operational_notice(
@@ -202,6 +206,7 @@ def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
     assert first == "sent"
     assert replay == "sent"
     provider_send.assert_awaited_once()
+    legacy_send.assert_not_awaited()
     assert stored[_notice()["idempotency_key"]]["status"] == "sent"
     conn = sqlite3.connect(operational_profile / "transport-outbox.sqlite3")
     try:
@@ -309,7 +314,7 @@ def test_worker_admission_denial_reaches_notice_outbox_and_terminal_receipt(
     provider_send = AsyncMock(
         return_value={"success": True, "message_id": "om-worker-denial"}
     )
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
     decision = {
         "action": "block",
         "reason": "runtime_denied",
@@ -366,7 +371,7 @@ def test_crash_after_confirmed_send_recovers_without_resending(
     provider_send = AsyncMock(
         return_value={"success": True, "message_id": "om_crash_once"}
     )
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
     epoch = [1000]
     monkeypatch.setattr(jobs.time, "time", lambda: epoch[0])
     real_mark = scheduler.mark_operational_notice_delivery
@@ -409,7 +414,7 @@ def test_cross_original_lease_two_thread_probe_converges_confirmed_sent(
             await asyncio.sleep(0.005)
         return {"success": True, "message_id": "om-cross-lease"}
 
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
     results = []
 
     def deliver():
@@ -496,7 +501,7 @@ def test_notice_freezes_scoped_store_across_heartbeat_and_reconciliation(
             await asyncio.sleep(0.005)
         return {"success": True, "message_id": "om-scoped-store-b"}
 
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
     with jobs.use_cron_store(owning_profile):
         jobs.save_jobs([_job(profile_home=owning_profile)])
 
@@ -608,7 +613,7 @@ def test_operational_notice_rejects_top_level_or_receipt_profile_spoof(
     operational_profile, monkeypatch
 ):
     provider_send = AsyncMock(return_value={"success": True})
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
 
     spoofed = _job(profile_id="atlas", profile_home=operational_profile)
     spoofed["profile_id"] = "default"

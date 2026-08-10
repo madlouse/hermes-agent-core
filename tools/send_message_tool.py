@@ -627,7 +627,11 @@ def _handle_send(args, *, after_send=None):
         )
         media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
         boundary_context["content"] = cleaned_message
-        if isinstance(getattr(boundary_decision, "delivery_authority", None), dict):
+        strict_transport = trusted_request is not None or isinstance(
+            getattr(boundary_decision, "delivery_authority", None),
+            dict,
+        )
+        if strict_transport:
             if media_files or not cleaned_message.strip():
                 return json.dumps(
                     _error(
@@ -694,6 +698,7 @@ def _handle_send(args, *, after_send=None):
                     decision=boundary_decision,
                     send=lambda: _send_authorized_to_platform(
                         platform,
+                        pconfig,
                         chat_id,
                         cleaned_message,
                         thread_id=thread_id,
@@ -704,6 +709,17 @@ def _handle_send(args, *, after_send=None):
                 )
             )
             result = authority_execution.result
+        elif trusted_commit is not None:
+            result = _run_async(
+                _send_authorized_to_platform(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    cleaned_message,
+                    thread_id=thread_id,
+                    transport_request_id=trusted_commit["request"]["request_id"],
+                )
+            )
         else:
             result = _run_async(
                 _send_to_platform(
@@ -1028,6 +1044,7 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
 
 async def _send_authorized_to_platform(
     platform,
+    pconfig,
     chat_id,
     content,
     *,
@@ -1042,23 +1059,44 @@ async def _send_authorized_to_platform(
         adapter = runner.adapters.get(platform) if runner is not None else None
     except Exception:
         adapter = None
-    if adapter is None:
-        return {
-            "success": False,
-            "error": "strict transport authority requires a live adapter",
-        }
-    if getattr(adapter, "supports_transport_authority", False) is not True:
-        return {
-            "success": False,
-            "error": "adapter does not support strict transport authority",
-        }
-    metadata = {"thread_id": thread_id} if thread_id else None
-    result = await adapter.send_authorized(
-        chat_id,
-        content,
-        metadata=metadata,
-        transport_request_id=transport_request_id,
-    )
+    if adapter is not None:
+        if getattr(adapter, "supports_transport_authority", False) is not True:
+            return {
+                "success": False,
+                "error": "adapter does not support strict transport authority",
+            }
+        metadata = {"thread_id": thread_id} if thread_id else None
+        result = await adapter.send_authorized(
+            chat_id,
+            content,
+            metadata=metadata,
+            transport_request_id=transport_request_id,
+        )
+    else:
+        try:
+            from gateway.platform_registry import platform_registry
+
+            platform_name = platform.value if hasattr(platform, "value") else str(platform)
+            entry = platform_registry.get(platform_name)
+        except Exception:
+            entry = None
+        strict_sender = (
+            getattr(entry, "standalone_authorized_sender_fn", None)
+            if entry is not None
+            else None
+        )
+        if not callable(strict_sender):
+            return {
+                "success": False,
+                "error": "strict transport authority requires a conforming adapter",
+            }
+        result = await strict_sender(
+            pconfig,
+            chat_id,
+            content,
+            thread_id=thread_id,
+            transport_request_id=transport_request_id,
+        )
     if isinstance(result, dict):
         return result
     return {

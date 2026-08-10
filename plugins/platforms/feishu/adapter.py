@@ -6650,6 +6650,43 @@ async def _standalone_send(
         return {"error": f"Feishu send failed: {e}"}
 
 
+async def _standalone_send_authorized(
+    pconfig,
+    chat_id,
+    content,
+    *,
+    thread_id=None,
+    transport_request_id: str,
+):
+    """Run the same strict one-attempt seam without a resident Gateway."""
+    if not await asyncio.to_thread(_load_lark_oapi):
+        return {
+            "success": False,
+            "error": "Feishu dependencies not installed. Run `hermes setup` to install Feishu support.",
+        }
+    try:
+        adapter = FeishuAdapter(pconfig)
+        domain_name = getattr(adapter, "_domain_name", "feishu")
+        domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+        adapter._client = adapter._build_lark_client(domain)
+        result = await adapter.send_authorized(
+            chat_id,
+            content,
+            metadata={"thread_id": thread_id} if thread_id else None,
+            transport_request_id=transport_request_id,
+        )
+        return {
+            "success": result.success,
+            "message_id": result.message_id,
+            "error": result.error,
+            "raw_response": result.raw_response,
+        }
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return {"success": False, "error": f"Feishu strict send failed: {exc}"}
+
+
 def interactive_setup() -> None:
     """Interactive setup for Feishu / Lark — scan-to-create or manual creds.
 
@@ -6867,6 +6904,7 @@ def register(ctx) -> None:
         allow_all_env="FEISHU_ALLOW_ALL_USERS",
         cron_deliver_env_var="FEISHU_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        standalone_authorized_sender_fn=_standalone_send_authorized,
         max_message_length=8000,
         emoji="🪽",
         allow_update_command=True,

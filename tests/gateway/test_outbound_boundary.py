@@ -386,6 +386,67 @@ def test_gateway_final_reply_hook_authority_uses_core_executor(monkeypatch):
     assert executions[0]["decision"].delivery_authority == authority
 
 
+def test_gateway_authority_revalidates_payload_after_local_file_suppression(
+    monkeypatch, tmp_path
+):
+    local_file = tmp_path / "already-delivered.txt"
+    local_file.write_text("internal", encoding="utf-8")
+    content = f"Please review {local_file}"
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "telegram",
+        "channel_id": "admin-dm",
+        "thread_id": "",
+    }
+    request = {
+        "request_id": "request-gateway-local-file",
+        "profile_id": "default",
+        "frame_id": "frame-gateway-local-file",
+        "notification_claim_id": "claim-gateway-local-file",
+        "decision_route": route,
+        "notification_route": route,
+        "items_content_hash": "sha256:items",
+        "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "claim_created_at": now.isoformat(),
+        "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": request,
+    }
+
+    def boundary(_event_type, _payload):
+        return {
+            "decision": "allow",
+            "reason": "registered",
+            "delivery_authority": authority,
+        }
+
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "_history_media_paths_for_session",
+        lambda *_args: {str(local_file)},
+    )
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(
+            named_handler(
+                boundary,
+                capabilities={
+                    ob.REQUIRED_SCREENING_CAPABILITY,
+                    ob.TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY,
+                },
+            )
+        ),
+        response=content,
+    )
+
+    adapter.send_authorized.assert_not_awaited()
+    adapter._send_with_retry.assert_not_awaited()
+
+
 def test_gateway_notice_hook_authority_uses_core_executor(monkeypatch):
     from gateway import run as gateway_run
 

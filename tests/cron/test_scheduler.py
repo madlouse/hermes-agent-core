@@ -854,6 +854,66 @@ class TestDeliverResultWrapping:
         live_send.assert_not_awaited()
         standalone_send.assert_not_awaited()
 
+    @pytest.mark.parametrize("schedule_mode", ["missing", "cancelled_timeout"])
+    def test_hook_authority_scheduling_failure_never_falls_back_standalone(
+        self, tmp_path, schedule_mode
+    ):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="请回复 1 确认",
+            raw={"decision": "allow"},
+            delivery_authority={
+                "schema_version": "transport-outbox-hook/v1",
+                "required": True,
+                "business_profile_id": "atlas",
+                "request": {"request_id": "request-cron-schedule-failure"},
+            },
+        )
+        adapter = AsyncMock()
+        adapter.supports_transport_authority = True
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        standalone_send = AsyncMock(return_value={"success": True})
+        (tmp_path / "config.yaml").write_text("profile_id: atlas\n", encoding="utf-8")
+
+        def schedule(coro, _loop):
+            coro.close()
+            if schedule_mode == "missing":
+                return None
+            future = MagicMock()
+            future.result.side_effect = TimeoutError
+            future.cancel.return_value = True
+            return future
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                {
+                    "id": f"authority-cron-{schedule_mode}",
+                    "profile_id": "default",
+                    "profile_path": str(tmp_path),
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                },
+                "请回复 1 确认",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+
+        assert result is not None
+        assert "live adapter" in result
+        adapter.send_authorized.assert_not_awaited()
+        standalone_send.assert_not_awaited()
+
 
 class TestDeliverResultErrorReturns:
     """Verify _deliver_result returns error strings on failure, None on success."""

@@ -872,6 +872,41 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertFalse(result.success)
         adapter._send_raw_message.assert_not_awaited()
 
+    def test_standalone_authorized_send_reuses_strict_adapter_seam(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import SendResult
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        strict_send = AsyncMock(
+            return_value=SendResult(success=True, message_id="om-standalone-strict")
+        )
+        with patch.object(feishu_module, "_load_lark_oapi", return_value=True), patch.object(
+            feishu_module.FeishuAdapter,
+            "_build_lark_client",
+            return_value=object(),
+        ), patch.object(
+            feishu_module.FeishuAdapter,
+            "send_authorized",
+            strict_send,
+        ):
+            result = asyncio.run(
+                feishu_module._standalone_send_authorized(
+                    PlatformConfig(),
+                    "oc_chat",
+                    "请回复 1 确认",
+                    transport_request_id="request-standalone-strict",
+                )
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["message_id"], "om-standalone-strict")
+        strict_send.assert_awaited_once_with(
+            "oc_chat",
+            "请回复 1 确认",
+            metadata=None,
+            transport_request_id="request-standalone-strict",
+        )
+
     def test_outer_send_retry_does_not_duplicate_timeout(self):
         import httpx
         import requests

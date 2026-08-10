@@ -3126,7 +3126,10 @@ def _deliver_result(
             authority_active = isinstance(
                 getattr(boundary_decision, "delivery_authority", None), dict
             )
-            authority_terminal = False
+            # Once a Hook authority owns this target, no scheduling, timeout,
+            # adapter, or provider failure may reopen the legacy standalone
+            # path. A confirmed execution can still mark delivery successful.
+            authority_terminal = authority_active
             if authority_active and boundary_media_files:
                 raise RuntimeError(
                     "trusted outbound delivery authority does not support multipart sends"
@@ -3585,15 +3588,15 @@ def _deliver_result(
                         job["id"], err_msg,
                     )
 
-        if not delivered and authority_terminal:
-            delivery_errors.extend(target_errors or [
-                f"trusted delivery to {platform_name}:{chat_id} was not confirmed"
-            ])
-            continue
-
         if not delivered and authority_active and not live_adapter_ready:
             delivery_errors.extend(target_errors or [
                 f"strict authority delivery requires a live {platform_name} adapter"
+            ])
+            continue
+
+        if not delivered and authority_terminal:
+            delivery_errors.extend(target_errors or [
+                f"trusted delivery to {platform_name}:{chat_id} was not confirmed"
             ])
             continue
 
