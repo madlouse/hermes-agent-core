@@ -10755,12 +10755,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             idempotent_recovery = (
                 getattr(adapter, "supports_delivery_idempotency", False) is True
+                and bool(row.get("idempotency_key"))
             )
             idempotency_ttl = getattr(
                 adapter, "delivery_idempotency_ttl_seconds", None
             )
             if (
                 idempotent_recovery
+                and row.get("needs_marker")
                 and idempotency_ttl
                 and (time.time() - float(row["created_at"])) >= idempotency_ttl
             ):
@@ -10778,10 +10780,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             content = row["content"]
             if row.get("needs_marker") and not idempotent_recovery:
                 content = RECOVERED_MARKER + content
-            metadata = {
-                "hermes_delivery_idempotency_key": row["obligation_id"],
-                "hermes_delivery_part": "text",
-            }
+            metadata = {}
+            if row.get("idempotency_key"):
+                metadata.update({
+                    "hermes_delivery_idempotency_key": row["idempotency_key"],
+                    "hermes_delivery_part": "text",
+                })
             if row.get("thread_id"):
                 metadata["thread_id"] = row["thread_id"]
             try:

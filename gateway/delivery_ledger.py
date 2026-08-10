@@ -102,6 +102,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             chat_id TEXT NOT NULL,
             thread_id TEXT,
             reply_to TEXT,
+            idempotency_key TEXT,
             content TEXT NOT NULL,
             state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -120,6 +121,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     if "reply_to" not in columns:
         conn.execute(
             "ALTER TABLE delivery_obligations ADD COLUMN reply_to TEXT"
+        )
+    if "idempotency_key" not in columns:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN idempotency_key TEXT"
         )
 
 
@@ -213,12 +218,12 @@ def record_obligation(
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
-                reply_to, content, state, attempts, created_at, updated_at,
+                reply_to, idempotency_key, content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None,
-             str(reply_to) if reply_to else None, content, now, now,
+             str(reply_to) if reply_to else None, obligation_id, content, now, now,
              pid, started),
         )
     _prune()
@@ -277,12 +282,13 @@ def sweep_recoverable(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      reply_to, content, state, attempts, created_at,
+                      reply_to, idempotency_key, content, state, attempts, created_at,
                       owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
-        for (oid, session_key, platform, chat_id, thread_id, reply_to, content, state,
+        for (oid, session_key, platform, chat_id, thread_id, reply_to,
+             idempotency_key, content, state,
              attempts, created_at, owner_pid, owner_started_at) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
@@ -315,6 +321,7 @@ def sweep_recoverable(
                     "chat_id": chat_id,
                     "thread_id": thread_id,
                     "reply_to": reply_to,
+                    "idempotency_key": idempotency_key,
                     "content": content,
                     "created_at": created_at,
                     # pending = send never started, redeliver plainly;

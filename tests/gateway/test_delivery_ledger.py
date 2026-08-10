@@ -38,6 +38,13 @@ def test_legacy_schema_migrates_reply_target(tmp_path):
             last_error TEXT
         )"""
     )
+    conn.execute(
+        """INSERT INTO delivery_obligations
+           (obligation_id, session_key, platform, chat_id, thread_id,
+            content, state, attempts, created_at, updated_at)
+           VALUES ('legacy-1', 'session', 'feishu', 'chat', NULL,
+                   'answer', 'attempting', 0, 1, 1)"""
+    )
 
     dl._initialize_schema(conn)
 
@@ -46,8 +53,13 @@ def test_legacy_schema_migrates_reply_target(tmp_path):
             "PRAGMA table_info(delivery_obligations)"
         ).fetchall()
     }
+    migrated = conn.execute(
+        "SELECT reply_to, idempotency_key FROM delivery_obligations "
+        "WHERE obligation_id='legacy-1'"
+    ).fetchone()
     conn.close()
-    assert "reply_to" in columns
+    assert {"reply_to", "idempotency_key"}.issubset(columns)
+    assert migrated == (None, None)
 
 
 @pytest.fixture(autouse=True)
@@ -274,6 +286,48 @@ class TestGatewayRedeliverySweep:
         assert await runner._redeliver_pending_obligations() == 0
         adapter.send.assert_not_awaited()
         assert _row("ob-1")["state"] == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_legacy_row_keeps_marked_at_least_once_recovery(self):
+        _record(platform="slack")
+        dl.mark_attempting("ob-1")
+        _orphan("ob-1")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET idempotency_key=NULL, "
+                "reply_to=NULL WHERE obligation_id=?",
+                ("ob-1",),
+            )
+        adapter = self._adapter()
+        adapter.supports_delivery_idempotency = True
+        adapter.delivery_idempotency_ttl_seconds = 3000
+        runner = self._runner(adapter)
+
+        await runner._redeliver_pending_obligations()
+
+        sent = adapter.send.call_args.kwargs
+        assert sent["content"].startswith(dl.RECOVERED_MARKER)
+        assert sent["reply_to"] is None
+        assert "hermes_delivery_idempotency_key" not in sent["metadata"]
+
+    @pytest.mark.asyncio
+    async def test_old_pending_row_sends_after_idempotency_window(self):
+        _record(reply_to="msg-42")
+        _orphan("ob-1")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
+                (time.time() - 60, "ob-1"),
+            )
+        adapter = self._adapter()
+        adapter.supports_delivery_idempotency = True
+        adapter.delivery_idempotency_ttl_seconds = 30
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 1
+        sent = adapter.send.call_args.kwargs
+        assert sent["content"] == "the final answer"
+        assert sent["reply_to"] == "msg-42"
 
     @pytest.mark.parametrize(
         ("send_success", "ledger_method"),
