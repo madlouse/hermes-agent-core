@@ -113,6 +113,7 @@ CallBackCard = None  # type: ignore[assignment]
 P2CardActionTriggerResponse = None  # type: ignore[assignment]
 EventDispatcherHandler = None  # type: ignore[assignment]
 FeishuWSClient = None  # type: ignore[assignment]
+LarkTokenManager = None  # type: ignore[assignment]
 FEISHU_AVAILABLE = False
 _lark_import_lock = threading.Lock()
 
@@ -220,6 +221,8 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
+_FEISHU_SDK_REQUEST_TIMEOUT_SECONDS = 30.0
+_FEISHU_SEND_HARD_TIMEOUT_SECONDS = 35.0
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
@@ -367,6 +370,10 @@ _SKIP_TEXT_KEYS = {
     "template",
     "locale",
 }
+
+
+class FeishuDeliveryTimeoutError(TimeoutError):
+    """A send timed out after delivery may already have occurred."""
 
 
 @dataclass(frozen=True)
@@ -1432,6 +1439,7 @@ def _load_lark_oapi() -> bool:
                 CallBackCard, P2CardActionTriggerResponse,
             )
             from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
+            from lark_oapi.core.token.manager import TokenManager as LarkTokenManager
             from lark_oapi.ws import Client as FeishuWSClient
         except ImportError:
             return False
@@ -1463,6 +1471,7 @@ def _load_lark_oapi() -> bool:
             "P2CardActionTriggerResponse": P2CardActionTriggerResponse,
             "EventDispatcherHandler": EventDispatcherHandler,
             "FeishuWSClient": FeishuWSClient,
+            "LarkTokenManager": LarkTokenManager,
             "FEISHU_AVAILABLE": True,
         })
         return True
@@ -1487,6 +1496,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
+    supports_delivery_idempotency = True
+    # Feishu documents a one-hour UUID deduplication window. Keep ten minutes
+    # of clock/skew margin so recovery never assumes deduplication too late.
+    delivery_idempotency_ttl_seconds = 50 * 60
 
     MAX_MESSAGE_LENGTH = 8000
     # Max distinct chat IDs retained in _chat_locks before LRU eviction kicks in.
@@ -1513,6 +1526,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # if it has been shut down. See issue #10849.
         self._sdk_executor_lock = threading.Lock()
         self._sdk_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._send_token_refresh_lock: Optional[asyncio.Lock] = None
+        self._send_token_refresh_future: Optional[
+            concurrent.futures.Future
+        ] = None
         # Set on disconnect/shutdown so a real teardown can't be resurrected
         # by the recreate-on-shutdown path; cleared on connect for reconnects.
         self._sdk_executor_closing = False
@@ -1758,6 +1775,70 @@ class FeishuAdapter(BasePlatformAdapter):
         """Run a blocking Feishu SDK call on the adapter-owned thread pool."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._get_sdk_executor(), func, *args)
+
+    async def _ensure_send_token_ready(self) -> None:
+        """Prime the SDK token cache off-loop before entering async send APIs."""
+        if LarkTokenManager is None or self._client is None:
+            return
+        config = getattr(self._client, "config", None)
+        if config is None:
+            return
+        lock = self._send_token_refresh_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._send_token_refresh_lock = lock
+
+        async with lock:
+            prior = self._send_token_refresh_future
+            if prior is not None and not prior.done():
+                raise FeishuDeliveryTimeoutError(
+                    "Feishu token refresh is still blocked; send not attempted"
+                )
+            self._send_token_refresh_future = None
+            future = self._get_sdk_executor().submit(
+                LarkTokenManager.get_self_tenant_token, config,
+            )
+            self._send_token_refresh_future = future
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.wrap_future(future)),
+                    timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise FeishuDeliveryTimeoutError(
+                    "Feishu token refresh timed out; send not attempted"
+                ) from exc
+            finally:
+                if future.done():
+                    self._send_token_refresh_future = None
+
+    async def _run_send_sdk(self, sync_func, async_func, request):
+        """Run a message send on the cancellable SDK path with a hard deadline."""
+        try:
+            if callable(async_func):
+                await self._ensure_send_token_ready()
+                return await asyncio.wait_for(
+                    async_func(request),
+                    timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
+                )
+
+            # Compatibility fallback for SDKs older than the repository pin.
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(
+                self._get_sdk_executor(), sync_func, request,
+            )
+            return await asyncio.wait_for(
+                future, timeout=_FEISHU_SEND_HARD_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            if isinstance(exc, FeishuDeliveryTimeoutError):
+                raise
+            if not self._is_timeout_exception(exc):
+                raise
+            raise FeishuDeliveryTimeoutError(
+                "Feishu send timed out after "
+                f"{_FEISHU_SEND_HARD_TIMEOUT_SECONDS:g}s; delivery status unknown"
+            ) from exc
 
     def _shutdown_sdk_executor(self) -> None:
         """Stop the adapter-owned SDK executor without touching the loop default."""
@@ -4887,7 +4968,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=message_uuid,
             )
             request = self._build_reply_message_request(effective_reply_to, body)
-            return await self._run_blocking(self._client.im.v1.message.reply, request)
+            message_api = self._client.im.v1.message
+            return await self._run_send_sdk(
+                message_api.reply,
+                getattr(message_api, "areply", None),
+                request,
+            )
 
         # For topic/thread messages that fell back from reply→create, use
         # thread_id as receive_id so the message lands in the topic instead of
@@ -4917,11 +5003,28 @@ class FeishuAdapter(BasePlatformAdapter):
                 uuid_value=message_uuid,
             )
             request = self._build_create_message_request(receive_id_type, body)
-        return await self._run_blocking(self._client.im.v1.message.create, request)
+        message_api = self._client.im.v1.message
+        return await self._run_send_sdk(
+            message_api.create,
+            getattr(message_api, "acreate", None),
+            request,
+        )
 
     @staticmethod
     def _response_succeeded(response: Any) -> bool:
         return bool(response and getattr(response, "success", lambda: False)())
+
+    @staticmethod
+    def _is_timeout_exception(exc: BaseException) -> bool:
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return True
+        if any("timeout" in cls.__name__.lower() for cls in type(exc).__mro__):
+            return True
+        lowered = str(exc).lower()
+        return any(
+            marker in lowered
+            for marker in ("timed out", "readtimeout", "writetimeout")
+        )
 
     @staticmethod
     def _extract_response_field(response: Any, field_name: str) -> Any:
@@ -5038,6 +5141,7 @@ class FeishuAdapter(BasePlatformAdapter):
             .app_id(self._app_id)
             .app_secret(self._app_secret)
             .domain(domain)
+            .timeout(_FEISHU_SDK_REQUEST_TIMEOUT_SECONDS)
             .log_level(lark.LogLevel.WARNING)
             .build()
         )
@@ -5096,6 +5200,15 @@ class FeishuAdapter(BasePlatformAdapter):
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
                     raise
+                # A timeout can happen after Feishu accepted the request. Retrying
+                # here could duplicate a user-visible message, so surface the
+                # uncertain result to the delivery ledger instead.
+                if self._is_timeout_exception(exc):
+                    if isinstance(exc, FeishuDeliveryTimeoutError):
+                        raise
+                    raise FeishuDeliveryTimeoutError(
+                        "Feishu send timed out; delivery status unknown"
+                    ) from exc
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
                 wait_seconds = 2 ** attempt

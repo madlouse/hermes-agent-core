@@ -3,7 +3,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 
@@ -116,7 +116,12 @@ class TestBasePlatformTopicSessions:
                 "chat_id": "-1001",
                 "content": "ack",
                 "reply_to": None,
-                "metadata": {"thread_id": "17585", "notify": True},
+                "metadata": {
+                    "thread_id": "17585",
+                    "notify": True,
+                    "hermes_delivery_idempotency_key": ANY,
+                    "hermes_delivery_part": "text",
+                },
             }
         ]
         assert typing_calls == [
@@ -195,7 +200,11 @@ class TestTelegramAutoTtsCaptionDelivery:
                 "chat_id": "-1001",
                 "content": long_reply,
                 "reply_to": None,
-                "metadata": {"thread_id": "17585", "notify": True},
+                "metadata": {
+                    "thread_id": "17585",
+                    "notify": True,
+                    "hermes_delivery_idempotency_key": ANY,
+                    "hermes_delivery_part": "text",
+                },
             }
         ]
-

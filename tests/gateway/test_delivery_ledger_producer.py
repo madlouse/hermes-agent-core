@@ -15,7 +15,13 @@ import pytest
 
 from gateway import delivery_ledger as dl
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    RecoveryDeliveryContext,
+    SendResult,
+)
 from gateway.session import SessionSource
 
 
@@ -33,6 +39,7 @@ class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True), Platform.SLACK)
         self.sent = []
+        self.sent_metadata = []
 
     async def connect(self, *, is_reconnect: bool = False):  # pragma: no cover
         return True
@@ -45,6 +52,7 @@ class _Adapter(BasePlatformAdapter):  # type: ignore[misc]
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
         self.sent.append(content)
+        self.sent_metadata.append(metadata)
         return SendResult(success=True, message_id="m1")
 
 
@@ -109,6 +117,11 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "delivered"
         assert rows[0][2] == "final answer"
+        assert adapter.sent_metadata == [{
+            "notify": True,
+            "hermes_delivery_idempotency_key": rows[0][0],
+            "hermes_delivery_part": "text",
+        }]
 
     @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):
@@ -121,6 +134,35 @@ class TestProducerHook:
         rows = _rows()
         assert len(rows) == 1
         assert rows[0][1] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_recovery_key_survives_failed_send_and_sweep(self):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(
+            return_value=SendResult(success=False, error="send timed out")
+        )
+        event = _event()
+        event.recovery_delivery = RecoveryDeliveryContext(
+            complete=lambda: None,
+            idempotency_key="upstream-stable-key",
+            future=asyncio.get_running_loop().create_future(),
+        )
+
+        await _run(adapter, event)
+
+        with dl._connect() as conn:
+            persisted = conn.execute(
+                "SELECT obligation_id, idempotency_key "
+                "FROM delivery_obligations"
+            ).fetchone()
+            conn.execute(
+                "UPDATE delivery_obligations "
+                "SET owner_pid=999999999, owner_started_at=1"
+            )
+        claimed = dl.sweep_recoverable()
+        assert persisted[1] == "upstream-stable-key"
+        assert claimed[0]["obligation_id"] == persisted[0]
+        assert claimed[0]["idempotency_key"] == "upstream-stable-key"
 
 
     @pytest.mark.asyncio

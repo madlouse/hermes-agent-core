@@ -2716,6 +2716,8 @@ class BasePlatformAdapter(ABC):
     # support multi-message delivery (Discord, Telegram, …).  Default False
     # (conservative); adapters verified to chunk in ``send()`` set True.
     splits_long_messages: bool = False
+    supports_delivery_idempotency: bool = False
+    delivery_idempotency_ttl_seconds: Optional[float] = None
 
     # The command prefix users can always TYPE on this platform to reach
     # Hermes commands.  Default "/" (most platforms deliver "/approve" etc.
@@ -6282,6 +6284,10 @@ class BasePlatformAdapter(ABC):
                                     ),
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
+                                    reply_to=_reply_anchor,
+                                    idempotency_key=(
+                                        recovery_key or _obligation_id
+                                    ),
                                     content=text_content,
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
@@ -6292,7 +6298,15 @@ class BasePlatformAdapter(ABC):
                         chat_id=event.source.chat_id,
                         content=text_content,
                         reply_to=_reply_anchor,
-                        metadata=_delivery_metadata("text"),
+                        metadata=(
+                            _delivery_metadata("text")
+                            if _obligation_id is None or recovery_key
+                            else {
+                                **_final_thread_metadata,
+                                "hermes_delivery_idempotency_key": _obligation_id,
+                                "hermes_delivery_part": "text",
+                            }
+                        ),
                     )
                     _record_delivery(result)
                     if _obligation_id is not None:

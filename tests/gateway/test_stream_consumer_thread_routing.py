@@ -130,12 +130,12 @@ class TestFeishuFallbackThreadRouting:
         adapter._client = mock_client
         adapter._build_create_message_body = FeishuAdapter._build_create_message_body
         adapter._build_create_message_request = FeishuAdapter._build_create_message_request
-        # _send_raw_message routes blocking SDK calls through _run_blocking
-        # (adapter-owned executor). On a MagicMock(spec=...) that method is
-        # auto-mocked and would swallow the real call, so wire a passthrough.
-        async def _run_blocking_passthrough(func, *args):
-            return func(*args)
-        adapter._run_blocking = _run_blocking_passthrough
+        # Wire the send dispatcher to the synchronous mock API. Production
+        # uses the SDK's cancellable async method; this test only checks topic
+        # request construction and routing.
+        async def _run_send_passthrough(sync_func, _async_func, request):
+            return sync_func(request)
+        adapter._run_send_sdk = _run_send_passthrough
 
         # Call _send_raw_message with reply_to=None and thread_id in metadata
         import json
@@ -171,4 +171,3 @@ class TestFeishuFallbackThreadRouting:
         assert receive_id_type == "thread_id", (
             f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
         )
-

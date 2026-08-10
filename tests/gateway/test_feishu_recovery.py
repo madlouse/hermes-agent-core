@@ -626,7 +626,7 @@ def test_feishu_recovery_message_uuid_is_stable_per_delivery_part():
     captured = []
     adapter._build_reply_message_body = lambda **kwargs: captured.append(kwargs) or kwargs
     adapter._build_reply_message_request = lambda message_id, body: (message_id, body)
-    adapter._run_blocking = AsyncMock(return_value=SimpleNamespace(success=lambda: True))
+    adapter._run_send_sdk = AsyncMock(return_value=SimpleNamespace(success=lambda: True))
 
     async def send(part, text="business result"):
         await adapter._send_raw_message(
@@ -723,7 +723,7 @@ def test_feishu_regular_send_keeps_random_uuid_path():
     captured = []
     adapter._build_reply_message_body = lambda **kwargs: captured.append(kwargs) or kwargs
     adapter._build_reply_message_request = lambda message_id, body: (message_id, body)
-    adapter._run_blocking = AsyncMock(return_value=SimpleNamespace(success=lambda: True))
+    adapter._run_send_sdk = AsyncMock(return_value=SimpleNamespace(success=lambda: True))
 
     asyncio.run(
         adapter._send_raw_message(
@@ -1205,7 +1205,7 @@ def test_multi_image_delivery_propagates_failure_exception_and_empty_success():
     assert asyncio.run(adapter.send_multiple_images("oc_chat", [])) == SendResult(success=True)
 
 
-def test_recovered_delivery_without_idempotency_key_uses_plain_final_metadata(monkeypatch):
+def test_recovered_delivery_without_key_uses_ledger_obligation_key(monkeypatch):
     async def allow(_hooks, context):
         return SimpleNamespace(
             transmit=True, content=context["content"], raw={"decision": "allow"},
@@ -1230,7 +1230,9 @@ def test_recovered_delivery_without_idempotency_key_uses_plain_final_metadata(mo
         return event.recovery_delivery.future.result()
 
     assert asyncio.run(scenario()) == {"status": "completed"}
-    assert "hermes_delivery_part" not in adapter.send.await_args.kwargs["metadata"]
+    metadata = adapter.send.await_args.kwargs["metadata"]
+    assert metadata["hermes_delivery_part"] == "text"
+    assert metadata["hermes_delivery_idempotency_key"]
 
 
 def test_list_request_sdk_builder_carries_optional_page_token(monkeypatch):
