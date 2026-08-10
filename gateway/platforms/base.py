@@ -6285,6 +6285,9 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     reply_to=_reply_anchor,
+                                    idempotency_key=(
+                                        recovery_key or _obligation_id
+                                    ),
                                     content=text_content,
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)

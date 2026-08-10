@@ -81,6 +81,7 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
         thread_id=kw.get("thread_id", "171.001"),
         content=kw.get("content", "the final answer"),
         reply_to=kw.get("reply_to"),
+        idempotency_key=kw.get("idempotency_key", oid),
     )
 
 

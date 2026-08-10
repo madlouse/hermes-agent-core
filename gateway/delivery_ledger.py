@@ -210,6 +210,7 @@ def record_obligation(
     thread_id: Optional[str],
     content: str,
     reply_to: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
 ) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
@@ -223,7 +224,9 @@ def record_obligation(
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None,
-             str(reply_to) if reply_to else None, obligation_id, content, now, now,
+             str(reply_to) if reply_to else None,
+             str(idempotency_key) if idempotency_key else None,
+             content, now, now,
              pid, started),
         )
     _prune()
