@@ -18537,11 +18537,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _stts_adapter is not None
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
-            if (
-                not _streaming_tts_done
-                and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
-            ):
-                setattr(event, "_hermes_auto_voice_reply_requested", True)
+            self._defer_auto_voice_reply(
+                event,
+                response,
+                agent_messages,
+                already_sent=_already_sent,
+                streaming_tts_done=_streaming_tts_done,
+            )
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -19574,6 +19576,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if is_voice_input and not already_sent:
             return False
 
+        return True
+
+    def _defer_auto_voice_reply(
+        self,
+        event: MessageEvent,
+        response: str,
+        agent_messages: list,
+        *,
+        already_sent: bool,
+        streaming_tts_done: bool,
+    ) -> bool:
+        if streaming_tts_done or not self._should_send_voice_reply(
+            event,
+            response,
+            agent_messages,
+            already_sent=already_sent,
+        ):
+            return False
+        setattr(event, "_hermes_auto_voice_reply_requested", True)
         return True
 
     def _should_echo_stt_transcripts(self) -> bool:

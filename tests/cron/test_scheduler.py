@@ -782,6 +782,90 @@ class TestDeliverResultWrapping:
         legacy_send.assert_not_awaited()
         after_send.assert_not_called()
 
+    def test_hook_authority_cron_reaches_feishu_strict_sender_through_registry(
+        self, monkeypatch
+    ):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.outbound_boundary import AuthorizedOutboundExecution
+        from gateway.platform_registry import PlatformEntry, platform_registry
+        from gateway.platforms.base import SendResult
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        class RegistrationContext:
+            @staticmethod
+            def register_platform(**kwargs):
+                platform_registry.register(PlatformEntry(**kwargs))
+
+        monkeypatch.setattr(platform_registry, "_entries", dict(platform_registry._entries))
+        monkeypatch.setattr(platform_registry, "_deferred", dict(platform_registry._deferred))
+        feishu_module.register(RegistrationContext())
+
+        pconfig = PlatformConfig(enabled=True, extra={"app_id": "app", "app_secret": "secret"})
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.FEISHU: pconfig}
+        boundary_decision = MagicMock(
+            transmit=True,
+            decision="allow",
+            content="请回复 1 确认",
+            raw={"decision": "allow"},
+            delivery_authority={
+                "schema_version": "transport-outbox-hook/v1",
+                "required": True,
+                "business_profile_id": "atlas",
+                "request": {"request_id": "request-feishu-registry"},
+            },
+        )
+
+        async def execute(**kwargs):
+            provider_result = await kwargs["send"]()
+            return AuthorizedOutboundExecution(
+                result=provider_result,
+                outcome="confirmed",
+                request={"request_id": "request-feishu-registry"},
+                receipt={"receipt_id": "receipt-feishu-registry"},
+                provider_called=True,
+            )
+
+        strict_adapter_send = AsyncMock(
+            return_value=SendResult(
+                success=True,
+                message_id="om-feishu-registry",
+                raw_response=SimpleNamespace(
+                    code=0,
+                    msg="ok",
+                    data=SimpleNamespace(message_id="om-feishu-registry"),
+                ),
+            )
+        )
+        legacy_send = AsyncMock(return_value={"success": True})
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", return_value=boundary_decision), \
+             patch("gateway.outbound_boundary.execute_authorized_outbound_send", side_effect=execute), \
+             patch.object(feishu_module, "_load_lark_oapi", return_value=True), \
+             patch.object(feishu_module.FeishuAdapter, "_build_lark_client", return_value=object()), \
+             patch.object(feishu_module.FeishuAdapter, "send_authorized", strict_adapter_send), \
+             patch("tools.send_message_tool._send_to_platform", new=legacy_send):
+            result = _deliver_result(
+                {
+                    "id": "authority-feishu-registry",
+                    "profile_id": "atlas",
+                    "deliver": "origin",
+                    "origin": {"platform": "feishu", "chat_id": "oc_admin"},
+                },
+                "请回复 1 确认",
+            )
+
+        assert result is None
+        strict_adapter_send.assert_awaited_once_with(
+            "oc_admin",
+            "请回复 1 确认",
+            metadata=None,
+            transport_request_id="request-feishu-registry",
+        )
+        legacy_send.assert_not_awaited()
+
     def test_hook_authority_wraps_live_cron_provider_once(self, tmp_path):
         from concurrent.futures import Future
         from gateway.config import Platform
