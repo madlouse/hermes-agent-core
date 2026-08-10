@@ -40,8 +40,12 @@ def test_repository_release_versions_are_identical():
         desktop["version"],
         package_lock["packages"]["apps/desktop"]["version"],
     }
+    release_date = re.search(
+        r'^__release_date__ = "([^"]+)"$', init_text, re.MULTILINE
+    ).group(1)
 
     assert len(versions) == 1
+    assert release_date == "2026.8.10.3"
 
 
 def test_version_update_and_stage_list_cover_desktop_lockfile(tmp_path, monkeypatch):
