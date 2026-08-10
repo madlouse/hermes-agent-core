@@ -208,9 +208,14 @@ def test_operator_enforce_outbound_boundary_rewrites_armed_complete_reply(tmp_pa
     def build_outbound_context(**kwargs):
         return dict(kwargs)
 
+    def gateway_reply_source_kind(content, *, enforced_channel=False):
+        assert content == "raw"
+        assert enforced_channel is True
+        return "gateway_reply"
+
     def outbound_before_send_sync(hooks, context):
         assert hooks == "hooks"
-        assert context["source_kind"] == "streaming_final_reply"
+        assert context["source_kind"] == "gateway_reply"
         assert context["enforced_channel"] is True
         assert context["output_screening_required"] is True
         return SimpleNamespace(
@@ -222,6 +227,7 @@ def test_operator_enforce_outbound_boundary_rewrites_armed_complete_reply(tmp_pa
         )
 
     fake_boundary.build_outbound_context = build_outbound_context
+    fake_boundary.gateway_reply_source_kind = gateway_reply_source_kind
     fake_boundary.outbound_before_send_sync = outbound_before_send_sync
     fake_boundary.profile_id_from_home = lambda _profile: "yuange"
     monkeypatch.setitem(sys.modules, "gateway.outbound_boundary", fake_boundary)

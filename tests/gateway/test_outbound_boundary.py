@@ -82,6 +82,7 @@ def process_gateway_reply(
     profile_id="atlas",
     source_profile=None,
     profile_config=None,
+    enforced_channel=False,
 ):
     from gateway import run as gateway_run
 
@@ -101,6 +102,11 @@ def process_gateway_reply(
             _profile_name_for_source=lambda source: source.profile or profile_id,
             _active_profile_name=lambda: profile_id,
         ),
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_operator_enforce_streaming_boundary_source_armed",
+        lambda _profile_home, _source: enforced_channel,
     )
     adapter = StubAdapter(
         PlatformConfig(enabled=True, token="test", typing_indicator=False),
@@ -296,6 +302,27 @@ def test_adapter_screens_plain_gateway_reply_before_existing_send(monkeypatch):
     assert calls[0][1]["output_screening_required"] is True
     assert calls[0][1]["profile_id"] == "atlas"
     assert calls[0][1]["profile_path"] == str(adapter._test_profile_home)
+
+
+def test_armed_adapter_screens_terminal_result_without_actionable_escalation(monkeypatch):
+    calls = []
+
+    def boundary(event_type, payload):
+        calls.append((event_type, dict(payload)))
+        return {"decision": "allow", "reason": "screened"}
+
+    process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(named_handler(boundary)),
+        response="已完成。两项均已确认，可靠投递回写成功：2/2 completed。",
+        enforced_channel=True,
+    )
+
+    assert calls[0][0] == "outbound:before_send"
+    assert calls[0][1]["source_kind"] == "gateway_reply"
+    assert calls[0][1]["enforced_channel"] is True
+    assert calls[0][1]["output_screening_required"] is True
+    assert calls[0][1]["looks_actionable"] is False
 
 
 def test_adapter_binds_named_profile_owner_before_screening(monkeypatch):
