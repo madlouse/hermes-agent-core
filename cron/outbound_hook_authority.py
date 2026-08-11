@@ -31,12 +31,13 @@ class _UnresolvedOutboundHooks:
 class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     """One lock-owned Profile authority projected as a mapping."""
 
-    __slots__ = ("__lock", "__profile", "__state")
+    __slots__ = ("__generation", "__lock", "__profile", "__state")
 
     def __init__(self) -> None:
         if hasattr(self, "_OutboundHookRegistryStore__lock"):
             raise RuntimeError("Outbound Hook registry store is already initialized")
         self.__lock = threading.RLock()
+        self.__generation = 0
         self.__profile: Path | None = None
         self.__state: Any = _MISSING_OUTBOUND_HOOK_REGISTRY
 
@@ -68,6 +69,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT:
             return
         self.__state = None if claim_token.revoked else result
+        self.__generation += 1
 
     def _prepare_mutation_locked(self) -> None:
         if not isinstance(self.__state, _UnresolvedOutboundHooks):
@@ -117,6 +119,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         self._prepare_mutation_locked()
         self.__profile = key
         self.__state = value
+        self.__generation += 1
 
     def __delitem__(self, key: Path) -> None:
         with self.__lock:
@@ -126,6 +129,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             self._prepare_mutation_locked()
             self.__profile = None
             self.__state = _MISSING_OUTBOUND_HOOK_REGISTRY
+            self.__generation += 1
 
     def __iter__(self) -> Iterator[Path]:
         with self.__lock:
@@ -161,6 +165,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             if claim_token.result is not _UNRESOLVED_OUTBOUND_HOOK_RESULT:
                 return False
             claim_token.result = result
+            self.__generation += 1
             claim_token.done.set()
             self._finalize_claim_locked(key, claim_token)
             return True
@@ -176,6 +181,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             if claim_token.result is not _UNRESOLVED_OUTBOUND_HOOK_RESULT:
                 return False
             claim_token.result = None
+            self.__generation += 1
             claim_token.done.set()
             self._finalize_claim_locked(key, claim_token)
             return True
@@ -226,12 +232,20 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     def update(self, *args: Any, **kwargs: Any) -> None:
         with self.__lock:
             self._guard_mutation_start_locked()
-        candidate = dict(*args, **kwargs)
-        if len(candidate) > 1:
-            raise ValueError("Outbound Hook registry store accepts one Profile")
+            observed_generation = self.__generation
+        try:
+            candidate = dict(*args, **kwargs)
+        except BaseException:
+            with self.__lock:
+                self._normalize_abandoned_waiters_locked()
+            raise
         with self.__lock:
+            self._guard_mutation_start_locked()
+            if self.__generation != observed_generation:
+                raise ValueError("Outbound Hook registry authority changed")
+            if len(candidate) > 1:
+                raise ValueError("Outbound Hook registry store accepts one Profile")
             if not candidate:
-                self._guard_mutation_start_locked()
                 return
             key, value = next(iter(candidate.items()))
             self._setitem_locked(key, value)
@@ -259,6 +273,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             self._prepare_mutation_locked()
             self.__profile = None
             self.__state = _MISSING_OUTBOUND_HOOK_REGISTRY
+            self.__generation += 1
             return result
 
     def popitem(self) -> tuple[Path, Any | None]:

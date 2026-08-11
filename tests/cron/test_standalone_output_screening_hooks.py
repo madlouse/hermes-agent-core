@@ -745,6 +745,69 @@ def test_abandoned_terminal_normalizes_before_update_iterates_input(tmp_path):
     assert store == {profile: hooks}
 
 
+@pytest.mark.parametrize("operation", ("update", "ior"))
+def test_slow_update_rejects_stale_intent_and_preserves_new_claim(
+    tmp_path,
+    operation,
+):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    token = scheduler._UnresolvedOutboundHooks()
+    replacement = object()
+    store = scheduler._OutboundHookRegistryStore()
+    iteration_entered = threading.Event()
+    release_iteration = threading.Event()
+    result = {}
+
+    def slow_items():
+        iteration_entered.set()
+        assert release_iteration.wait(timeout=2)
+        yield profile_b, replacement
+
+    def mutate():
+        try:
+            if operation == "update":
+                store.update(slow_items())
+            else:
+                store.__ior__(slow_items())
+        except ValueError as exc:
+            result["error"] = str(exc)
+
+    worker = threading.Thread(target=mutate, name=operation)
+    worker.start()
+    assert iteration_entered.wait(timeout=2)
+    store[profile_a] = token
+    release_iteration.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result == {"error": "Outbound Hook registry authority changed"}
+    assert token.revoked is False
+    assert store == {profile_a: token}
+
+
+def test_reentrant_update_rejects_revision_aba(tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    first_token = scheduler._UnresolvedOutboundHooks()
+    second_token = scheduler._UnresolvedOutboundHooks()
+    replacement = object()
+    store = scheduler._OutboundHookRegistryStore()
+
+    def reentrant_items():
+        store[profile_a] = first_token
+        store.clear()
+        store[profile_a] = second_token
+        yield profile_b, replacement
+
+    with pytest.raises(ValueError, match="authority changed"):
+        store.update(reentrant_items())
+
+    assert first_token.revoked is True
+    assert second_token.revoked is False
+    assert store == {profile_a: second_token}
+
+
 def test_direct_file_alias_reuses_canonical_process_authority(tmp_path):
     scheduler._standalone_outbound_hook_registries.clear()
     spec = importlib.util.spec_from_file_location(
