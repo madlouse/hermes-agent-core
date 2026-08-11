@@ -2604,10 +2604,68 @@ class _UnresolvedOutboundHooks:
     def __init__(self) -> None:
         self.owner_thread_id = threading.get_ident()
         self.result: Any = _UNRESOLVED_OUTBOUND_HOOK_RESULT
+        self.revoked = False
         self.done = threading.Event()
 
 
-_standalone_outbound_hook_registries: dict[Path, Any | None] = {}
+_MISSING_OUTBOUND_HOOK_REGISTRY = object()
+
+
+class _OutboundHookRegistryStore(dict[Path, Any | None]):
+    """Revoke unresolved claims on every non-owner map mutation."""
+
+    @staticmethod
+    def _revoke(
+        value: Any,
+        replacement: Any = _MISSING_OUTBOUND_HOOK_REGISTRY,
+    ) -> None:
+        if (
+            isinstance(value, _UnresolvedOutboundHooks)
+            and value is not replacement
+            and value.result is not replacement
+        ):
+            value.revoked = True
+
+    def __setitem__(self, key: Path, value: Any | None) -> None:
+        self._revoke(self.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY), value)
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key: Path) -> None:
+        self._revoke(self[key])
+        super().__delitem__(key)
+
+    def clear(self) -> None:
+        for value in self.values():
+            self._revoke(value)
+        super().clear()
+
+    def pop(self, key: Path, *default: Any) -> Any:
+        if key in self:
+            self._revoke(self[key])
+        return super().pop(key, *default)
+
+    def popitem(self) -> tuple[Path, Any | None]:
+        if not self:
+            raise KeyError("popitem(): dictionary is empty")
+        key = next(reversed(self))
+        self._revoke(self[key])
+        return super().popitem()
+
+    def setdefault(self, key: Path, default: Any | None = None) -> Any | None:
+        if key not in self:
+            self[key] = default
+        return self[key]
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def __ior__(self, other: Any) -> "_OutboundHookRegistryStore":
+        self.update(other)
+        return self
+
+
+_standalone_outbound_hook_registries = _OutboundHookRegistryStore()
 _standalone_outbound_hooks_lock = threading.Lock()
 
 
@@ -2628,7 +2686,7 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
             if profile_home in _standalone_outbound_hook_registries:
                 cached = _standalone_outbound_hook_registries[profile_home]
                 if isinstance(cached, _UnresolvedOutboundHooks):
-                    if cached.done.is_set():
+                    if cached.revoked or cached.done.is_set():
                         cached.result = None
                         _standalone_outbound_hook_registries[profile_home] = None
                         raise ValueError(
@@ -2663,6 +2721,11 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
     with _standalone_outbound_hooks_lock:
         cached = _standalone_outbound_hook_registries.get(profile_home)
         result = wait_token.result
+        if wait_token.revoked:
+            if cached is wait_token:
+                wait_token.result = None
+                _standalone_outbound_hook_registries[profile_home] = None
+            raise ValueError("Standalone Cron Profile Hook registry ownership changed")
         if cached is wait_token:
             wait_token.result = None
             _standalone_outbound_hook_registries[profile_home] = None
@@ -2683,7 +2746,7 @@ def _bind_live_outbound_hooks(
     with _standalone_outbound_hooks_lock:
         if profile_home in _standalone_outbound_hook_registries:
             cached = _standalone_outbound_hook_registries[profile_home]
-            if cached is claim_token:
+            if cached is claim_token and not claim_token.revoked:
                 claim_token.result = hooks
                 _standalone_outbound_hook_registries[profile_home] = hooks
                 return hooks
@@ -2741,7 +2804,7 @@ def _standalone_outbound_hooks(
     try:
         with _standalone_outbound_hooks_lock:
             cached = _standalone_outbound_hook_registries.get(profile_home)
-            if cached is not claim_token:
+            if cached is not claim_token or claim_token.revoked:
                 raise ValueError(
                     "Standalone Cron Profile Hook registry ownership changed"
                 )
@@ -2767,6 +2830,7 @@ def _standalone_outbound_hooks(
             if (
                 _standalone_outbound_hook_registries.get(profile_home)
                 is not claim_token
+                or claim_token.revoked
             ):
                 raise ValueError(
                     "Standalone Cron Profile Hook registry ownership changed"
