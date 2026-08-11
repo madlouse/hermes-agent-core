@@ -213,12 +213,50 @@ def test_missing_and_stale_receipts_never_verify(profile_home):
     assert no_receipt["status"] == OUTCOME_INDETERMINATE
     assert no_receipt["reason"] == "receipt_not_found"
 
-    commit_transport_receipt("request-1", {"success": True}, outcome=OUTCOME_CONFIRMED, now=NOW, home=profile_home)
+    stale_request = _request("request-stale")
+    _begin(profile_home, stale_request)
     stale = verify_transport_receipt(
-        request, now=NOW + timedelta(hours=1), home=profile_home
+        stale_request, now=NOW + timedelta(hours=1), home=profile_home
     )
     assert stale["status"] == "stale"
     assert stale["verified"] is False
+
+    commit_transport_receipt("request-1", {"success": True}, outcome=OUTCOME_CONFIRMED, now=NOW, home=profile_home)
+    terminal = verify_transport_receipt(
+        request, now=NOW + timedelta(hours=1), home=profile_home
+    )
+    assert terminal["status"] == "verified"
+    assert terminal["verified"] is True
+
+
+@pytest.mark.parametrize(
+    "outcome", [OUTCOME_DEFINITIVELY_REJECTED, OUTCOME_INDETERMINATE]
+)
+def test_late_nonconfirmed_receipt_remains_verifiable_terminal_audit(
+    profile_home, outcome
+):
+    request = _request(f"request-late-{outcome}")
+    _begin(profile_home, request)
+    receipt = commit_transport_receipt(
+        request["request_id"],
+        {"success": False, "error": "provider completed after claim expiry"},
+        outcome=outcome,
+        now=NOW + timedelta(hours=1),
+        home=profile_home,
+    )
+
+    verified = verify_transport_receipt(
+        request, now=NOW + timedelta(hours=2), home=profile_home
+    )
+    recovered = recover_transport_request(
+        request, now=NOW + timedelta(hours=2), home=profile_home
+    )
+
+    assert verified["status"] == outcome
+    assert verified["verified"] is False
+    assert verified["receipt"]["receipt_id"] == receipt["receipt_id"]
+    assert recovered["outcome"] == outcome
+    assert recovered["receipt"]["receipt_id"] == receipt["receipt_id"]
 
 
 def test_corrupt_database_fails_closed_as_integrity_failure(profile_home):

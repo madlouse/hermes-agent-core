@@ -430,6 +430,30 @@ def _confirmed_receipt_result(request: dict, receipt: dict) -> dict:
     return result
 
 
+def _terminal_receipt_result_after_finalization_failure(
+    request: dict, receipt: dict
+) -> dict:
+    """Project an already-persisted terminal receipt without writing another."""
+    outcome = str(receipt.get("status") or "").strip()
+    if outcome == "confirmed":
+        result = _confirmed_receipt_result(request, receipt)
+    else:
+        result = {
+            "success": False,
+            "error": "Transport outcome was persisted before post-receipt finalization failed",
+            "transport_outcome": outcome or "indeterminate",
+            "transport_request_id": request["request_id"],
+            "transport_receipt_id": receipt["receipt_id"],
+            "transport_receipt": receipt,
+        }
+        if result["transport_outcome"] == "indeterminate":
+            result["indeterminate"] = True
+    result["warnings"] = [
+        "transport receipt recovered after post-receipt finalization failed"
+    ]
+    return result
+
+
 def _handle_send(args, *, after_send=None):
     """Send a message to a platform target."""
     target = args.get("target", "")
@@ -687,9 +711,10 @@ def _handle_send(args, *, after_send=None):
                 )
             )
 
+    authority_execution = None
+    transport_receipt = None
     try:
         from model_tools import _run_async
-        authority_execution = None
         if isinstance(getattr(boundary_decision, "delivery_authority", None), dict):
             authority_execution = _run_async(
                 execute_authorized_outbound_send(
@@ -734,12 +759,12 @@ def _handle_send(args, *, after_send=None):
             )
         if trusted_commit is not None or authority_execution is not None:
             result = send_result_payload(result)
-        transport_receipt = None
         if trusted_commit is not None:
             from gateway.transport_outbox import (
                 OUTCOME_CONFIRMED,
                 classify_transport_outcome,
                 commit_transport_receipt,
+                recover_transport_request,
             )
 
             request_id = str(trusted_commit["request"]["request_id"])
@@ -751,6 +776,21 @@ def _handle_send(args, *, after_send=None):
                     outcome=outcome,
                 )
             except Exception as exc:
+                try:
+                    recovered = recover_transport_request(trusted_commit["request"])
+                except Exception:
+                    recovered = {}
+                recovered_receipt = recovered.get("receipt")
+                if (
+                    recovered.get("outcome")
+                    in {"confirmed", "definitively_rejected", "indeterminate"}
+                    and isinstance(recovered_receipt, dict)
+                ):
+                    return json.dumps(
+                        _terminal_receipt_result_after_finalization_failure(
+                            trusted_commit["request"], recovered_receipt
+                        )
+                    )
                 return json.dumps(
                     _trusted_transport_error(
                         f"Transport receipt commit failed after send outcome {outcome}: {exc}",
@@ -839,7 +879,7 @@ def _handle_send(args, *, after_send=None):
             except Exception:
                 pass
 
-        if isinstance(result, dict) and "error" in result:
+        if isinstance(result, dict) and isinstance(result.get("error"), str):
             result["error"] = _sanitize_error_text(result["error"])
         return json.dumps(result)
     except Exception as e:
@@ -847,9 +887,38 @@ def _handle_send(args, *, after_send=None):
             from gateway.transport_outbox import (
                 OUTCOME_INDETERMINATE,
                 commit_transport_receipt,
+                recover_transport_request,
             )
 
             request_id = str(trusted_commit["request"]["request_id"])
+            persisted_receipt = transport_receipt
+            if (
+                persisted_receipt is None
+                and authority_execution is not None
+                and isinstance(authority_execution.receipt, dict)
+            ):
+                persisted_receipt = authority_execution.receipt
+            if isinstance(persisted_receipt, dict):
+                return json.dumps(
+                    _terminal_receipt_result_after_finalization_failure(
+                        trusted_commit["request"], persisted_receipt
+                    )
+                )
+            try:
+                recovered = recover_transport_request(trusted_commit["request"])
+            except Exception:
+                recovered = {}
+            recovered_receipt = recovered.get("receipt")
+            if (
+                recovered.get("outcome")
+                in {"confirmed", "definitively_rejected", "indeterminate"}
+                and isinstance(recovered_receipt, dict)
+            ):
+                return json.dumps(
+                    _terminal_receipt_result_after_finalization_failure(
+                        trusted_commit["request"], recovered_receipt
+                    )
+                )
             error_text = _sanitize_error_text(str(e))
             try:
                 receipt = commit_transport_receipt(

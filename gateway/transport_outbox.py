@@ -764,11 +764,11 @@ def verify_transport_receipt(
                     "verified": False,
                     "reason": f"wrong_{field}",
                 }
-        moment = _utc_now(now)
-        if moment >= _parse_timestamp(request["claim_expires_at"]):
-            return {"status": "stale", "verified": False, "reason": "claim_expired"}
         receipt_row = _receipt_row(conn, expected["request_id"])
         if receipt_row is None:
+            moment = _utc_now(now)
+            if moment >= _parse_timestamp(request["claim_expires_at"]):
+                return {"status": "stale", "verified": False, "reason": "claim_expired"}
             return {
                 "status": OUTCOME_INDETERMINATE,
                 "verified": False,
@@ -799,6 +799,19 @@ def verify_transport_receipt(
                 "status": "integrity_failure",
                 "verified": False,
                 "reason": "transport_outcome_invalid",
+            }
+        receipt_moment = _parse_timestamp(receipt.get("created_at"))
+        if (
+            receipt_moment < _parse_timestamp(request["created_at"])
+            or (
+                receipt_status == OUTCOME_CONFIRMED
+                and receipt_moment >= _parse_timestamp(request["claim_expires_at"])
+            )
+        ):
+            return {
+                "status": "integrity_failure",
+                "verified": False,
+                "reason": "receipt_outside_claim_interval",
             }
         if receipt_status != OUTCOME_CONFIRMED:
             return {

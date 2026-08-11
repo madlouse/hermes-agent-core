@@ -88,7 +88,7 @@ def test_trusted_standalone_send_orders_request_send_receipt_after_send_and_mirr
 
     async def provider_send(*_args, **_kwargs):
         events.append("send")
-        return {"success": True, "message_id": "om_native"}
+        return {"success": True, "message_id": "om_native", "error": None}
 
     monkeypatch.setattr(outbox, "begin_transport_request", begin)
     monkeypatch.setattr(outbox, "commit_transport_receipt", commit)
@@ -107,6 +107,98 @@ def test_trusted_standalone_send_orders_request_send_receipt_after_send_and_mirr
     assert result["transport_receipt_id"].startswith("transport-receipt:")
     assert result["mirrored"] is True
     assert events == ["request_commit", "send", "receipt_commit", "after_send", "mirror"]
+
+
+def test_confirmed_receipt_recovers_when_post_receipt_finalization_raises(
+    standalone_send, monkeypatch
+):
+    import gateway.transport_outbox as outbox
+
+    commit_count = 0
+    original_commit = outbox.commit_transport_receipt
+
+    def commit(*args, **kwargs):
+        nonlocal commit_count
+        commit_count += 1
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(outbox, "commit_transport_receipt", commit)
+    monkeypatch.setattr(
+        send_module,
+        "_send_authorized_to_platform",
+        AsyncMock(
+            return_value={
+                "success": True,
+                "message_id": "om_recovered",
+                "error": "nonfatal provider note",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        send_module,
+        "_sanitize_error_text",
+        lambda _text: (_ for _ in ()).throw(RuntimeError("finalization failed")),
+    )
+    monkeypatch.setattr(
+        "gateway.transport_outbox.recover_transport_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("persisted receipt must be retained without time-based recovery")
+        ),
+    )
+
+    result = _send()
+
+    assert result["success"] is True
+    assert result["transport_outcome"] == "confirmed"
+    assert result["transport_request_id"] == "request-send-1"
+    assert result["transport_receipt_id"].startswith("transport-receipt:")
+    assert result["message_id"] == "om_recovered"
+    assert result["warnings"] == [
+        "transport receipt recovered after post-receipt finalization failed"
+    ]
+    assert commit_count == 1
+
+
+@pytest.mark.parametrize("outcome", ["definitively_rejected", "indeterminate"])
+def test_persisted_nonconfirmed_receipt_is_returned_without_second_commit(
+    standalone_send, monkeypatch, outcome
+):
+    import gateway.transport_outbox as outbox
+
+    commit_count = 0
+    original_commit = outbox.commit_transport_receipt
+
+    def commit(*args, **kwargs):
+        nonlocal commit_count
+        commit_count += 1
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(outbox, "commit_transport_receipt", commit)
+    monkeypatch.setattr(
+        send_module,
+        "_send_authorized_to_platform",
+        AsyncMock(
+            return_value={
+                "success": False,
+                "error": "provider outcome",
+                "transport_outcome": outcome,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        send_module,
+        "_sanitize_error_text",
+        lambda _text: (_ for _ in ()).throw(RuntimeError("finalization failed")),
+    )
+
+    result = _send()
+
+    assert result["success"] is False
+    assert result["transport_outcome"] == outcome
+    assert result["transport_request_id"] == "request-send-1"
+    assert result["transport_receipt_id"].startswith("transport-receipt:")
+    assert bool(result.get("indeterminate")) is (outcome == "indeterminate")
+    assert commit_count == 1
 
 
 def test_confirmed_send_with_receipt_commit_failure_is_indeterminate_and_skips_after_send(
@@ -133,6 +225,48 @@ def test_confirmed_send_with_receipt_commit_failure_is_indeterminate_and_skips_a
     assert result["transport_outcome"] == "indeterminate"
     send.assert_awaited_once()
     assert events == []
+
+
+@pytest.mark.parametrize(
+    ("outcome", "success"),
+    [
+        ("confirmed", True),
+        ("definitively_rejected", False),
+        ("indeterminate", False),
+    ],
+)
+def test_durable_receipt_is_recovered_when_commit_raises_after_persisting(
+    standalone_send, monkeypatch, outcome, success
+):
+    import gateway.transport_outbox as outbox
+
+    original_commit = outbox.commit_transport_receipt
+
+    def commit_then_raise(*args, **kwargs):
+        original_commit(*args, **kwargs)
+        raise OSError("post-transaction permission cleanup failed")
+
+    monkeypatch.setattr(outbox, "commit_transport_receipt", commit_then_raise)
+    monkeypatch.setattr(
+        send_module,
+        "_send_authorized_to_platform",
+        AsyncMock(
+            return_value={
+                "success": success,
+                "message_id": "om_durable" if success else None,
+                "error": None if success else "provider outcome",
+                "transport_outcome": outcome,
+            }
+        ),
+    )
+
+    result = _send()
+
+    assert result["success"] is success
+    assert result["transport_outcome"] == outcome
+    assert result["transport_request_id"] == "request-send-1"
+    assert result["transport_receipt_id"].startswith("transport-receipt:")
+    assert bool(result.get("indeterminate")) is (outcome == "indeterminate")
 
 
 def test_request_commit_failure_prevents_transport(standalone_send, monkeypatch):
@@ -233,6 +367,26 @@ def test_provider_exception_leaves_indeterminate_request_and_cannot_resend(
     assert duplicate["success"] is False
     assert duplicate["indeterminate"] is True
     assert send.await_count == 1
+
+
+def test_provider_exception_stays_fail_closed_when_receipt_recovery_fails(
+    standalone_send, monkeypatch
+):
+    send = AsyncMock(side_effect=TimeoutError("provider timeout"))
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", send)
+    monkeypatch.setattr(
+        "gateway.transport_outbox.recover_transport_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("recovery unavailable")),
+    )
+
+    result = _send("request-recovery-failure")
+
+    assert result["success"] is False
+    assert result["indeterminate"] is True
+    assert result["transport_outcome"] == "indeterminate"
+    assert result["transport_request_id"] == "request-recovery-failure"
+    assert result["transport_receipt_id"].startswith("transport-receipt:")
+    send.assert_awaited_once()
 
 
 def test_unclassified_provider_error_is_indeterminate_not_rejected(
