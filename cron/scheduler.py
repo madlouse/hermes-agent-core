@@ -2614,21 +2614,47 @@ _MISSING_OUTBOUND_HOOK_REGISTRY = object()
 class _OutboundHookRegistryStore(dict[Path, Any | None]):
     """Revoke unresolved claims on every non-owner map mutation."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        for value in self.values():
+            self._revoke(value)
+        super().__init__()
+        self.update(*args, **kwargs)
+
     @staticmethod
-    def _revoke(
-        value: Any,
-        replacement: Any = _MISSING_OUTBOUND_HOOK_REGISTRY,
-    ) -> None:
-        if (
-            isinstance(value, _UnresolvedOutboundHooks)
-            and value is not replacement
-            and value.result is not replacement
-        ):
+    def _revoke(value: Any) -> None:
+        if isinstance(value, _UnresolvedOutboundHooks):
             value.revoked = True
 
     def __setitem__(self, key: Path, value: Any | None) -> None:
-        self._revoke(self.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY), value)
+        self._revoke(self.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY))
         super().__setitem__(key, value)
+
+    def resolve_claim(
+        self,
+        key: Path,
+        claim_token: _UnresolvedOutboundHooks,
+        result: Any,
+    ) -> bool:
+        """Publish success only for the exact active claim."""
+        if self.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
+            return False
+        if claim_token.revoked:
+            return False
+        claim_token.result = result
+        super().__setitem__(key, result)
+        return True
+
+    def fail_claim(
+        self,
+        key: Path,
+        claim_token: _UnresolvedOutboundHooks,
+    ) -> bool:
+        """Terminalize an exact claim without treating cleanup as replacement."""
+        if self.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
+            return False
+        claim_token.result = None
+        super().__setitem__(key, None)
+        return True
 
     def __delitem__(self, key: Path) -> None:
         self._revoke(self[key])
@@ -2687,8 +2713,10 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
                 cached = _standalone_outbound_hook_registries[profile_home]
                 if isinstance(cached, _UnresolvedOutboundHooks):
                     if cached.revoked or cached.done.is_set():
-                        cached.result = None
-                        _standalone_outbound_hook_registries[profile_home] = None
+                        _standalone_outbound_hook_registries.fail_claim(
+                            profile_home,
+                            cached,
+                        )
                         raise ValueError(
                             "Standalone Cron Profile Hook registry is unavailable"
                         )
@@ -2723,12 +2751,16 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
         result = wait_token.result
         if wait_token.revoked:
             if cached is wait_token:
-                wait_token.result = None
-                _standalone_outbound_hook_registries[profile_home] = None
+                _standalone_outbound_hook_registries.fail_claim(
+                    profile_home,
+                    wait_token,
+                )
             raise ValueError("Standalone Cron Profile Hook registry ownership changed")
         if cached is wait_token:
-            wait_token.result = None
-            _standalone_outbound_hook_registries[profile_home] = None
+            _standalone_outbound_hook_registries.fail_claim(
+                profile_home,
+                wait_token,
+            )
             raise ValueError("Standalone Cron Profile Hook registry is unavailable")
         if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT or cached is not result:
             raise ValueError("Standalone Cron Profile Hook registry ownership changed")
@@ -2744,12 +2776,12 @@ def _bind_live_outbound_hooks(
 ) -> Any:
     """Bind a matching live registry to the process-wide Profile owner."""
     with _standalone_outbound_hooks_lock:
-        if profile_home in _standalone_outbound_hook_registries:
-            cached = _standalone_outbound_hook_registries[profile_home]
-            if cached is claim_token and not claim_token.revoked:
-                claim_token.result = hooks
-                _standalone_outbound_hook_registries[profile_home] = hooks
-                return hooks
+        if _standalone_outbound_hook_registries.resolve_claim(
+            profile_home,
+            claim_token,
+            hooks,
+        ):
+            return hooks
         raise ValueError("Standalone Cron Profile Hook registry ownership changed")
 
 
@@ -2759,9 +2791,7 @@ def _fail_outbound_hook_claim(
 ) -> None:
     """Publish failure only while the exact unresolved claim is still current."""
     with _standalone_outbound_hooks_lock:
-        if _standalone_outbound_hook_registries.get(profile_home) is claim_token:
-            claim_token.result = None
-            _standalone_outbound_hook_registries[profile_home] = None
+        _standalone_outbound_hook_registries.fail_claim(profile_home, claim_token)
 
 
 def _fail_outbound_hook_claim_during_control_signal(
@@ -2776,9 +2806,7 @@ def _fail_outbound_hook_claim_during_control_signal(
     if not acquired:
         return
     try:
-        if _standalone_outbound_hook_registries.get(profile_home) is claim_token:
-            claim_token.result = None
-            _standalone_outbound_hook_registries[profile_home] = None
+        _standalone_outbound_hook_registries.fail_claim(profile_home, claim_token)
     finally:
         try:
             _standalone_outbound_hooks_lock.release()
@@ -2827,16 +2855,14 @@ def _standalone_outbound_hooks(
             )
             raise
         with _standalone_outbound_hooks_lock:
-            if (
-                _standalone_outbound_hook_registries.get(profile_home)
-                is not claim_token
-                or claim_token.revoked
+            if not _standalone_outbound_hook_registries.resolve_claim(
+                profile_home,
+                claim_token,
+                registry,
             ):
                 raise ValueError(
                     "Standalone Cron Profile Hook registry ownership changed"
                 )
-            claim_token.result = registry
-            _standalone_outbound_hook_registries[profile_home] = registry
         return registry
     finally:
         if owns_claim:
