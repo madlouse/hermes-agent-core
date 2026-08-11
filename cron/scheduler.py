@@ -2596,14 +2596,62 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
-def _active_outbound_hooks():
-    """Return the live gateway hook registry, if cron shares its process."""
-    try:
-        from gateway.run import _gateway_runner_ref
+_standalone_outbound_hook_registries: dict[Path, Any] = {}
+_standalone_outbound_hooks_lock = threading.Lock()
 
-        runner = _gateway_runner_ref()
-        return getattr(runner, "hooks", None) if runner is not None else None
-    except Exception:
+
+def _standalone_outbound_hooks():
+    """Load the selected Profile's normal hooks for a standalone Cron run."""
+    profile_home = get_hermes_home().expanduser()
+    if not profile_home.is_absolute():
+        profile_home = Path.cwd() / profile_home
+    with _standalone_outbound_hooks_lock:
+        cached = _standalone_outbound_hook_registries.get(profile_home)
+        if cached is not None:
+            return cached
+
+        from gateway.hooks import HookRegistry
+
+        registry = HookRegistry(
+            profile_home / "hooks",
+            strict_discovery=True,
+            quiet=True,
+        )
+        registry.discover_and_load()
+        _standalone_outbound_hook_registries[profile_home] = registry
+        return registry
+
+
+def _active_outbound_hooks():
+    """Return the live Gateway hooks or the selected standalone Profile hooks."""
+    profile_home = get_hermes_home().expanduser()
+    if not profile_home.is_absolute():
+        profile_home = Path.cwd() / profile_home
+    gateway_run = sys.modules.get("gateway.run")
+    runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
+    if callable(runner_ref):
+        try:
+            runner = runner_ref()
+        except Exception:  # noqa: BLE001 - a broken optional runner must not disable standalone screening
+            logger.warning("Gateway hook registry lookup failed", exc_info=True)
+        else:
+            hooks = getattr(runner, "hooks", None) if runner is not None else None
+            hooks_dir = getattr(hooks, "hooks_dir", None)
+            if hooks is not None and hooks_dir is not None and (
+                Path(hooks_dir).expanduser().absolute()
+                == (profile_home / "hooks").absolute()
+            ):
+                return hooks
+            if hooks is not None:
+                logger.warning(
+                    "Gateway hook registry belongs to another Profile; "
+                    "loading hooks for %s",
+                    profile_home,
+                )
+    try:
+        return _standalone_outbound_hooks()
+    except (NotImplementedError, OSError, UnicodeError, ValueError):
+        logger.warning("Standalone Cron output hooks unavailable", exc_info=True)
         return None
 
 
