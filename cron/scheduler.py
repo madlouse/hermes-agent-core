@@ -2649,6 +2649,19 @@ def _fail_outbound_hook_claim(
             _standalone_outbound_hook_registries[profile_home] = None
 
 
+def _fail_outbound_hook_claim_during_control_signal(
+    profile_home: Path,
+    claim_token: _UnresolvedOutboundHooks,
+) -> None:
+    """Complete exact-token cleanup without replacing the original signal."""
+    while True:
+        try:
+            _fail_outbound_hook_claim(profile_home, claim_token)
+        except BaseException:
+            continue
+        return
+
+
 def _standalone_outbound_hooks(
     claim_token: _UnresolvedOutboundHooks | None = None,
     profile_home: Path | None = None,
@@ -2677,7 +2690,7 @@ def _standalone_outbound_hooks(
         )
         registry.discover_and_load()
     except BaseException:
-        _fail_outbound_hook_claim(profile_home, claim_token)
+        _fail_outbound_hook_claim_during_control_signal(profile_home, claim_token)
         raise
     with _standalone_outbound_hooks_lock:
         if _standalone_outbound_hook_registries.get(profile_home) is not claim_token:
@@ -2699,7 +2712,15 @@ def _active_outbound_hooks():
     if not isinstance(claimed, _UnresolvedOutboundHooks):
         return claimed
     gateway_run = sys.modules.get("gateway.run")
-    runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
+    try:
+        runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
+    except Exception:  # noqa: BLE001 - untrusted runner metadata must fail closed
+        _fail_outbound_hook_claim(profile_home, claimed)
+        logger.warning("Gateway runner reference lookup failed", exc_info=True)
+        return None
+    except BaseException:
+        _fail_outbound_hook_claim_during_control_signal(profile_home, claimed)
+        raise
     if callable(runner_ref):
         try:
             runner = runner_ref()
@@ -2708,7 +2729,7 @@ def _active_outbound_hooks():
             logger.warning("Gateway hook registry lookup failed", exc_info=True)
             return None
         except BaseException:
-            _fail_outbound_hook_claim(profile_home, claimed)
+            _fail_outbound_hook_claim_during_control_signal(profile_home, claimed)
             raise
         else:
             if runner is None:
@@ -2726,7 +2747,10 @@ def _active_outbound_hooks():
                     logger.warning("Gateway hook registry inspection failed", exc_info=True)
                     return None
                 except BaseException:
-                    _fail_outbound_hook_claim(profile_home, claimed)
+                    _fail_outbound_hook_claim_during_control_signal(
+                        profile_home,
+                        claimed,
+                    )
                     raise
                 if not hooks_match:
                     _fail_outbound_hook_claim(profile_home, claimed)
