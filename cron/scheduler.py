@@ -2872,6 +2872,11 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
     assert waiter is not None
     try:
         wait_token.done.wait()
+        result, revoked = _standalone_outbound_hook_registries._consume_waiter(
+            profile_home,
+            wait_token,
+            waiter,
+        )
     except BaseException:
         _standalone_outbound_hook_registries._abandon_waiter_during_control_signal(
             profile_home,
@@ -2879,11 +2884,6 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
             waiter,
         )
         raise
-    result, revoked = _standalone_outbound_hook_registries._consume_waiter(
-        profile_home,
-        wait_token,
-        waiter,
-    )
     if revoked:
         raise ValueError("Standalone Cron Profile Hook registry ownership changed")
     if result is None:

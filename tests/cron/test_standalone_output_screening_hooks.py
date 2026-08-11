@@ -777,6 +777,53 @@ def test_waiter_control_signal_does_not_wait_for_authority_lock(
     assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
 
 
+def test_waiter_consume_control_signal_does_not_strand_published_result(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    owner_result = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load_owner():
+        owner_result["hooks"] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load_owner, name="owner")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    original_wait = token.done.wait
+
+    def release_then_wait(*args, **kwargs):
+        release_lookup.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(token.done, "wait", release_then_wait)
+    monkeypatch.setattr(
+        scheduler._standalone_outbound_hook_registries,
+        "_consume_waiter",
+        MagicMock(side_effect=KeyboardInterrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    owner.join(timeout=2)
+    assert not owner.is_alive()
+    assert owner_result == {"hooks": hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
 def test_same_profile_waiter_rejects_cross_profile_store_mutation(
     monkeypatch, tmp_path
 ):
