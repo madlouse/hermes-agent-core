@@ -6071,6 +6071,14 @@ class BasePlatformAdapter(ABC):
                     else:
                         response = boundary_decision.content
                         outbound_boundary_context["content"] = response
+                        if isinstance(
+                            getattr(boundary_decision, "delivery_authority", None),
+                            dict,
+                        ):
+                            # Authority owns the entire downstream delivery
+                            # lifecycle, including extraction/normalization
+                            # failures before the provider attempt.
+                            authority_delivery_owned = True
                 except Exception as boundary_err:
                     logger.warning(
                         "[%s] outbound boundary bridge failed: %s",
@@ -6157,7 +6165,6 @@ class BasePlatformAdapter(ABC):
                 if boundary_decision is not None and isinstance(
                     getattr(boundary_decision, "delivery_authority", None), dict
                 ):
-                    authority_delivery_owned = True
                     if images or local_files or media_files:
                         raise RuntimeError(
                             "trusted outbound delivery authority does not support multipart sends"

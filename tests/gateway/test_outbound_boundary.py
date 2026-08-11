@@ -614,6 +614,36 @@ def test_gateway_authority_rejects_media_or_empty_final_without_legacy_error_sen
     legacy_send.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "extractor",
+    ["extract_media", "extract_images", "extract_local_files"],
+)
+def test_gateway_authority_owns_extraction_failures_without_legacy_error_send(
+    monkeypatch, extractor
+):
+    content = "请回复 1 确认"
+    legacy_send = AsyncMock(return_value=SendResult(success=True))
+    monkeypatch.setattr(StubAdapter, "send", legacy_send)
+
+    def fail_extraction(*_args, **_kwargs):
+        raise RuntimeError(f"{extractor} failed")
+
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        extractor,
+        staticmethod(fail_extraction),
+    )
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=authority_hooks(content),
+        response=content,
+    )
+
+    adapter.send_authorized.assert_not_awaited()
+    adapter._send_with_retry.assert_not_awaited()
+    legacy_send.assert_not_awaited()
+
+
 def test_gateway_deferred_voice_ignores_non_callable_sender(monkeypatch):
     adapter = process_gateway_reply(
         monkeypatch,
