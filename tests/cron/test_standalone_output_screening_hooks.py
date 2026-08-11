@@ -253,6 +253,45 @@ def test_hook_discovery_reentry_fails_closed_without_deadlock(monkeypatch, tmp_p
     assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
 
 
+def test_live_registry_cannot_commit_after_claim_is_lost(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile / "hooks")
+
+    def clear_claim_before_return():
+        scheduler._standalone_outbound_hook_registries.clear()
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", clear_claim_before_return)
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {}
+
+
+def test_live_registry_inspection_failure_terminalizes_exact_claim(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+
+    class BrokenHooks:
+        @property
+        def hooks_dir(self):
+            raise OSError("hooks directory unavailable")
+
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=BrokenHooks()),
+    )
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):
     profile = tmp_path / "missing-profile"
     _reset_standalone_cache(monkeypatch, profile)

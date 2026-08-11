@@ -2641,12 +2641,17 @@ def _bind_live_outbound_hooks(
             if cached is None:
                 raise ValueError("Standalone Cron Profile Hook registry is unavailable")
             return cached
-        if _standalone_outbound_hook_registries:
-            raise ValueError(
-                "Standalone Cron process is already bound to another Profile"
-            )
-        _standalone_outbound_hook_registries[profile_home] = hooks
-    return hooks
+        raise ValueError("Standalone Cron Profile Hook registry ownership changed")
+
+
+def _fail_outbound_hook_claim(
+    profile_home: Path,
+    claim_token: _UnresolvedOutboundHooks,
+) -> None:
+    """Publish failure only while the exact unresolved claim is still current."""
+    with _standalone_outbound_hooks_lock:
+        if _standalone_outbound_hook_registries.get(profile_home) is claim_token:
+            _standalone_outbound_hook_registries[profile_home] = None
 
 
 def _standalone_outbound_hooks(
@@ -2679,9 +2684,7 @@ def _standalone_outbound_hooks(
         )
         registry.discover_and_load()
     except Exception:
-        with _standalone_outbound_hooks_lock:
-            if _standalone_outbound_hook_registries.get(profile_home) is claim_token:
-                _standalone_outbound_hook_registries[profile_home] = None
+        _fail_outbound_hook_claim(profile_home, claim_token)
         raise
     with _standalone_outbound_hooks_lock:
         if _standalone_outbound_hook_registries.get(profile_home) is not claim_token:
@@ -2710,12 +2713,18 @@ def _active_outbound_hooks():
         except Exception:  # noqa: BLE001 - a broken optional runner must not disable standalone screening
             logger.warning("Gateway hook registry lookup failed", exc_info=True)
         else:
-            hooks = getattr(runner, "hooks", None) if runner is not None else None
-            hooks_dir = getattr(hooks, "hooks_dir", None)
-            if hooks is not None and hooks_dir is not None and (
-                Path(hooks_dir).expanduser().absolute()
-                == (profile_home / "hooks").absolute()
-            ):
+            try:
+                hooks = getattr(runner, "hooks", None) if runner is not None else None
+                hooks_dir = getattr(hooks, "hooks_dir", None)
+                hooks_match = hooks is not None and hooks_dir is not None and (
+                    Path(hooks_dir).expanduser().absolute()
+                    == (profile_home / "hooks").absolute()
+                )
+            except Exception:  # noqa: BLE001 - untrusted live registry inspection must terminalize its claim
+                _fail_outbound_hook_claim(profile_home, claimed)
+                logger.warning("Gateway hook registry inspection failed", exc_info=True)
+                return None
+            if hooks_match:
                 try:
                     return _bind_live_outbound_hooks(profile_home, hooks, claimed)
                 except ValueError:
