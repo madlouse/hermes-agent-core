@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import os
 import sys
 import threading
@@ -607,6 +608,33 @@ def test_registry_store_has_no_dict_base_mutation_bypass(tmp_path):
     assert store == {profile_a: token}
 
 
+def test_direct_file_alias_reuses_canonical_process_authority(tmp_path):
+    scheduler._standalone_outbound_hook_registries.clear()
+    spec = importlib.util.spec_from_file_location(
+        "cron_scheduler_direct_alias",
+        scheduler.__file__,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    alias = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(alias)
+
+    assert (
+        alias._standalone_outbound_hook_registries
+        is scheduler._standalone_outbound_hook_registries
+    )
+    assert alias._standalone_outbound_hooks_lock is scheduler._standalone_outbound_hooks_lock
+    assert alias._UnresolvedOutboundHooks is scheduler._UnresolvedOutboundHooks
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    claimed = scheduler._claim_outbound_hook_profile(profile_a)
+    assert isinstance(claimed, scheduler._UnresolvedOutboundHooks)
+    with pytest.raises(ValueError, match="already bound to another Profile"):
+        alias._claim_outbound_hook_profile(profile_b)
+    scheduler._standalone_outbound_hook_registries.clear()
+
+
 def test_registry_store_serializes_claim_publish_with_cross_profile_write(tmp_path):
     profile_a = tmp_path / "profile-a"
     profile_b = tmp_path / "profile-b"
@@ -894,6 +922,15 @@ def test_active_waiter_rejects_cross_profile_store_mutation_without_revocation(
                 profile_a,
                 hooks_b,
             )
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.pop(
+                profile_b,
+                hooks_b,
+            )
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.pop(profile_b)
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.popitem()
         with pytest.raises(ValueError, match="active waiters"):
             scheduler._standalone_outbound_hook_registries[profile_b] = hooks_b
     assert token.revoked is False
