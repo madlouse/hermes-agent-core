@@ -365,6 +365,26 @@ def test_profile_home_is_captured_once_for_claim_and_discovery(monkeypatch, tmp_
     assert scheduler._standalone_outbound_hook_registries == {profile_a: hooks}
 
 
+def test_discovery_runtime_error_after_lost_claim_fails_closed(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    replacement = HookRegistry(profile / "replacement-hooks")
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+    def replace_claim_then_fail(registry):
+        scheduler._standalone_outbound_hook_registries[profile] = replacement
+        raise RuntimeError("discovery failed after ownership changed")
+
+    monkeypatch.setattr(HookRegistry, "discover_and_load", replace_claim_then_fail)
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+
+
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):
     profile = tmp_path / "missing-profile"
     _reset_standalone_cache(monkeypatch, profile)

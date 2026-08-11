@@ -2738,7 +2738,7 @@ def _active_outbound_hooks():
                     return None
     try:
         return _standalone_outbound_hooks(claimed, profile_home)
-    except (NotImplementedError, OSError, UnicodeError, ValueError):
+    except Exception:  # noqa: BLE001 - hook discovery must fail closed at the scheduler boundary
         logger.warning("Standalone Cron output hooks unavailable", exc_info=True)
         return None
 
