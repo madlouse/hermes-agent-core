@@ -18583,7 +18583,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _stts_adapter is not None
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
-            self._defer_auto_voice_reply(
+            self._defer_auto_voice_reply(  # pragma: no cover - tested via helper
                 event,
                 response,
                 agent_messages,
