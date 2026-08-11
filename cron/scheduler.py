@@ -25,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
@@ -2611,83 +2612,96 @@ class _UnresolvedOutboundHooks:
 _MISSING_OUTBOUND_HOOK_REGISTRY = object()
 
 
-class _OutboundHookRegistryStore(dict[Path, Any | None]):
-    """Revoke unresolved claims on every non-owner map mutation."""
+class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
+    """Serialize ordinary mutations and exact claim publication."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        for value in self.values():
-            self._revoke(value)
-        super().__init__()
-        self.update(*args, **kwargs)
+        if not hasattr(self, "_lock"):
+            self._lock = threading.RLock()
+            self._data: dict[Path, Any | None] = {}
+        with self._lock:
+            self._revoke_all_claims_locked()
+            self._data.clear()
+            initial = dict(*args, **kwargs)
+            if len(initial) > 1:
+                raise ValueError("Outbound Hook registry store accepts one Profile")
+            self._data.update(initial)
+
+    @property
+    def lock(self):
+        return self._lock
 
     @staticmethod
     def _revoke(value: Any) -> None:
         if isinstance(value, _UnresolvedOutboundHooks):
             value.revoked = True
 
-    def _revoke_all_claims(self) -> None:
-        for value in self.values():
+    def _revoke_all_claims_locked(self) -> None:
+        for value in self._data.values():
             self._revoke(value)
 
-    def __setitem__(self, key: Path, value: Any | None) -> None:
-        self._revoke_all_claims()
-        super().__setitem__(key, value)
+    def __getitem__(self, key: Path) -> Any | None:
+        with self._lock:
+            return self._data[key]
 
-    def resolve_claim(
+    def __setitem__(self, key: Path, value: Any | None) -> None:
+        with self._lock:
+            self._revoke_all_claims_locked()
+            if self._data and key not in self._data:
+                raise ValueError("Outbound Hook registry store is already bound")
+            current = self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY)
+            if current is not _MISSING_OUTBOUND_HOOK_REGISTRY and not isinstance(
+                current,
+                _UnresolvedOutboundHooks,
+            ):
+                raise ValueError("Outbound Hook registry authority is immutable")
+            self._data[key] = value
+
+    def __delitem__(self, key: Path) -> None:
+        with self._lock:
+            self._revoke_all_claims_locked()
+            del self._data[key]
+
+    def __iter__(self) -> Iterator[Path]:
+        with self._lock:
+            return iter(tuple(self._data))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            return key in self._data
+
+    def _resolve_claim(
         self,
         key: Path,
         claim_token: _UnresolvedOutboundHooks,
         result: Any,
     ) -> bool:
         """Publish success only for the exact active claim."""
-        if self.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
-            return False
-        if claim_token.revoked:
-            return False
-        claim_token.result = result
-        super().__setitem__(key, result)
-        return True
+        with self._lock:
+            if self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
+                return False
+            if claim_token.revoked:
+                return False
+            claim_token.result = result
+            self._data[key] = result
+            return True
 
-    def fail_claim(
+    def _fail_claim(
         self,
         key: Path,
         claim_token: _UnresolvedOutboundHooks,
     ) -> bool:
         """Terminalize an exact claim without treating cleanup as replacement."""
-        if self.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
-            return False
-        claim_token.result = None
-        super().__setitem__(key, None)
-        return True
-
-    def __delitem__(self, key: Path) -> None:
-        self._revoke_all_claims()
-        super().__delitem__(key)
-
-    def clear(self) -> None:
-        self._revoke_all_claims()
-        super().clear()
-
-    def pop(self, key: Path, *default: Any) -> Any:
-        if key in self:
-            self._revoke_all_claims()
-        return super().pop(key, *default)
-
-    def popitem(self) -> tuple[Path, Any | None]:
-        if not self:
-            raise KeyError("popitem(): dictionary is empty")
-        key = next(reversed(self))
-        self._revoke_all_claims()
-        return super().popitem()
-
-    def setdefault(self, key: Path, default: Any | None = None) -> Any | None:
-        if key not in self:
-            self[key] = default
-        return self[key]
-
-    def update(self, *args: Any, **kwargs: Any) -> None:
-        for key, value in dict(*args, **kwargs).items():
-            self[key] = value
+        with self._lock:
+            if self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
+                return False
+            claim_token.result = None
+            self._data[key] = None
+            return True
 
     def __ior__(self, other: Any) -> "_OutboundHookRegistryStore":
         self.update(other)
@@ -2695,7 +2709,7 @@ class _OutboundHookRegistryStore(dict[Path, Any | None]):
 
 
 _standalone_outbound_hook_registries = _OutboundHookRegistryStore()
-_standalone_outbound_hooks_lock = threading.Lock()
+_standalone_outbound_hooks_lock = _standalone_outbound_hook_registries.lock
 
 
 def _warn_outbound_hook_failure(message: str, *args: Any, exc_info: bool = False) -> None:
@@ -2716,7 +2730,7 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
                 cached = _standalone_outbound_hook_registries[profile_home]
                 if isinstance(cached, _UnresolvedOutboundHooks):
                     if cached.revoked or cached.done.is_set():
-                        _standalone_outbound_hook_registries.fail_claim(
+                        _standalone_outbound_hook_registries._fail_claim(
                             profile_home,
                             cached,
                         )
@@ -2754,18 +2768,18 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
         result = wait_token.result
         if wait_token.revoked:
             if cached is wait_token:
-                _standalone_outbound_hook_registries.fail_claim(
+                _standalone_outbound_hook_registries._fail_claim(
                     profile_home,
                     wait_token,
                 )
             raise ValueError("Standalone Cron Profile Hook registry ownership changed")
         if cached is wait_token:
-            _standalone_outbound_hook_registries.fail_claim(
+            _standalone_outbound_hook_registries._fail_claim(
                 profile_home,
                 wait_token,
             )
             raise ValueError("Standalone Cron Profile Hook registry is unavailable")
-        if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT or cached is not result:
+        if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT:
             raise ValueError("Standalone Cron Profile Hook registry ownership changed")
         if result is None:
             raise ValueError("Standalone Cron Profile Hook registry is unavailable")
@@ -2779,7 +2793,7 @@ def _bind_live_outbound_hooks(
 ) -> Any:
     """Bind a matching live registry to the process-wide Profile owner."""
     with _standalone_outbound_hooks_lock:
-        if _standalone_outbound_hook_registries.resolve_claim(
+        if _standalone_outbound_hook_registries._resolve_claim(
             profile_home,
             claim_token,
             hooks,
@@ -2794,7 +2808,7 @@ def _fail_outbound_hook_claim(
 ) -> None:
     """Publish failure only while the exact unresolved claim is still current."""
     with _standalone_outbound_hooks_lock:
-        _standalone_outbound_hook_registries.fail_claim(profile_home, claim_token)
+        _standalone_outbound_hook_registries._fail_claim(profile_home, claim_token)
 
 
 def _fail_outbound_hook_claim_during_control_signal(
@@ -2809,7 +2823,7 @@ def _fail_outbound_hook_claim_during_control_signal(
     if not acquired:
         return
     try:
-        _standalone_outbound_hook_registries.fail_claim(profile_home, claim_token)
+        _standalone_outbound_hook_registries._fail_claim(profile_home, claim_token)
     finally:
         try:
             _standalone_outbound_hooks_lock.release()
@@ -2858,7 +2872,7 @@ def _standalone_outbound_hooks(
             )
             raise
         with _standalone_outbound_hooks_lock:
-            if not _standalone_outbound_hook_registries.resolve_claim(
+            if not _standalone_outbound_hook_registries._resolve_claim(
                 profile_home,
                 claim_token,
                 registry,
