@@ -2598,15 +2598,9 @@ def _confirm_adapter_delivery(send_result) -> bool:
 class _UnresolvedOutboundHooks:
     """Identity token for the one Profile lookup allowed to resolve."""
 
-    __slots__ = ("failed",)
-
-    def __init__(self) -> None:
-        self.failed = False
-
 
 _standalone_outbound_hook_registries: dict[Path, Any | None] = {}
 _standalone_outbound_hooks_lock = threading.Lock()
-_CONTROL_SIGNAL_CLEANUP_ATTEMPTS = 3
 
 
 def _warn_outbound_hook_failure(message: str, *args: Any, exc_info: bool = False) -> None:
@@ -2623,11 +2617,6 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
         if profile_home in _standalone_outbound_hook_registries:
             cached = _standalone_outbound_hook_registries[profile_home]
             if isinstance(cached, _UnresolvedOutboundHooks):
-                if cached.failed:
-                    _standalone_outbound_hook_registries[profile_home] = None
-                    raise ValueError(
-                        "Standalone Cron Profile Hook registry is unavailable"
-                    )
                 raise ValueError("Standalone Cron Profile Hook registry is resolving")
             if cached is None:
                 raise ValueError("Standalone Cron Profile Hook registry is unavailable")
@@ -2650,7 +2639,7 @@ def _bind_live_outbound_hooks(
     with _standalone_outbound_hooks_lock:
         if profile_home in _standalone_outbound_hook_registries:
             cached = _standalone_outbound_hook_registries[profile_home]
-            if cached is claim_token and not claim_token.failed:
+            if cached is claim_token:
                 _standalone_outbound_hook_registries[profile_home] = hooks
                 return hooks
         raise ValueError("Standalone Cron Profile Hook registry ownership changed")
@@ -2663,7 +2652,6 @@ def _fail_outbound_hook_claim(
     """Publish failure only while the exact unresolved claim is still current."""
     with _standalone_outbound_hooks_lock:
         if _standalone_outbound_hook_registries.get(profile_home) is claim_token:
-            claim_token.failed = True
             _standalone_outbound_hook_registries[profile_home] = None
 
 
@@ -2671,14 +2659,21 @@ def _fail_outbound_hook_claim_during_control_signal(
     profile_home: Path,
     claim_token: _UnresolvedOutboundHooks,
 ) -> None:
-    """Complete exact-token cleanup without replacing the original signal."""
-    for _ in range(_CONTROL_SIGNAL_CLEANUP_ATTEMPTS):
-        try:
-            _fail_outbound_hook_claim(profile_home, claim_token)
-        except BaseException:
-            continue
+    """Attempt exact-token cleanup without delaying the original signal."""
+    try:
+        acquired = _standalone_outbound_hooks_lock.acquire(False)
+    except BaseException:
         return
-    claim_token.failed = True
+    if not acquired:
+        return
+    try:
+        if _standalone_outbound_hook_registries.get(profile_home) is claim_token:
+            _standalone_outbound_hook_registries[profile_home] = None
+    finally:
+        try:
+            _standalone_outbound_hooks_lock.release()
+        except BaseException:
+            pass
 
 
 def _standalone_outbound_hooks(
@@ -2697,7 +2692,7 @@ def _standalone_outbound_hooks(
         claim_token = claimed
     with _standalone_outbound_hooks_lock:
         cached = _standalone_outbound_hook_registries.get(profile_home)
-        if cached is not claim_token or claim_token.failed:
+        if cached is not claim_token:
             raise ValueError("Standalone Cron Profile Hook registry ownership changed")
     try:
         from gateway.hooks import HookRegistry
@@ -2714,7 +2709,6 @@ def _standalone_outbound_hooks(
     with _standalone_outbound_hooks_lock:
         if (
             _standalone_outbound_hook_registries.get(profile_home) is not claim_token
-            or claim_token.failed
         ):
             raise ValueError("Standalone Cron Profile Hook registry ownership changed")
         _standalone_outbound_hook_registries[profile_home] = registry

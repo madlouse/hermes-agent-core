@@ -473,105 +473,29 @@ def test_runner_reference_attribute_control_signal_propagates(monkeypatch, tmp_p
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
-def test_cleanup_interruption_preserves_original_signal_and_replacement(
+def test_runner_control_signal_does_not_wait_for_held_cleanup_lock(
     monkeypatch, tmp_path
 ):
     profile = tmp_path / "profile"
     scheduler._standalone_outbound_hook_registries.clear()
-    replacement = HookRegistry(profile / "replacement-hooks")
+    lock_held = threading.Event()
+    release_lock = threading.Event()
 
-    class InterruptOnceLock:
-        def __init__(self):
-            self._lock = threading.Lock()
-            self.interrupt_next = False
+    def hold_lock():
+        with scheduler._standalone_outbound_hooks_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
 
-        def __enter__(self):
-            if self.interrupt_next:
-                self.interrupt_next = False
-                raise SystemExit("cleanup interrupted")
-            return self._lock.__enter__()
+    holder = threading.Thread(target=hold_lock)
 
-        def __exit__(self, *args):
-            return self._lock.__exit__(*args)
-
-    ownership_lock = InterruptOnceLock()
-    monkeypatch.setattr(
-        scheduler,
-        "_standalone_outbound_hooks_lock",
-        ownership_lock,
-    )
-
-    def replace_then_interrupt():
-        scheduler._standalone_outbound_hook_registries[profile] = replacement
-        ownership_lock.interrupt_next = True
+    def interrupt_with_lock_held():
+        holder.start()
+        assert lock_held.wait(timeout=2)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("gateway.run._gateway_runner_ref", replace_then_interrupt)
-
-    with pytest.raises(KeyboardInterrupt):
-        _load_with_profile_override(profile)
-
-    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
-
-
-def test_cleanup_interruption_retries_exact_token_and_preserves_original_signal(
-    monkeypatch, tmp_path
-):
-    profile = tmp_path / "profile"
-    scheduler._standalone_outbound_hook_registries.clear()
-
-    class InterruptOnceLock:
-        def __init__(self):
-            self._lock = threading.Lock()
-            self.interrupt_next = False
-
-        def __enter__(self):
-            if self.interrupt_next:
-                self.interrupt_next = False
-                raise SystemExit("cleanup interrupted")
-            return self._lock.__enter__()
-
-        def __exit__(self, *args):
-            return self._lock.__exit__(*args)
-
-    ownership_lock = InterruptOnceLock()
-    monkeypatch.setattr(
-        scheduler,
-        "_standalone_outbound_hooks_lock",
-        ownership_lock,
-    )
-
-    def interrupt_lookup():
-        ownership_lock.interrupt_next = True
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr("gateway.run._gateway_runner_ref", interrupt_lookup)
-
-    with pytest.raises(KeyboardInterrupt):
-        _load_with_profile_override(profile)
-
-    assert scheduler._standalone_outbound_hook_registries == {profile: None}
-
-
-def test_persistent_cleanup_signals_do_not_spin_or_replace_original_signal(
-    monkeypatch, tmp_path
-):
-    profile = tmp_path / "profile"
-    scheduler._standalone_outbound_hook_registries.clear()
-    cleanup_calls = []
-
-    def cleanup_always_interrupted(profile_home, claim_token):
-        cleanup_calls.append((profile_home, claim_token))
-        raise SystemExit("cleanup interrupted")
-
-    monkeypatch.setattr(
-        scheduler,
-        "_fail_outbound_hook_claim",
-        cleanup_always_interrupted,
-    )
     monkeypatch.setattr(
         "gateway.run._gateway_runner_ref",
-        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+        interrupt_with_lock_held,
     )
 
     with pytest.raises(KeyboardInterrupt):
@@ -579,16 +503,47 @@ def test_persistent_cleanup_signals_do_not_spin_or_replace_original_signal(
 
     token = scheduler._standalone_outbound_hook_registries[profile]
     assert isinstance(token, scheduler._UnresolvedOutboundHooks)
-    assert token.failed is True
-    assert len(cleanup_calls) == scheduler._CONTROL_SIGNAL_CLEANUP_ATTEMPTS
-
-    monkeypatch.setattr(
-        scheduler,
-        "_fail_outbound_hook_claim",
-        lambda profile_home, claim_token: None,
-    )
+    release_lock.set()
+    holder.join(timeout=2)
+    assert not holder.is_alive()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
     assert _load_with_profile_override(profile) is None
-    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+    assert scheduler._standalone_outbound_hook_registries == {profile: token}
+
+
+def test_discovery_control_signal_does_not_wait_for_held_cleanup_lock(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_lock():
+        with scheduler._standalone_outbound_hooks_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock)
+
+    def interrupt_with_lock_held(registry):
+        holder.start()
+        assert lock_held.wait(timeout=2)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(HookRegistry, "discover_and_load", interrupt_with_lock_held)
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    release_lock.set()
+    holder.join(timeout=2)
+    assert not holder.is_alive()
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: token}
 
 
 def test_logging_failure_cannot_replace_fail_closed_result(monkeypatch, tmp_path):
