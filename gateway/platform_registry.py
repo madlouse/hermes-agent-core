@@ -158,6 +158,14 @@ class PlatformEntry:
     # targets when the gateway is not co-resident with the cron process.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
 
+    # Optional strict out-of-process sender for a pre-committed transport
+    # request. Unlike ``standalone_sender_fn``, this contract permits exactly
+    # one text provider attempt and forbids chunking, retry, or route fallback.
+    # Signature:
+    #     async (pconfig, chat_id, content, *, thread_id=None,
+    #            transport_request_id: str) -> dict
+    standalone_authorized_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
+
 
 class PlatformRegistry:
     """Central registry of platform adapters.

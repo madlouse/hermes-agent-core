@@ -88,6 +88,35 @@ class DeliveryTransport:
             )
         return await self.adapter.send(chat_id, content, metadata=metadata)
 
+    async def send_authorized(
+        self,
+        logical_platform: Platform,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        transport_request_id: str,
+    ) -> Any:
+        """Send through an adapter that explicitly implements strict authority."""
+        if self.is_relay:
+            return {
+                "success": False,
+                "error": "relay transport does not support strict transport authority",
+            }
+        if getattr(self.adapter, "supports_transport_authority", False) is not True:
+            return {
+                "success": False,
+                "error": (
+                    f"{logical_platform.value} adapter does not support strict transport authority"
+                ),
+            }
+        return await self.adapter.send_authorized(
+            chat_id,
+            content,
+            metadata=metadata,
+            transport_request_id=transport_request_id,
+        )
+
 
 def resolve_delivery_transport(
     platform: Platform,
@@ -640,7 +669,6 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
 
 
 

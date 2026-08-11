@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import Future
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -16,6 +19,7 @@ import pytest
 from cron import jobs, scheduler
 from gateway.config import Platform
 from gateway.outbound_boundary import BoundaryDecision
+from gateway.platforms.base import SendResult
 from tools import send_message_tool as send_module
 
 
@@ -178,13 +182,17 @@ def test_confirmed_sent_truth_cannot_be_overwritten_by_uncertain(
     )
 
 
-def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
+def test_operational_notice_uses_strict_sender_and_transport_outbox_once(
     operational_profile, monkeypatch
 ):
     provider_send = AsyncMock(
         return_value={"success": True, "message_id": "om_notice_once"}
     )
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
+    legacy_send = AsyncMock(
+        side_effect=AssertionError("operational notice must not use legacy sender")
+    )
+    monkeypatch.setattr(send_module, "_send_to_platform", legacy_send)
 
     with jobs.use_cron_store(operational_profile):
         first = scheduler._deliver_operational_notice(
@@ -198,6 +206,7 @@ def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
     assert first == "sent"
     assert replay == "sent"
     provider_send.assert_awaited_once()
+    legacy_send.assert_not_awaited()
     assert stored[_notice()["idempotency_key"]]["status"] == "sent"
     conn = sqlite3.connect(operational_profile / "transport-outbox.sqlite3")
     try:
@@ -205,6 +214,211 @@ def test_operational_notice_uses_screened_sender_and_transport_outbox_once(
         assert conn.execute("SELECT count(*) FROM transport_outbox_receipts").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_operational_notice_executes_hook_authority_through_strict_adapter(
+    operational_profile,
+    monkeypatch,
+):
+    (operational_profile / "config.yaml").write_text(
+        "profile_id: atlas\n",
+        encoding="utf-8",
+    )
+    content = _notice()["admin_content"]
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "feishu",
+        "channel_id": "ou_admin",
+        "thread_id": "",
+    }
+    request = {
+        "request_id": "request-operational-authority",
+        "profile_id": "default",
+        "frame_id": _notice()["evidence_ref"],
+        "notification_claim_id": _notice()["idempotency_key"],
+        "decision_route": route,
+        "notification_route": route,
+        "items_content_hash": "sha256:" + "b" * 64,
+        "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "claim_created_at": (now - timedelta(minutes=1)).isoformat(),
+        "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    authority = {
+        "schema_version": "transport-outbox-hook/v1",
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": request,
+    }
+
+    def authorize(_hooks, context):
+        assert context["profile_id"] == "atlas"
+        return BoundaryDecision(
+            transmit=True,
+            decision="allow",
+            content=content,
+            reason="authorized",
+            raw={"decision": "allow"},
+            delivery_authority=authority,
+        )
+
+    def run_now(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    adapter = SimpleNamespace(
+        supports_transport_authority=True,
+        send_authorized=AsyncMock(
+            return_value=SendResult(success=True, message_id="om-operational")
+        ),
+    )
+    loop = SimpleNamespace(is_running=lambda: True)
+    config = SimpleNamespace(
+        platforms={
+            Platform.FEISHU: SimpleNamespace(enabled=True, token="test", extra={})
+        },
+        get_home_channel=lambda _platform: None,
+    )
+    monkeypatch.setattr("gateway.outbound_boundary.outbound_before_send_sync", authorize)
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", run_now)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    legacy_send = AsyncMock()
+    monkeypatch.setattr(send_module, "_send_to_platform", legacy_send)
+
+    with jobs.use_cron_store(operational_profile):
+        status = scheduler._deliver_operational_notice(
+            _job(profile_home=operational_profile),
+            {"operational_notice": _notice()},
+            adapters={Platform.FEISHU: adapter},
+            loop=loop,
+        )
+
+    assert status == "sent"
+    adapter.send_authorized.assert_awaited_once_with(
+        "ou_admin",
+        content,
+        metadata=None,
+        transport_request_id=request["request_id"],
+    )
+    legacy_send.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("invalid_platform", "strict_adapter_unavailable"),
+        ("transport_missing", "strict_adapter_unavailable"),
+        ("authority_request_conflict", "request_conflict"),
+        ("authority_binding_lost", "ownership_lost"),
+        ("schedule_missing", "strict_adapter_unavailable"),
+        ("standalone_request_conflict", "request_conflict"),
+        ("standalone_binding_lost", "ownership_lost"),
+        ("screening_exception", "uncertain"),
+    ],
+)
+def test_operational_notice_transport_fail_closed_matrix(
+    operational_profile, monkeypatch, mode, expected
+):
+    notice = _notice()
+    authority_mode = not mode.startswith("standalone") and mode != "screening_exception"
+    if mode == "invalid_platform":
+        notice["target"] = {**notice["target"], "transport_id": "not-a-platform"}
+
+    class Heartbeat:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def ensure_owner(self):
+            pass
+
+        def bind_request(self, _request_id):
+            pass
+
+    monkeypatch.setattr(scheduler, "_OperationalNoticeHeartbeat", Heartbeat)
+    claim = {"claimed": True, "claim_owner": "owner-1"}
+    if "request_conflict" in mode:
+        claim["transport_request_id"] = "different-request"
+    monkeypatch.setattr(scheduler, "claim_operational_notice_delivery", lambda *_args, **_kwargs: claim)
+    monkeypatch.setattr(
+        scheduler,
+        "mark_operational_notice_delivery",
+        lambda *_args, **_kwargs: {"status": "uncertain"},
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "bind_operational_notice_transport_request",
+        lambda *_args, **_kwargs: {
+            "status": "ownership_lost" if "binding_lost" in mode else "bound"
+        },
+    )
+
+    if mode == "screening_exception":
+        monkeypatch.setattr(
+            "gateway.outbound_boundary.outbound_before_send_sync",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("screening failed")),
+        )
+    elif authority_mode:
+        decision = BoundaryDecision(
+            transmit=True,
+            decision="allow",
+            content=notice["admin_content"],
+            reason="authorized",
+            delivery_authority={
+                "schema_version": "transport-outbox-hook/v1",
+                "required": True,
+                "business_profile_id": "default",
+                "request": {"request_id": "request-authority-matrix"},
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.outbound_boundary.outbound_before_send_sync",
+            lambda *_args, **_kwargs: decision,
+        )
+
+    transport = SimpleNamespace(
+        send_authorized=AsyncMock(
+            return_value=SendResult(success=True, message_id="om-matrix")
+        )
+    )
+    monkeypatch.setattr(
+        "gateway.delivery.resolve_delivery_transport",
+        lambda *_args, **_kwargs: None if mode == "transport_missing" else transport,
+    )
+
+    def schedule(coro, _loop):
+        if mode == "schedule_missing":
+            coro.close()
+            return None
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", schedule)
+    loop = SimpleNamespace(is_running=lambda: True)
+    adapter = SimpleNamespace(supports_transport_authority=True)
+
+    with jobs.use_cron_store(operational_profile):
+        status = scheduler._deliver_operational_notice_in_profile(
+            _job(profile_home=operational_profile),
+            notice,
+            owning_profile_home=operational_profile,
+            adapters={Platform.FEISHU: adapter},
+            loop=loop,
+        )
+
+    assert status == expected
 
 
 def test_worker_admission_denial_reaches_notice_outbox_and_terminal_receipt(
@@ -215,7 +429,7 @@ def test_worker_admission_denial_reaches_notice_outbox_and_terminal_receipt(
     provider_send = AsyncMock(
         return_value={"success": True, "message_id": "om-worker-denial"}
     )
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
     decision = {
         "action": "block",
         "reason": "runtime_denied",
@@ -272,7 +486,7 @@ def test_crash_after_confirmed_send_recovers_without_resending(
     provider_send = AsyncMock(
         return_value={"success": True, "message_id": "om_crash_once"}
     )
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
     epoch = [1000]
     monkeypatch.setattr(jobs.time, "time", lambda: epoch[0])
     real_mark = scheduler.mark_operational_notice_delivery
@@ -315,7 +529,7 @@ def test_cross_original_lease_two_thread_probe_converges_confirmed_sent(
             await asyncio.sleep(0.005)
         return {"success": True, "message_id": "om-cross-lease"}
 
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
     results = []
 
     def deliver():
@@ -402,7 +616,7 @@ def test_notice_freezes_scoped_store_across_heartbeat_and_reconciliation(
             await asyncio.sleep(0.005)
         return {"success": True, "message_id": "om-scoped-store-b"}
 
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
     with jobs.use_cron_store(owning_profile):
         jobs.save_jobs([_job(profile_home=owning_profile)])
 
@@ -514,7 +728,7 @@ def test_operational_notice_rejects_top_level_or_receipt_profile_spoof(
     operational_profile, monkeypatch
 ):
     provider_send = AsyncMock(return_value={"success": True})
-    monkeypatch.setattr(send_module, "_send_to_platform", provider_send)
+    monkeypatch.setattr(send_module, "_send_authorized_to_platform", provider_send)
 
     spoofed = _job(profile_id="atlas", profile_home=operational_profile)
     spoofed["profile_id"] = "default"

@@ -172,6 +172,7 @@ async def test_first_turn_session_meta_is_captured_by_rebaseline(
     db.create_session(SESSION_ID, source="telegram")
 
     runner = _bootstrap(monkeypatch, tmp_path, db)
+    runner._defer_auto_voice_reply = MagicMock(return_value=False)
 
     # Cache snapshot taken at agent-BUILD time = count before this turn's
     # writes (a fresh session → 0). This is what the #45966 guard stores.
@@ -198,6 +199,14 @@ async def test_first_turn_session_meta_is_captured_by_rebaseline(
 
     await runner._handle_message_with_agent(_event(), _source(), SESSION_KEY, 1)
 
+    runner._defer_auto_voice_reply.assert_called_once()
+    voice_call = runner._defer_auto_voice_reply.call_args
+    assert voice_call.args[1] == "Hi there!"
+    assert voice_call.kwargs == {
+        "already_sent": False,
+        "streaming_tts_done": False,
+    }
+
     # The first-turn session_meta row was written → live count advanced.
     live = _live_count(db, SESSION_ID)
     assert live == build_count + 1, (
@@ -216,5 +225,4 @@ async def test_first_turn_session_meta_is_captured_by_rebaseline(
     )
     # And the cached agent instance must be untouched (never rebuilt).
     assert cached[0] is agent_obj
-
 

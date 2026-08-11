@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -56,6 +58,19 @@ class StubAdapter(BasePlatformAdapter):
         return {}
 
 
+def test_base_adapter_default_authorized_send_fails_closed():
+    adapter = StubAdapter(PlatformConfig(), Platform.TELEGRAM)
+    result = run(
+        adapter.send_authorized(
+            "chat-1",
+            "notice",
+            transport_request_id="request-1",
+        )
+    )
+    assert result.success is False
+    assert "does not support strict transport authority" in (result.error or "")
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -71,6 +86,47 @@ def ctx(**overrides):
     return base
 
 
+def authority_hooks(content: str, *, final_content: str | None = None):
+    selected = content if final_content is None else final_content
+    now = datetime.now(timezone.utc)
+    route = {"transport_id": "telegram", "channel_id": "admin-dm", "thread_id": ""}
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": {
+            "request_id": "request-authority-edge",
+            "profile_id": "default",
+            "frame_id": "frame-authority-edge",
+            "notification_claim_id": "claim-authority-edge",
+            "decision_route": route,
+            "notification_route": route,
+            "items_content_hash": "sha256:items",
+            "visible_content_sha256": hashlib.sha256(selected.encode()).hexdigest(),
+            "claim_created_at": now.isoformat(),
+            "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+    }
+
+    def boundary(_event_type, _payload):
+        return {
+            "decision": "allow" if final_content is None else "rewrite",
+            "reason": "authorized",
+            "content": selected,
+            "delivery_authority": authority,
+        }
+
+    return Hooks(
+        named_handler(
+            boundary,
+            capabilities={
+                ob.REQUIRED_SCREENING_CAPABILITY,
+                ob.TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY,
+            },
+        )
+    )
+
+
 def process_gateway_reply(
     monkeypatch,
     *,
@@ -83,6 +139,9 @@ def process_gateway_reply(
     source_profile=None,
     profile_config=None,
     enforced_channel=False,
+    auto_voice_requested=False,
+    handler_side_effect=None,
+    voice_sender_callable=True,
 ):
     from gateway import run as gateway_run
 
@@ -93,6 +152,7 @@ def process_gateway_reply(
         encoding="utf-8",
     )
 
+    voice_sender = AsyncMock()
     monkeypatch.setattr(
         gateway_run,
         "_gateway_runner_ref",
@@ -101,6 +161,7 @@ def process_gateway_reply(
             _resolve_profile_home_for_source=lambda _source: profile_home,
             _profile_name_for_source=lambda source: source.profile or profile_id,
             _active_profile_name=lambda: profile_id,
+            _send_voice_reply=voice_sender if voice_sender_callable else None,
         ),
     )
     monkeypatch.setattr(
@@ -112,8 +173,19 @@ def process_gateway_reply(
         PlatformConfig(enabled=True, token="test", typing_indicator=False),
         Platform.TELEGRAM,
     )
-    adapter._message_handler = AsyncMock(return_value=response)
+    adapter._message_handler = AsyncMock(
+        return_value=response,
+        side_effect=handler_side_effect,
+    )
     adapter._send_with_retry = AsyncMock(
+        return_value=(
+            send_result
+            if send_result is not None
+            else SendResult(success=True, message_id="sent")
+        )
+    )
+    adapter.supports_transport_authority = True
+    adapter.send_authorized = AsyncMock(
         return_value=(
             send_result
             if send_result is not None
@@ -141,7 +213,9 @@ def process_gateway_reply(
         ),
         message_id="inbound",
     )
+    event._hermes_auto_voice_reply_requested = auto_voice_requested
     run(adapter._process_message_background(event, "telegram:admin-dm"))
+    adapter._test_auto_voice_sender = voice_sender
     return adapter
 
 
@@ -302,6 +376,534 @@ def test_adapter_screens_plain_gateway_reply_before_existing_send(monkeypatch):
     assert calls[0][1]["output_screening_required"] is True
     assert calls[0][1]["profile_id"] == "atlas"
     assert calls[0][1]["profile_path"] == str(adapter._test_profile_home)
+
+
+def test_gateway_final_reply_hook_authority_uses_core_executor(monkeypatch):
+    content = "请回复 1 确认"
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "telegram",
+        "channel_id": "admin-dm",
+        "thread_id": "",
+    }
+    request = {
+        "request_id": "request-gateway-reply",
+        "profile_id": "default",
+        "frame_id": "frame-gateway-reply",
+        "notification_claim_id": "claim-gateway-reply",
+        "decision_route": route,
+        "notification_route": route,
+        "items_content_hash": "sha256:items",
+        "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "claim_created_at": now.isoformat(),
+        "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": request,
+    }
+    executions = []
+
+    def boundary(_event_type, _payload):
+        return {
+            "decision": "allow",
+            "reason": "registered",
+            "delivery_authority": authority,
+        }
+
+    async def execute(**kwargs):
+        executions.append(kwargs)
+        provider_result = await kwargs["send"]()
+        return ob.AuthorizedOutboundExecution(
+            result=provider_result,
+            outcome="confirmed",
+            request=request,
+            receipt={"receipt_id": "receipt-gateway-reply"},
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(ob, "execute_authorized_outbound_send", execute)
+    monkeypatch.setattr("gateway.delivery_ledger.ledger_enabled", lambda: True)
+    monkeypatch.setattr(
+        "gateway.delivery_ledger.record_obligation",
+        lambda **kwargs: pytest.fail("authority send must not enter legacy ledger"),
+    )
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(
+            named_handler(
+                boundary,
+                capabilities={
+                    ob.REQUIRED_SCREENING_CAPABILITY,
+                    ob.TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY,
+                },
+            )
+        ),
+        response=content,
+    )
+
+    assert len(executions) == 1
+    adapter.send_authorized.assert_awaited_once()
+    adapter._send_with_retry.assert_not_awaited()
+    assert executions[0]["decision"].delivery_authority == authority
+
+
+def test_gateway_authority_revalidates_payload_after_local_file_suppression(
+    monkeypatch, tmp_path
+):
+    legacy_error_send = AsyncMock(return_value=SendResult(success=True))
+    monkeypatch.setattr(StubAdapter, "send", legacy_error_send)
+    local_file = tmp_path / "already-delivered.txt"
+    local_file.write_text("internal", encoding="utf-8")
+    content = f"Please review {local_file}"
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "telegram",
+        "channel_id": "admin-dm",
+        "thread_id": "",
+    }
+    request = {
+        "request_id": "request-gateway-local-file",
+        "profile_id": "default",
+        "frame_id": "frame-gateway-local-file",
+        "notification_claim_id": "claim-gateway-local-file",
+        "decision_route": route,
+        "notification_route": route,
+        "items_content_hash": "sha256:items",
+        "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+        "claim_created_at": now.isoformat(),
+        "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": request,
+    }
+
+    def boundary(_event_type, _payload):
+        return {
+            "decision": "allow",
+            "reason": "registered",
+            "delivery_authority": authority,
+        }
+
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "_history_media_paths_for_session",
+        lambda *_args: {str(local_file)},
+    )
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(
+            named_handler(
+                boundary,
+                capabilities={
+                    ob.REQUIRED_SCREENING_CAPABILITY,
+                    ob.TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY,
+                },
+            )
+        ),
+        response=content,
+    )
+
+    adapter.send_authorized.assert_not_awaited()
+    adapter._send_with_retry.assert_not_awaited()
+    legacy_error_send.assert_not_awaited()
+
+
+def test_gateway_authority_never_sends_deferred_auto_voice(monkeypatch):
+    content = "请回复 1 确认"
+    now = datetime.now(timezone.utc)
+    route = {
+        "transport_id": "telegram",
+        "channel_id": "admin-dm",
+        "thread_id": "",
+    }
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": {
+            "request_id": "request-gateway-voice",
+            "profile_id": "default",
+            "frame_id": "frame-gateway-voice",
+            "notification_claim_id": "claim-gateway-voice",
+            "decision_route": route,
+            "notification_route": route,
+            "items_content_hash": "sha256:items",
+            "visible_content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "claim_created_at": now.isoformat(),
+            "claim_expires_at": (now + timedelta(hours=1)).isoformat(),
+        },
+    }
+
+    def boundary(_event_type, _payload):
+        return {
+            "decision": "allow",
+            "reason": "registered",
+            "delivery_authority": authority,
+        }
+
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(
+            named_handler(
+                boundary,
+                capabilities={
+                    ob.REQUIRED_SCREENING_CAPABILITY,
+                    ob.TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY,
+                },
+            )
+        ),
+        response=content,
+        auto_voice_requested=True,
+    )
+
+    adapter._test_auto_voice_sender.assert_not_awaited()
+    adapter.send_authorized.assert_awaited_once()
+
+
+def test_gateway_rewrite_sends_deferred_auto_voice_with_final_text(monkeypatch):
+    def boundary(_event_type, _payload):
+        return {"decision": "rewrite", "reason": "safe", "content": "safe final"}
+
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(named_handler(boundary)),
+        response="unsafe draft",
+        auto_voice_requested=True,
+    )
+
+    adapter._test_auto_voice_sender.assert_awaited_once()
+    assert adapter._test_auto_voice_sender.await_args.args[1] == "safe final"
+
+
+def test_gateway_authority_rejects_media_or_empty_final_without_legacy_error_send(
+    tmp_path, monkeypatch
+):
+    media = tmp_path / "authority.pdf"
+    media.write_bytes(b"%PDF-1.4")
+    media_content = f"MEDIA:{media}"
+    legacy_send = AsyncMock(return_value=SendResult(success=True))
+    monkeypatch.setattr(StubAdapter, "send", legacy_send)
+
+    media_adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=authority_hooks(media_content),
+        response=media_content,
+    )
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "filter_media_delivery_paths",
+        staticmethod(lambda _media: []),
+    )
+    empty_adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=authority_hooks(
+            "rewrite me",
+            final_content=media_content,
+        ),
+        response="rewrite me",
+    )
+
+    media_adapter.send_authorized.assert_not_awaited()
+    empty_adapter.send_authorized.assert_not_awaited()
+    legacy_send.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "extractor",
+    ["extract_media", "extract_images", "extract_local_files"],
+)
+def test_gateway_authority_owns_extraction_failures_without_legacy_error_send(
+    monkeypatch, extractor
+):
+    content = "请回复 1 确认"
+    legacy_send = AsyncMock(return_value=SendResult(success=True))
+    monkeypatch.setattr(StubAdapter, "send", legacy_send)
+
+    def fail_extraction(*_args, **_kwargs):
+        raise RuntimeError(f"{extractor} failed")
+
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        extractor,
+        staticmethod(fail_extraction),
+    )
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=authority_hooks(content),
+        response=content,
+    )
+
+    adapter.send_authorized.assert_not_awaited()
+    adapter._send_with_retry.assert_not_awaited()
+    legacy_send.assert_not_awaited()
+
+
+def test_gateway_deferred_voice_ignores_non_callable_sender(monkeypatch):
+    adapter = process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(named_handler(lambda *_args: {"decision": "allow"})),
+        response="final text",
+        auto_voice_requested=True,
+        voice_sender_callable=False,
+    )
+    adapter._send_with_retry.assert_awaited_once()
+
+
+def test_gateway_non_authority_error_notification_and_failure_are_contained(monkeypatch):
+    notify = AsyncMock(return_value=SendResult(success=True, message_id="om-error"))
+    monkeypatch.setattr(StubAdapter, "send", notify)
+    process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(),
+        response=None,
+        handler_side_effect=RuntimeError("handler failed"),
+    )
+    notify.assert_awaited_once()
+
+    failed_notify = AsyncMock(side_effect=RuntimeError("notify failed"))
+    monkeypatch.setattr(StubAdapter, "send", failed_notify)
+    process_gateway_reply(
+        monkeypatch,
+        hooks=Hooks(),
+        response=None,
+        handler_side_effect=RuntimeError("handler failed again"),
+    )
+    failed_notify.assert_awaited_once()
+
+
+def test_gateway_notice_hook_authority_uses_core_executor(monkeypatch):
+    from gateway import run as gateway_run
+
+    authority = {
+        "schema_version": ob.DELIVERY_AUTHORITY_SCHEMA_VERSION,
+        "required": True,
+        "business_profile_id": "atlas",
+        "request": {"request_id": "request-gateway-notice"},
+    }
+    decision = SimpleNamespace(
+        content="最终通知内容",
+        delivery_authority=authority,
+    )
+    provider = lambda: SendResult(success=True, message_id="notice-1")
+    executions = []
+
+    def execute(**kwargs):
+        executions.append(kwargs)
+        result = kwargs["send"]()
+        return ob.AuthorizedOutboundExecution(
+            result=result,
+            outcome="confirmed",
+            request={"request_id": "request-gateway-notice"},
+            receipt={"receipt_id": "receipt-gateway-notice"},
+            provider_called=True,
+        )
+
+    monkeypatch.setattr(ob, "execute_authorized_outbound_send_sync", execute)
+    monkeypatch.setattr(
+        gateway_run,
+        "_operator_enforce_outbound_after_send",
+        lambda *args: pytest.fail("legacy after_send must not run for authority"),
+    )
+
+    result = gateway_run._send_screened_gateway_notice(
+        Hooks(),
+        {"source_kind": "gateway_notice"},
+        decision,
+        provider,
+    )
+
+    assert result.message_id == "notice-1"
+    assert len(executions) == 1
+    assert executions[0]["context"]["content"] == "最终通知内容"
+
+
+def test_gateway_notice_helpers_cover_legacy_success_and_deferred_voice(monkeypatch):
+    from gateway import run as gateway_run
+
+    audits = []
+    monkeypatch.setattr(
+        gateway_run,
+        "_operator_enforce_outbound_after_send",
+        lambda hooks, context, result: audits.append((hooks, context, result)),
+    )
+    decision = SimpleNamespace(content="notice", delivery_authority=None)
+    result = gateway_run._send_screened_gateway_notice(
+        "hooks",
+        {"content": "notice"},
+        decision,
+        lambda: SendResult(success=True, message_id="om-notice"),
+    )
+    assert result.success is True
+    assert len(audits) == 1
+    failed = gateway_run._send_screened_gateway_notice(
+        "hooks",
+        {"content": "notice"},
+        decision,
+        lambda: SendResult(success=False, error="rejected"),
+    )
+    assert failed.success is False
+    assert len(audits) == 1
+
+    event = SimpleNamespace()
+    runner = SimpleNamespace(_should_send_voice_reply=lambda *_args, **_kwargs: True)
+    assert gateway_run.GatewayRunner._defer_auto_voice_reply(
+        runner,
+        event,
+        "final",
+        [],
+        already_sent=False,
+        streaming_tts_done=False,
+    ) is True
+    assert event._hermes_auto_voice_reply_requested is True
+    assert gateway_run.GatewayRunner._defer_auto_voice_reply(
+        runner,
+        SimpleNamespace(),
+        "final",
+        [],
+        already_sent=False,
+        streaming_tts_done=True,
+    ) is False
+
+
+def test_gateway_after_send_helper_removes_private_decision(monkeypatch):
+    from gateway import run as gateway_run
+
+    captured = []
+    monkeypatch.setattr(
+        ob,
+        "outbound_after_send_sync",
+        lambda hooks, evidence: captured.append(evidence),
+    )
+    gateway_run._operator_enforce_outbound_after_send(
+        None,
+        {"content": "notice", "_boundary_decision": object()},
+        SendResult(success=True, message_id="om-after"),
+    )
+    assert captured[0]["send_result"]["message_id"] == "om-after"
+    assert "_boundary_decision" not in captured[0]
+
+
+def test_gateway_approval_text_helper_uses_authority_or_legacy_sender(monkeypatch):
+    from concurrent.futures import Future
+    from gateway import run as gateway_run
+
+    def schedule(coro, _loop, **_kwargs):
+        future = Future()
+        future.set_result(asyncio.run(coro))
+        return future
+
+    monkeypatch.setattr("agent.async_utils.safe_schedule_threadsafe", schedule)
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="legacy")),
+        send_authorized=AsyncMock(
+            return_value=SendResult(success=True, message_id="authorized")
+        ),
+    )
+    context = SimpleNamespace(
+        _status_adapter=adapter,
+        _status_chat_id="chat-1",
+        _status_thread_metadata={"thread_id": "thread-1"},
+        _loop_for_step=object(),
+    )
+    authority = SimpleNamespace(
+        delivery_authority={"request": {"request_id": "request-approval"}}
+    )
+    plain = SimpleNamespace(delivery_authority=None)
+
+    assert gateway_run._send_gateway_approval_text(
+        context, "approve?", authority
+    ).message_id == "authorized"
+    assert gateway_run._send_gateway_approval_text(
+        context, "approve?", plain
+    ).message_id == "legacy"
+    adapter.send_authorized.assert_awaited_once_with(
+        "chat-1",
+        "approve?",
+        metadata={"thread_id": "thread-1"},
+        transport_request_id="request-approval",
+    )
+    adapter.send.assert_awaited_once()
+
+
+def test_gateway_approval_text_helper_rejects_missing_loop(monkeypatch):
+    from gateway import run as gateway_run
+
+    adapter = SimpleNamespace(send=AsyncMock())
+    context = SimpleNamespace(
+        _status_adapter=adapter,
+        _status_chat_id="chat-1",
+        _status_thread_metadata=None,
+        _loop_for_step=object(),
+    )
+    monkeypatch.setattr(
+        "agent.async_utils.safe_schedule_threadsafe",
+        lambda *_args, **_kwargs: None,
+    )
+    with pytest.raises(RuntimeError, match="loop unavailable"):
+        gateway_run._send_gateway_approval_text(
+            context,
+            "approve?",
+            SimpleNamespace(delivery_authority=None),
+        )
+
+
+@pytest.mark.asyncio
+async def test_queued_first_response_helper_uses_authority_or_legacy(monkeypatch):
+    from gateway import run as gateway_run
+
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="legacy")),
+        send_authorized=AsyncMock(
+            return_value=SendResult(success=True, message_id="authorized")
+        ),
+    )
+    source = SimpleNamespace(chat_id="chat-1")
+    executions = []
+
+    async def execute(**kwargs):
+        executions.append(kwargs)
+        await kwargs["send"]()
+        return SimpleNamespace(outcome="confirmed")
+
+    monkeypatch.setattr(ob, "execute_authorized_outbound_send", execute)
+    authority = SimpleNamespace(
+        delivery_authority={"request": {"request_id": "request-queued"}}
+    )
+    await gateway_run._send_queued_first_response(
+        adapter=adapter,
+        source=source,
+        content="first",
+        metadata={"thread_id": "thread-1"},
+        hooks="hooks",
+        context={"content": "old"},
+        decision=authority,
+    )
+    assert executions[0]["context"]["content"] == "first"
+    adapter.send_authorized.assert_awaited_once()
+
+    audits = []
+    monkeypatch.setattr(
+        gateway_run,
+        "_operator_enforce_outbound_after_send",
+        lambda hooks, context, result: audits.append((hooks, context, result)),
+    )
+    await gateway_run._send_queued_first_response(
+        adapter=adapter,
+        source=source,
+        content="legacy first",
+        metadata=None,
+        hooks="hooks",
+        context={"content": "legacy first"},
+        decision=None,
+    )
+    adapter.send.assert_awaited_once()
+    assert len(audits) == 1
 
 
 def test_armed_adapter_screens_terminal_result_without_actionable_escalation(monkeypatch):

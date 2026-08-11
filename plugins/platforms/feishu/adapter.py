@@ -2300,6 +2300,53 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    supports_transport_authority = True
+
+    async def send_authorized(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        transport_request_id: str,
+    ) -> SendResult:
+        """Perform one exact Feishu API attempt for a Core-authorized notice."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        formatted = self.format_message(content)
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        if len(chunks) != 1:
+            return SendResult(
+                success=False,
+                error="strict transport authority does not support chunked Feishu sends",
+            )
+        strict_metadata = {
+            **dict(metadata or {}),
+            "hermes_delivery_idempotency_key": transport_request_id,
+            "hermes_delivery_part": "authorized-text",
+            "hermes_transport_authority_strict": True,
+        }
+        msg_type, payload = self._build_outbound_payload(
+            chunks[0],
+            prefer_post=bool(_MARKDOWN_HINT_RE.search(formatted)),
+        )
+        try:
+            response = await self._send_raw_message(
+                chat_id=chat_id,
+                msg_type=msg_type,
+                payload=payload,
+                reply_to=reply_to,
+                metadata=strict_metadata,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                retryable=False,
+            )
+        return self._finalize_send_result(response, "strict authorized send failed")
+
     async def edit_message(
         self,
         chat_id: str,
@@ -6603,6 +6650,43 @@ async def _standalone_send(
         return {"error": f"Feishu send failed: {e}"}
 
 
+async def _standalone_send_authorized(
+    pconfig,
+    chat_id,
+    content,
+    *,
+    thread_id=None,
+    transport_request_id: str,
+):
+    """Run the same strict one-attempt seam without a resident Gateway."""
+    if not await asyncio.to_thread(_load_lark_oapi):
+        return {
+            "success": False,
+            "error": "Feishu dependencies not installed. Run `hermes setup` to install Feishu support.",
+        }
+    try:
+        adapter = FeishuAdapter(pconfig)
+        domain_name = getattr(adapter, "_domain_name", "feishu")
+        domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
+        adapter._client = adapter._build_lark_client(domain)
+        result = await adapter.send_authorized(
+            chat_id,
+            content,
+            metadata={"thread_id": thread_id} if thread_id else None,
+            transport_request_id=transport_request_id,
+        )
+        return {
+            "success": result.success,
+            "message_id": result.message_id,
+            "error": result.error,
+            "raw_response": result.raw_response,
+        }
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return {"success": False, "error": f"Feishu strict send failed: {exc}"}
+
+
 def interactive_setup() -> None:
     """Interactive setup for Feishu / Lark — scan-to-create or manual creds.
 
@@ -6820,6 +6904,7 @@ def register(ctx) -> None:
         allow_all_env="FEISHU_ALLOW_ALL_USERS",
         cron_deliver_env_var="FEISHU_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
+        standalone_authorized_sender_fn=_standalone_send_authorized,
         max_message_length=8000,
         emoji="🪽",
         allow_update_command=True,

@@ -154,4 +154,3 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     result = asyncio.new_event_loop().run_until_complete(_run())
     assert result["final_response"] == "Hello from the agent."
 
-

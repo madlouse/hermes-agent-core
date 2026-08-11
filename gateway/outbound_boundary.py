@@ -19,7 +19,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from gateway.hooks import HookRegistry
 
@@ -33,8 +33,23 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 DECISIONS = {"allow", "deny", "hold", "rewrite", "downgrade"}
 OPERATOR_SOURCE_KINDS = {"operator_enforce", "streaming_final_reply"}
 REQUIRED_SCREENING_CAPABILITY = "output-screening"
+TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY = "transport-outbox-authority"
+DELIVERY_AUTHORITY_SCHEMA_VERSION = "transport-outbox-hook/v1"
 _HOOK_IDENTITY_KEY = "_hermes_hook_name"
 _HOOK_CAPABILITIES_KEY = "_hermes_hook_capabilities"
+
+_DELIVERY_AUTHORITY_REQUEST_FIELDS = {
+    "request_id",
+    "profile_id",
+    "frame_id",
+    "notification_claim_id",
+    "decision_route",
+    "notification_route",
+    "items_content_hash",
+    "visible_content_sha256",
+    "claim_created_at",
+    "claim_expires_at",
+}
 
 _ACTIONABLE_TEXT_RE = re.compile(
     r"(回复|发送|选择|确认|同意|通过|继续|批准|拒绝|不发|全发|发).{0,12}([A-Za-z]\d+|\d+|这[一二两三四五六七八九十\d]+)",
@@ -63,6 +78,7 @@ class BoundaryDecision:
     reason: str
     raw: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    delivery_authority: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -74,7 +90,25 @@ class BoundaryDecision:
         }
         if self.errors:
             payload["errors"] = list(self.errors)
+        if self.delivery_authority is not None:
+            payload["delivery_authority"] = copy.deepcopy(self.delivery_authority)
         return payload
+
+
+@dataclass(frozen=True)
+class AuthorizedOutboundExecution:
+    """Result of one Core-owned Hook transport-outbox transaction."""
+
+    result: Any
+    outcome: str
+    request: dict[str, Any]
+    receipt: dict[str, Any] | None
+    provider_called: bool
+    recovered: bool = False
+
+
+class OutboundDeliveryAuthorityError(Exception):
+    """A Hook transport authority could not be executed without ambiguity."""
 
 
 def _string(value: Any) -> str:
@@ -113,6 +147,43 @@ def _list_of_objects(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [dict(item) for item in value if isinstance(item, dict)]
+
+
+def _route_from_context(context: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "transport_id": _string(
+            context.get("transport_id") or context.get("platform")
+        ).lower(),
+        "channel_id": _string(
+            context.get("channel_id") or context.get("chat_id")
+        ),
+        "thread_id": _string(context.get("thread_id")),
+    }
+
+
+def _normalized_route(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    route = {
+        "transport_id": _string(
+            value.get("transport_id") or value.get("platform")
+        ).lower(),
+        "channel_id": _string(value.get("channel_id") or value.get("chat_id")),
+        "thread_id": _string(value.get("thread_id")),
+    }
+    return route if route["transport_id"] and route["channel_id"] else None
+
+
+def _canonical_profile_id_from_home(profile_path: Any) -> str:
+    try:
+        resolved = Path(profile_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, TypeError):
+        return ""
+    if not resolved.is_dir():
+        return ""
+    if resolved.parent.name == "profiles":
+        return resolved.name if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", resolved.name) else ""
+    return "default"
 
 
 def _source_kind(context: dict[str, Any]) -> str:
@@ -431,6 +502,13 @@ def _is_required_screening_result(result: Any) -> bool:
     )
 
 
+def _has_capability(result: Any, capability: str) -> bool:
+    return bool(
+        isinstance(result, dict)
+        and capability in result.get(_HOOK_CAPABILITIES_KEY, [])
+    )
+
+
 def _without_hook_identity(result: Any) -> Any:
     if not isinstance(result, dict):
         return result
@@ -439,6 +517,115 @@ def _without_hook_identity(result: Any) -> Any:
         for key, value in result.items()
         if key not in {_HOOK_IDENTITY_KEY, _HOOK_CAPABILITIES_KEY}
     }
+
+
+def _validate_delivery_authority(
+    context: dict[str, Any],
+    decision: BoundaryDecision,
+    authority: Any,
+) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(authority, dict):
+        return None, "invalid_delivery_authority"
+    if authority.get("schema_version") != DELIVERY_AUTHORITY_SCHEMA_VERSION:
+        return None, "invalid_delivery_authority"
+    if authority.get("required") is not True:
+        return None, "invalid_delivery_authority"
+    if _string(authority.get("business_profile_id")) != _string(
+        context.get("profile_id")
+    ):
+        return None, "delivery_authority_profile_mismatch"
+    if any(key in authority for key in ("requests", "selectors", "frame_ids")):
+        return None, "multiple_delivery_frames"
+    request = authority.get("request")
+    if not isinstance(request, dict):
+        return None, "invalid_delivery_authority"
+    if any(key in request for key in ("requests", "selectors", "frame_ids")):
+        return None, "multiple_delivery_frames"
+    if _DELIVERY_AUTHORITY_REQUEST_FIELDS - set(request):
+        return None, "invalid_delivery_authority"
+    if isinstance(request.get("frame_id"), (list, tuple, dict, set)):
+        return None, "multiple_delivery_frames"
+    if not isinstance(request.get("frame_id"), str) or not _string(request.get("frame_id")):
+        return None, "invalid_delivery_authority"
+
+    if _string(request.get("profile_id")) != _canonical_profile_id_from_home(
+        context.get("profile_path")
+    ):
+        return None, "delivery_authority_profile_mismatch"
+    actual_route = _route_from_context(context)
+    authority_route = _normalized_route(request.get("notification_route"))
+    if authority_route is None or authority_route != actual_route:
+        return None, "delivery_authority_route_mismatch"
+
+    from gateway.transport_outbox import visible_content_sha256
+
+    if _string(request.get("visible_content_sha256")).lower() != visible_content_sha256(
+        decision.content
+    ):
+        return None, "delivery_authority_content_mismatch"
+    return copy.deepcopy(authority), ""
+
+
+def _delivery_authority_decision(
+    context: dict[str, Any],
+    normalized_results: list[tuple[Any, BoundaryDecision]],
+    selected: BoundaryDecision,
+) -> BoundaryDecision:
+    required_results = [
+        (result, normalized)
+        for result, normalized in normalized_results
+        if normalized.transmit
+        and isinstance((public := _without_hook_identity(result)), dict)
+        and isinstance(public.get("post_send"), dict)
+        and public["post_send"].get("required") is True
+    ]
+    authority_required = bool(required_results)
+    if any(
+        "delivery_authority" not in _without_hook_identity(result)
+        for result, _ in required_results
+    ):
+        return _closed_decision(context, "missing_delivery_authority")
+    authority_results = [
+        (result, normalized)
+        for result, normalized in normalized_results
+        if isinstance(result, dict)
+        and "delivery_authority" in _without_hook_identity(result)
+    ]
+    if not authority_results:
+        return selected
+    if any(
+        not _has_capability(result, TRANSPORT_OUTBOX_AUTHORITY_CAPABILITY)
+        for result, _ in authority_results
+    ):
+        return _closed_decision(context, "untrusted_delivery_authority")
+    if len(authority_results) != 1:
+        return _closed_decision(context, "multiple_delivery_authorities")
+    result, authority_decision = authority_results[0]
+    if authority_required:
+        if (
+            selected.decision in {"rewrite", "downgrade"}
+            and authority_decision is not selected
+        ):
+            return _closed_decision(
+                context,
+                "delivery_authority_decision_mismatch",
+            )
+        selected = authority_decision
+    elif authority_decision is not selected:
+        return _closed_decision(context, "delivery_authority_decision_mismatch")
+    authority, reason = _validate_delivery_authority(
+        context,
+        selected,
+        _without_hook_identity(result).get("delivery_authority"),
+    )
+    if authority is None:
+        return _closed_decision(context, reason)
+    selected.delivery_authority = authority
+    selected.raw = {
+        **selected.raw,
+        "delivery_authority": copy.deepcopy(authority),
+    }
+    return selected
 
 
 async def _emit_collect_strict(
@@ -607,13 +794,21 @@ async def outbound_before_send(
     ]
     for normalized in positive_results:
         if normalized.decision in {"rewrite", "downgrade"}:
-            return normalized
+            return _delivery_authority_decision(
+                ctx,
+                normalized_results,
+                normalized,
+            )
     best_allow: BoundaryDecision | None = None
     for normalized in positive_results:
         best_allow = normalized
 
     if best_allow is not None:
-        return best_allow
+        return _delivery_authority_decision(
+            ctx,
+            normalized_results,
+            best_allow,
+        )
     if requires_boundary(ctx):
         return _closed_decision(ctx, "no_boundary_decision", errors)
     return _allow_decision(ctx, "not_actionable")
@@ -689,15 +884,333 @@ def outbound_after_send_sync(
     )
 
 
+def _authority_home(context: Mapping[str, Any]) -> Path | None:
+    profile_path = _string(context.get("profile_path"))
+    return Path(profile_path).expanduser() if profile_path else None
+
+
+def _source_outbox_id(payload: Mapping[str, Any], receipt: Mapping[str, Any]) -> str:
+    direct = _string(
+        payload.get("outbox_id") or payload.get("message_id") or payload.get("id")
+    )
+    if direct:
+        return direct
+    native_ids = receipt.get("native_ids")
+    if isinstance(native_ids, list):
+        for item in native_ids:
+            if isinstance(item, Mapping) and _string(item.get("value")):
+                return _string(item.get("value"))
+    return _string(receipt.get("receipt_id"))
+
+
+def _confirmed_duplicate_result(
+    request: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    native_ids = copy.deepcopy(receipt.get("native_ids") or [])
+    result = {
+        "success": True,
+        "transport_outcome": "confirmed",
+        "transport_request_id": _string(request.get("request_id")),
+        "transport_receipt_id": _string(receipt.get("receipt_id")),
+        "transport_receipt": copy.deepcopy(dict(receipt)),
+        "native_ids": native_ids,
+        "recovered": True,
+    }
+    if isinstance(native_ids, list) and native_ids:
+        first = native_ids[0]
+        if isinstance(first, Mapping):
+            result[_string(first.get("kind")) or "message_id"] = _string(
+                first.get("value")
+            )
+    return result
+
+
+def _authority_after_context(
+    context: Mapping[str, Any],
+    authority: Mapping[str, Any],
+    request: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    result: Any,
+) -> dict[str, Any]:
+    payload = send_result_payload(result)
+    payload.update(
+        {
+            "transport_outcome": "confirmed",
+            "transport_request_id": _string(request.get("request_id")),
+            "transport_receipt_id": _string(receipt.get("receipt_id")),
+            "transport_receipt": copy.deepcopy(dict(receipt)),
+        }
+    )
+    return {
+        **dict(context),
+        "delivery_authority": copy.deepcopy(dict(authority)),
+        "delivery_authority_selector": copy.deepcopy(dict(request)),
+        "transport_request_id": _string(request.get("request_id")),
+        "transport_receipt_id": _string(receipt.get("receipt_id")),
+        "transport_receipt": copy.deepcopy(dict(receipt)),
+        "send_result": payload,
+        "source_outbox_id": _source_outbox_id(payload, receipt),
+        "success": True,
+    }
+
+
+def _begin_authorized_delivery(
+    context: Mapping[str, Any],
+    decision: BoundaryDecision,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    authority = decision.delivery_authority
+    if authority is None:
+        raise OutboundDeliveryAuthorityError("delivery authority is missing")
+    request = authority.get("request")
+    if not isinstance(request, Mapping):
+        raise OutboundDeliveryAuthorityError("delivery authority request is invalid")
+    execution_decision = BoundaryDecision(
+        transmit=decision.transmit,
+        decision=decision.decision,
+        content=content_text(dict(context)),
+        reason=decision.reason,
+        raw=decision.raw,
+        delivery_authority=decision.delivery_authority,
+    )
+    validated, reason = _validate_delivery_authority(
+        dict(context), execution_decision, authority
+    )
+    if validated is None:
+        raise OutboundDeliveryAuthorityError(reason)
+    try:
+        from gateway.transport_outbox import begin_transport_request
+
+        commit = begin_transport_request(
+            request,
+            visible_content=execution_decision.content,
+            notification_route=_route_from_context(context),
+            home=_authority_home(context),
+        )
+    except Exception as exc:
+        raise OutboundDeliveryAuthorityError(
+            f"transport request begin failed: {exc}"
+        ) from exc
+    if not isinstance(commit, dict) or not isinstance(commit.get("request"), dict):
+        raise OutboundDeliveryAuthorityError("transport request begin returned invalid state")
+    state = _string(commit.get("state"))
+    if state not in {"new", "confirmed", "indeterminate", "definitively_rejected"}:
+        raise OutboundDeliveryAuthorityError(
+            f"transport request begin returned invalid state: {state or 'missing'}"
+        )
+    return copy.deepcopy(authority), commit
+
+
+def _commit_authorized_delivery(
+    context: Mapping[str, Any],
+    commit: Mapping[str, Any],
+    result: Any,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    from gateway.transport_outbox import (
+        classify_transport_outcome,
+        commit_transport_receipt,
+    )
+
+    payload = send_result_payload(result)
+    request = dict(commit["request"])
+    try:
+        outcome = classify_transport_outcome(payload)
+        receipt = commit_transport_receipt(
+            _string(request.get("request_id")),
+            payload,
+            outcome=outcome,
+            home=_authority_home(context),
+        )
+    except Exception as exc:
+        raise OutboundDeliveryAuthorityError(
+            f"transport receipt commit failed: {exc}"
+        ) from exc
+    return outcome, receipt, payload
+
+
+def execute_authorized_outbound_send_sync(
+    *,
+    hooks: Any,
+    context: dict[str, Any],
+    decision: BoundaryDecision,
+    send: Callable[[], Any],
+) -> AuthorizedOutboundExecution:
+    """Execute one trusted Hook send with durable request/receipt ordering."""
+    authority, commit = _begin_authorized_delivery(context, decision)
+    request = dict(commit["request"])
+    state = _string(commit.get("state"))
+    if state == "confirmed":
+        receipt = dict(commit["receipt"])
+        result = _confirmed_duplicate_result(request, receipt)
+        outbound_after_send_sync(
+            hooks,
+            _authority_after_context(context, authority, request, receipt, result),
+        )
+        return AuthorizedOutboundExecution(
+            result=result,
+            outcome="confirmed",
+            request=request,
+            receipt=receipt,
+            provider_called=False,
+            recovered=True,
+        )
+    if state != "new":
+        raise OutboundDeliveryAuthorityError(
+            f"transport request already has {state} outcome"
+        )
+
+    try:
+        result = send()
+    except Exception as exc:
+        result = {
+            "success": False,
+            "error": str(exc),
+            "exception_type": type(exc).__name__,
+            "transport_outcome": "indeterminate",
+        }
+        outcome, receipt, _ = _commit_authorized_delivery(context, commit, result)
+        raise OutboundDeliveryAuthorityError(
+            f"provider send failed with {outcome} outcome: {exc}"
+        ) from exc
+
+    outcome, receipt, _ = _commit_authorized_delivery(context, commit, result)
+    if outcome != "confirmed":
+        raise OutboundDeliveryAuthorityError(
+            f"provider send completed with {outcome} outcome"
+        )
+    outbound_after_send_sync(
+        hooks,
+        _authority_after_context(context, authority, request, receipt, result),
+    )
+    return AuthorizedOutboundExecution(
+        result=result,
+        outcome=outcome,
+        request=request,
+        receipt=receipt,
+        provider_called=True,
+    )
+
+
+async def execute_authorized_outbound_send(
+    *,
+    hooks: Any,
+    context: dict[str, Any],
+    decision: BoundaryDecision,
+    send: Callable[[], Awaitable[Any]],
+) -> AuthorizedOutboundExecution:
+    """Async counterpart used by gateway and live-adapter delivery paths."""
+    authority, commit = await asyncio.to_thread(
+        _begin_authorized_delivery,
+        context,
+        decision,
+    )
+    request = dict(commit["request"])
+    state = _string(commit.get("state"))
+    if state == "confirmed":
+        receipt = dict(commit["receipt"])
+        result = _confirmed_duplicate_result(request, receipt)
+        await outbound_after_send(
+            hooks,
+            _authority_after_context(context, authority, request, receipt, result),
+        )
+        return AuthorizedOutboundExecution(
+            result=result,
+            outcome="confirmed",
+            request=request,
+            receipt=receipt,
+            provider_called=False,
+            recovered=True,
+        )
+    if state != "new":
+        raise OutboundDeliveryAuthorityError(
+            f"transport request already has {state} outcome"
+        )
+
+    try:
+        result = await send()
+    except Exception as exc:
+        failed_result = {
+            "success": False,
+            "error": str(exc),
+            "exception_type": type(exc).__name__,
+            "transport_outcome": "indeterminate",
+        }
+        outcome, _, _ = await asyncio.to_thread(
+            _commit_authorized_delivery,
+            context,
+            commit,
+            failed_result,
+        )
+        raise OutboundDeliveryAuthorityError(
+            f"provider send failed with {outcome} outcome: {exc}"
+        ) from exc
+
+    outcome, receipt, _ = await asyncio.to_thread(
+        _commit_authorized_delivery,
+        context,
+        commit,
+        result,
+    )
+    if outcome != "confirmed":
+        raise OutboundDeliveryAuthorityError(
+            f"provider send completed with {outcome} outcome"
+        )
+    await outbound_after_send(
+        hooks,
+        _authority_after_context(context, authority, request, receipt, result),
+    )
+    return AuthorizedOutboundExecution(
+        result=result,
+        outcome=outcome,
+        request=request,
+        receipt=receipt,
+        provider_called=True,
+    )
+
+
 def send_result_payload(result: Any) -> dict[str, Any]:
     if isinstance(result, dict):
-        return dict(result)
-    if result is None:
+        payload = dict(result)
+    elif result is None:
         return {}
-    payload: dict[str, Any] = {}
-    for key in ("success", "message_id", "outbox_id", "error", "raw_response"):
-        if hasattr(result, key):
-            value = getattr(result, key)
-            if value is not None:
-                payload[key] = value
-    return payload
+    else:
+        payload = {}
+        for key in (
+            "success",
+            "message_id",
+            "outbox_id",
+            "error",
+            "raw_response",
+            "transport_outcome",
+        ):
+            if hasattr(result, key):
+                value = getattr(result, key)
+                if value is not None:
+                    payload[key] = value
+    return _json_safe_transport_result(payload)
+
+
+def _json_safe_transport_result(value: Any, *, _depth: int = 0) -> Any:
+    """Keep receipt evidence deterministic without serializing provider objects."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_transport_result(item, _depth=_depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            _json_safe_transport_result(item, _depth=_depth + 1)
+            for item in value
+        ]
+    if _depth >= 4:
+        return {"provider_object_type": type(value).__name__}
+    allowed = {}
+    for key in ("code", "msg", "request_id", "message_id", "outbox_id", "status", "data"):
+        if not hasattr(value, key):
+            continue
+        item = getattr(value, key)
+        if item is not None and not callable(item):
+            allowed[key] = _json_safe_transport_result(item, _depth=_depth + 1)
+    return allowed or {"provider_object_type": type(value).__name__}

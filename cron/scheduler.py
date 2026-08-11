@@ -1133,7 +1133,9 @@ def _deliver_operational_notice_in_profile(
     try:
         from gateway.outbound_boundary import (
             build_outbound_context,
+            execute_authorized_outbound_send,
             outbound_before_send_sync,
+            profile_id_from_home,
         )
 
         context = build_outbound_context(
@@ -1141,7 +1143,7 @@ def _deliver_operational_notice_in_profile(
             content=notice["admin_content"],
             platform=route["transport_id"],
             chat_id=route["channel_id"],
-            profile_id=profile_id,
+            profile_id=profile_id_from_home(owning_profile_home),
             profile_path=str(owning_profile_home),
             producer_id="cron-operational-notice",
             job_id=str(job.get("id") or ""),
@@ -1163,61 +1165,134 @@ def _deliver_operational_notice_in_profile(
             heartbeat.stop()
             return "screening_rejected"
         screened_content = decision.content
-        from gateway.transport_outbox import visible_content_sha256
-        from tools.send_message_tool import send_message_tool
+        context["content"] = screened_content
 
-        request_material = json.dumps(
-            {
-                "profile_id": profile_id,
-                "job_id": str(job.get("id") or ""),
-                "idempotency_key": notice["idempotency_key"],
-                "route": route,
-                "content": screened_content,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        request_digest = hashlib.sha256(request_material.encode("utf-8")).hexdigest()
-        transport_request = {
-            "request_id": f"cron-operational-notice:{request_digest}",
-            "profile_id": profile_id,
-            "frame_id": notice["evidence_ref"],
-            "notification_claim_id": notice["idempotency_key"],
-            "decision_route": route,
-            "notification_route": route,
-            "items_content_hash": f"sha256:{request_digest}",
-            "visible_content_sha256": visible_content_sha256(screened_content),
-            "claim_created_at": "1970-01-01T00:00:00+00:00",
-            "claim_expires_at": expires_at.isoformat(timespec="microseconds"),
-        }
-        existing_request_id = str(claim.get("transport_request_id") or "")
-        if existing_request_id and existing_request_id != transport_request["request_id"]:
-            heartbeat.stop()
-            return "request_conflict"
-        binding = bind_operational_notice_transport_request(
-            str(job.get("id") or ""),
-            notice["idempotency_key"],
-            claim_owner=claim_owner,
-            transport_request_id=transport_request["request_id"],
-        )
-        if binding.get("status") != "bound":
-            heartbeat.stop()
-            return str(binding.get("status") or "ownership_lost")
-        heartbeat.bind_request(transport_request["request_id"])
-        result = json.loads(
-            send_message_tool(
-                {
-                    "action": "send",
-                    "target": f"{route['transport_id']}:{route['channel_id']}",
-                    "message": screened_content,
-                    "profile_id": profile_id,
-                    "transport_request": transport_request,
-                }
+        if isinstance(decision.delivery_authority, dict):
+            from gateway.config import Platform, load_gateway_config
+
+            try:
+                platform = Platform(route["transport_id"])
+            except (ValueError, KeyError):
+                heartbeat.stop()
+                return "strict_adapter_unavailable"
+
+            config = load_gateway_config()
+            from gateway.delivery import resolve_delivery_transport
+
+            transport = resolve_delivery_transport(platform, config, adapters)
+            if (
+                transport is None
+                or loop is None
+                or not getattr(loop, "is_running", lambda: False)()
+            ):
+                heartbeat.stop()
+                return "strict_adapter_unavailable"
+            transport_request = dict(decision.delivery_authority["request"])
+            existing_request_id = str(claim.get("transport_request_id") or "")
+            if existing_request_id and existing_request_id != transport_request["request_id"]:
+                heartbeat.stop()
+                return "request_conflict"
+            binding = bind_operational_notice_transport_request(
+                str(job.get("id") or ""),
+                notice["idempotency_key"],
+                claim_owner=claim_owner,
+                transport_request_id=transport_request["request_id"],
             )
-        )
+            if binding.get("status") != "bound":
+                heartbeat.stop()
+                return str(binding.get("status") or "ownership_lost")
+            heartbeat.bind_request(transport_request["request_id"])
+
+            async def _send_operational_notice():
+                return await transport.send_authorized(
+                    platform,
+                    route["channel_id"],
+                    screened_content,
+                    None,
+                    transport_request_id=transport_request["request_id"],
+                )
+
+            from agent.async_utils import safe_schedule_threadsafe
+
+            future = safe_schedule_threadsafe(
+                execute_authorized_outbound_send(
+                    hooks=_active_outbound_hooks(),
+                    context=context,
+                    decision=decision,
+                    send=_send_operational_notice,
+                ),
+                loop,
+            )
+            if future is None:
+                heartbeat.stop()
+                return "strict_adapter_unavailable"
+            execution = future.result(timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS)
+            result = {
+                "success": True,
+                "transport_request_id": execution.request["request_id"],
+                "transport_receipt_id": execution.receipt["receipt_id"],
+            }
+        else:
+            from gateway.transport_outbox import visible_content_sha256
+            from tools.send_message_tool import send_message_tool
+
+            request_material = json.dumps(
+                {
+                    "profile_id": profile_id,
+                    "job_id": str(job.get("id") or ""),
+                    "idempotency_key": notice["idempotency_key"],
+                    "route": route,
+                    "content": screened_content,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            request_digest = hashlib.sha256(request_material.encode("utf-8")).hexdigest()
+            transport_request = {
+                "request_id": f"cron-operational-notice:{request_digest}",
+                "profile_id": profile_id,
+                "frame_id": notice["evidence_ref"],
+                "notification_claim_id": notice["idempotency_key"],
+                "decision_route": route,
+                "notification_route": route,
+                "items_content_hash": f"sha256:{request_digest}",
+                "visible_content_sha256": visible_content_sha256(screened_content),
+                "claim_created_at": "1970-01-01T00:00:00+00:00",
+                "claim_expires_at": expires_at.isoformat(timespec="microseconds"),
+            }
+            existing_request_id = str(claim.get("transport_request_id") or "")
+            if existing_request_id and existing_request_id != transport_request["request_id"]:
+                heartbeat.stop()
+                return "request_conflict"
+            binding = bind_operational_notice_transport_request(
+                str(job.get("id") or ""),
+                notice["idempotency_key"],
+                claim_owner=claim_owner,
+                transport_request_id=transport_request["request_id"],
+            )
+            if binding.get("status") != "bound":
+                heartbeat.stop()
+                return str(binding.get("status") or "ownership_lost")
+            heartbeat.bind_request(transport_request["request_id"])
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": f"{route['transport_id']}:{route['channel_id']}",
+                        "message": screened_content,
+                        "profile_id": profile_id,
+                        "transport_request": transport_request,
+                    }
+                )
+            )
         heartbeat.ensure_owner()
-    except Exception:
-        result = {}
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': operational notice delivery failed closed: %s",
+            job.get("id", "?"),
+            exc,
+        )
+        result = {"success": False, "error": str(exc)}
     try:
         if transport_request is not None:
             from gateway.transport_outbox import verify_transport_receipt
@@ -2712,6 +2787,7 @@ def _is_channel_dm_topic(
 
 
 _CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS = 60.0
+_CRON_AUTHORITY_RECEIPT_WAIT_SECONDS = 300.0
 
 
 def _run_coro_in_new_loop(coro):
@@ -2765,7 +2841,7 @@ def _deliver_result(
         logger.warning("Job '%s': %s", job["id"], msg)
         return msg
 
-    from tools.send_message_tool import _send_to_platform
+    from tools.send_message_tool import _send_authorized_to_platform, _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
     # Optionally wrap the content with a header/footer so the user knows this
@@ -2995,17 +3071,19 @@ def _deliver_result(
             from gateway.outbound_boundary import (
                 build_outbound_context,
                 outbound_before_send_sync,
+                profile_id_from_home,
             )
 
             outbound_hooks = _active_outbound_hooks()
+            outbound_profile_path = str(job.get("profile_path") or _get_hermes_home())
             boundary_context = build_outbound_context(
                 source_kind="cron",
                 content=delivery_content,
                 platform=platform_name,
                 chat_id=chat_id,
                 thread_id=thread_id,
-                profile_id=str(job.get("profile_id") or ""),
-                profile_path=str(job.get("profile_path") or _get_hermes_home()),
+                profile_id=profile_id_from_home(outbound_profile_path),
+                profile_path=outbound_profile_path,
                 producer_id="cron",
                 job_id=str(job.get("id", "")),
                 run_id=str(job.get("last_run_id") or job.get("id", "")),
@@ -3046,6 +3124,21 @@ def _deliver_result(
                 boundary_media_files
             )
             boundary_context["content"] = boundary_delivery_content
+            authority_active = isinstance(
+                getattr(boundary_decision, "delivery_authority", None), dict
+            )
+            # A live-adapter attempt owns the authority once selected. Without
+            # a live adapter, the registered strict standalone seam may execute
+            # the same request; the legacy sender is never eligible.
+            authority_terminal = authority_active and live_adapter_ready
+            if authority_active and boundary_media_files:
+                raise RuntimeError(
+                    "trusted outbound delivery authority does not support multipart sends"
+                )
+            if authority_active and not boundary_delivery_content.strip():
+                raise RuntimeError(
+                    "trusted outbound delivery authority requires one non-empty text send"
+                )
             boundary_unchanged = (
                 boundary_decision.decision == "allow"
                 and boundary_decision.content == delivery_content
@@ -3091,6 +3184,7 @@ def _deliver_result(
             and runtime_adapter is not None
             and loop is not None
             and not thread_id  # never override an explicit origin thread/topic
+            and not authority_active
         ):
             new_thread_id = _open_continuable_cron_thread(
                 job, runtime_adapter, chat_id, loop,
@@ -3165,10 +3259,10 @@ def _deliver_result(
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = boundary_delivery_content.strip()
+                text_to_send = boundary_delivery_content
                 adapter_ok = True
                 timed_out = False
-                if text_to_send:
+                if text_to_send.strip():
                     if heartbeat is not None:
                         heartbeat()
                     from agent.async_utils import safe_schedule_threadsafe
@@ -3185,12 +3279,37 @@ def _deliver_result(
                     # detection when "thread_id"/"message_thread_id" are absent
                     # from metadata, deriving the routing from target.thread_id
                     # or the explicit direct_messages_topic_id above.
-                    future = safe_schedule_threadsafe(
-                        router._deliver_to_platform(
+                    async def _send_live_payload():
+                        if authority_active:
+                            authority_request = boundary_decision.delivery_authority["request"]
+                            return await transport.send_authorized(
+                                platform,
+                                str(chat_id),
+                                text_to_send,
+                                route_metadata,
+                                transport_request_id=authority_request["request_id"],
+                            )
+                        return await router._deliver_to_platform(
                             route_target,
                             text_to_send,
                             route_metadata,
-                        ),
+                        )
+
+                    if authority_active:
+                        from gateway.outbound_boundary import (
+                            execute_authorized_outbound_send,
+                        )
+
+                        live_send_coro = execute_authorized_outbound_send(
+                            hooks=outbound_hooks,
+                            context=boundary_context,
+                            decision=boundary_decision,
+                            send=_send_live_payload,
+                        )
+                    else:
+                        live_send_coro = _send_live_payload()
+                    future = safe_schedule_threadsafe(
+                        live_send_coro,
                         loop,
                     )
                     if future is None:
@@ -3203,6 +3322,12 @@ def _deliver_result(
                             send_result = future.result(
                                 timeout=_CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS
                             )
+                            if authority_active:
+                                authority_execution = send_result
+                                send_result = authority_execution.result
+                                authority_terminal = (
+                                    authority_execution.outcome != "confirmed"
+                                )
                         except TimeoutError:
                             # #38922: a slow confirmation does NOT necessarily
                             # mean the send failed — but we must distinguish two
@@ -3234,6 +3359,40 @@ def _deliver_result(
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
                                 timeout_handled = True
+                            elif authority_active:
+                                logger.warning(
+                                    "Job '%s': trusted live adapter send to %s:%s "
+                                    "is in flight; waiting boundedly for an authoritative receipt",
+                                    job["id"], platform_name, chat_id,
+                                )
+                                receipt_deadline = (
+                                    time.monotonic()
+                                    + _CRON_AUTHORITY_RECEIPT_WAIT_SECONDS
+                                )
+                                while time.monotonic() < receipt_deadline:
+                                    if heartbeat is not None:
+                                        heartbeat()
+                                    try:
+                                        authority_execution = future.result(
+                                            timeout=min(
+                                                _CRON_LIVE_DELIVERY_CONFIRMATION_SECONDS,
+                                                max(0.001, receipt_deadline - time.monotonic()),
+                                            )
+                                        )
+                                        send_result = authority_execution.result
+                                        authority_terminal = (
+                                            authority_execution.outcome != "confirmed"
+                                        )
+                                        break
+                                    except TimeoutError:
+                                        continue
+                                else:
+                                    target_errors.append(
+                                        "trusted live adapter send remained in flight without "
+                                        "an authoritative receipt"
+                                    )
+                                    adapter_ok = False
+                                    timeout_handled = True
                             elif heartbeat is not None:
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
@@ -3297,6 +3456,9 @@ def _deliver_result(
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+
+                            if authority_active and authority_terminal:
+                                send_success = False
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -3390,11 +3552,12 @@ def _deliver_result(
                 if adapter_ok:
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
-                    _record_confirmed_outbound_send(
-                        outbound_hooks,
-                        boundary_context,
-                        boundary_send_result,
-                    )
+                    if not authority_active:
+                        _record_confirmed_outbound_send(
+                            outbound_hooks,
+                            boundary_context,
+                            boundary_send_result,
+                        )
                     # Seed the thread session only now that delivery into it
                     # succeeded (deferred from thread-open above).
                     if opened_thread_id and not thread_seeded:
@@ -3423,6 +3586,8 @@ def _deliver_result(
             except CronRunOutcomeOwnershipLost:
                 raise
             except Exception as e:
+                if authority_active:
+                    authority_terminal = True
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
@@ -3433,6 +3598,12 @@ def _deliver_result(
                         "Job '%s': %s, falling back to standalone",
                         job["id"], err_msg,
                     )
+
+        if not delivered and authority_terminal:
+            delivery_errors.extend(target_errors or [
+                f"trusted delivery to {platform_name}:{chat_id} was not confirmed"
+            ])
+            continue
 
         if not delivered:
             if transport is not None and transport.is_relay:
@@ -3460,6 +3631,18 @@ def _deliver_result(
             # Standalone delivery remains owned by the active run claim while the
             # async transport is in flight.
             def _standalone_delivery():
+                if authority_active:
+                    request_id = str(
+                        boundary_decision.delivery_authority["request"]["request_id"]
+                    )
+                    return _send_authorized_to_platform(
+                        platform,
+                        pconfig,
+                        chat_id,
+                        boundary_delivery_content,
+                        thread_id=thread_id,
+                        transport_request_id=request_id,
+                    )
                 return _send_to_platform(
                     platform,
                     pconfig,
@@ -3485,11 +3668,29 @@ def _deliver_result(
 
             if heartbeat is not None:
                 heartbeat()
-            coro = (
-                _standalone_delivery()
-                if heartbeat is None
-                else _standalone_delivery_with_heartbeat()
-            )
+            def _standalone_coro():
+                if not authority_active:
+                    return (
+                        _standalone_delivery()
+                        if heartbeat is None
+                        else _standalone_delivery_with_heartbeat()
+                    )
+                from gateway.outbound_boundary import (
+                    execute_authorized_outbound_send,
+                )
+
+                return execute_authorized_outbound_send(
+                    hooks=outbound_hooks,
+                    context=boundary_context,
+                    decision=boundary_decision,
+                    send=lambda: (
+                        _standalone_delivery()
+                        if heartbeat is None
+                        else _standalone_delivery_with_heartbeat()
+                    ),
+                )
+
+            coro = _standalone_coro()
             try:
                 result = asyncio.run(coro)
             except CronRunOutcomeOwnershipLost:
@@ -3520,11 +3721,7 @@ def _deliver_result(
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        fallback_coro = (
-                            _standalone_delivery()
-                            if heartbeat is None
-                            else _standalone_delivery_with_heartbeat()
-                        )
+                        fallback_coro = _standalone_coro()
                         future = pool.submit(_run_coro_in_new_loop, fallback_coro)
                         result = future.result(timeout=30)
                     finally:
@@ -3552,6 +3749,18 @@ def _deliver_result(
                 delivery_errors.extend(target_errors)
                 continue
 
+            if authority_active:
+                authority_execution = result
+                result = authority_execution.result
+                if authority_execution.outcome != "confirmed":
+                    msg = (
+                        "trusted delivery returned "
+                        f"{authority_execution.outcome} outcome"
+                    )
+                    target_errors.append(msg)
+                    delivery_errors.extend(target_errors)
+                    continue
+
             if heartbeat is not None:
                 heartbeat()
             if result and result.get("error"):
@@ -3571,11 +3780,12 @@ def _deliver_result(
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
-            _record_confirmed_outbound_send(
-                outbound_hooks,
-                boundary_context,
-                result,
-            )
+            if not authority_active:
+                _record_confirmed_outbound_send(
+                    outbound_hooks,
+                    boundary_context,
+                    result,
+                )
             _append_delivery_receipt(delivery_receipts, result, kind="payload")
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, boundary_mirror_text,

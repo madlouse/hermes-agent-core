@@ -3536,6 +3536,25 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    supports_transport_authority: bool = False
+
+    async def send_authorized(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        transport_request_id: str,
+    ) -> SendResult:
+        """Send one exact authority-bound text without retry, fallback, or chunking."""
+        return SendResult(
+            success=False,
+            error=(
+                f"{self.platform.value} adapter does not support strict transport authority"
+            ),
+        )
+
     # Default: the adapter treats ``finalize=True`` on edit_message as a
     # no-op and is happy to have the stream consumer skip redundant final
     # edits.  Subclasses that *require* an explicit finalize call to close
@@ -5855,6 +5874,7 @@ class BasePlatformAdapter(ABC):
         last_delivery_result = None
         confirmed_delivery_result = None
         recovery_delivery_results: list[SendResult] = []
+        authority_delivery_owned = False
 
         async def _settle_recovery_delivery(*, delivered: bool, reason: str) -> None:
             recovery = event.recovery_delivery
@@ -5976,6 +5996,8 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             outbound_boundary_context = None
             outbound_hooks = None
+            boundary_decision = None
+            authority_execution = None
             if response:
                 try:
                     from gateway.outbound_boundary import (
@@ -6049,6 +6071,14 @@ class BasePlatformAdapter(ABC):
                     else:
                         response = boundary_decision.content
                         outbound_boundary_context["content"] = response
+                        if isinstance(
+                            getattr(boundary_decision, "delivery_authority", None),
+                            dict,
+                        ):
+                            # Authority owns the entire downstream delivery
+                            # lifecycle, including extraction/normalization
+                            # failures before the provider attempt.
+                            authority_delivery_owned = True
                 except Exception as boundary_err:
                     logger.warning(
                         "[%s] outbound boundary bridge failed: %s",
@@ -6132,6 +6162,35 @@ class BasePlatformAdapter(ABC):
                         )
                         text_content = _recovered
 
+                if boundary_decision is not None and isinstance(
+                    getattr(boundary_decision, "delivery_authority", None), dict
+                ):
+                    if images or local_files or media_files:
+                        raise RuntimeError(
+                            "trusted outbound delivery authority does not support multipart sends"
+                        )
+                    if not text_content:
+                        raise RuntimeError(
+                            "trusted outbound delivery authority requires one text send"
+                        )
+                    # Authority execution revalidates this final provider payload.
+                    # No extraction or history suppression may run after it.
+                    outbound_boundary_context["content"] = text_content
+
+                # GatewayRunner defers /voice-all TTS until the exact final text
+                # has passed this Hook boundary. Authority requests remain one
+                # provider attempt and therefore never add an audio send.
+                auto_voice_requested = bool(
+                    getattr(event, "_hermes_auto_voice_reply_requested", False)
+                )
+                authority_active = boundary_decision is not None and isinstance(
+                    getattr(boundary_decision, "delivery_authority", None), dict
+                )
+                if auto_voice_requested and not authority_active and text_content:
+                    voice_sender = getattr(runner, "_send_voice_reply", None)
+                    if callable(voice_sender):
+                        await voice_sender(event, text_content)
+
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
@@ -6165,6 +6224,10 @@ class BasePlatformAdapter(ABC):
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
+                        and not (
+                            boundary_decision is not None
+                            and isinstance(getattr(boundary_decision, "delivery_authority", None), dict)
+                        )
                         and not self._streaming_tts_turn_completed(
                             session_key,
                             getattr(interrupt_event, "_hermes_run_generation", None),
@@ -6250,6 +6313,13 @@ class BasePlatformAdapter(ABC):
                         event.source.chat_id,
                     )
                     _reply_anchor = _reply_anchor_for_event(event)
+                    authority_active = bool(
+                        boundary_decision is not None
+                        and isinstance(
+                            getattr(boundary_decision, "delivery_authority", None),
+                            dict,
+                        )
+                    )
                     # Delivery-obligation ledger: durably record the final
                     # response BEFORE the send attempt so a gateway crash
                     # between finalize and platform ACK can redeliver it on
@@ -6259,7 +6329,7 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    if not authority_active and not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
                         try:
@@ -6296,20 +6366,50 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=(
-                            _delivery_metadata("text")
-                            if _obligation_id is None or recovery_key
-                            else {
-                                **_final_thread_metadata,
-                                "hermes_delivery_idempotency_key": _obligation_id,
-                                "hermes_delivery_part": "text",
-                            }
-                        ),
-                    )
+                    async def _send_final_text():
+                        if authority_active:
+                            authority_request = boundary_decision.delivery_authority[
+                                "request"
+                            ]
+                            return await delivery_adapter.send_authorized(
+                                chat_id=event.source.chat_id,
+                                content=text_content,
+                                reply_to=_reply_anchor,
+                                metadata=_final_thread_metadata,
+                                transport_request_id=authority_request["request_id"],
+                            )
+                        return await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=(
+                                _delivery_metadata("text")
+                                if _obligation_id is None or recovery_key
+                                else {
+                                    **_final_thread_metadata,
+                                    "hermes_delivery_idempotency_key": _obligation_id,
+                                    "hermes_delivery_part": "text",
+                                }
+                            ),
+                        )
+
+                    if authority_active:
+                        from gateway.outbound_boundary import (
+                            execute_authorized_outbound_send,
+                        )
+
+                        authority_execution = await execute_authorized_outbound_send(
+                            hooks=outbound_hooks,
+                            context=outbound_boundary_context,
+                            decision=boundary_decision,
+                            send=_send_final_text,
+                        )
+                        result = self.normalize_delivery_result(
+                            authority_execution.result,
+                            operation="trusted outbound delivery",
+                        )
+                    else:
+                        result = await _send_final_text()
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -6519,6 +6619,7 @@ class BasePlatformAdapter(ABC):
                 if (
                     outbound_boundary_context is not None
                     and boundary_delivery_result is not None
+                    and authority_execution is None
                 ):
                     try:
                         from gateway.outbound_boundary import (
@@ -6644,25 +6745,27 @@ class BasePlatformAdapter(ABC):
             )
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception as notify_err:
-                logger.error(
-                    "[%s] Failed to send error notification to user: %s",
-                    self.name, notify_err, exc_info=True,
-                )  # Last resort — don't let error reporting crash the handler
+            # Once Hook authority owns this delivery, any ordinary error send
+            # would be an unauthorized second provider attempt.
+            if not authority_delivery_owned:
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception as notify_err:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name, notify_err, exc_info=True,
+                    )  # Last resort — don't let error reporting crash the handler
         finally:
             await _settle_recovery_delivery(
                 delivered=False, reason="recovered_delivery_not_confirmed"

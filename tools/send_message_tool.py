@@ -554,8 +554,10 @@ def _handle_send(args, *, after_send=None):
     try:
         from gateway.outbound_boundary import (
             build_outbound_context,
+            execute_authorized_outbound_send,
             outbound_after_send_sync,
             outbound_before_send_sync,
+            profile_id_from_home,
             send_result_payload,
         )
 
@@ -577,18 +579,15 @@ def _handle_send(args, *, after_send=None):
             except Exception:
                 outbound_hooks = None
 
+        active_profile_home = get_hermes_home()
         boundary_context = build_outbound_context(
             source_kind="send_message",
             content=message,
             platform=platform_name,
             chat_id=chat_id,
             thread_id=thread_id,
-            profile_id=(
-                str(args.get("profile_id") or "")
-                if "profile_id" in args
-                else None
-            ),
-            profile_path=str(get_hermes_home()),
+            profile_id=profile_id_from_home(active_profile_home),
+            profile_path=str(active_profile_home),
             producer_id="send_message",
             target={
                 "transport_id": platform_name,
@@ -628,6 +627,17 @@ def _handle_send(args, *, after_send=None):
         )
         media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
         boundary_context["content"] = cleaned_message
+        strict_transport = trusted_request is not None or isinstance(
+            getattr(boundary_decision, "delivery_authority", None),
+            dict,
+        )
+        if strict_transport:
+            if media_files or not cleaned_message.strip():
+                return json.dumps(
+                    _error(
+                        "Trusted outbound delivery authority requires one non-empty text send"
+                    )
+                )
         mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
     except Exception as exc:
         return json.dumps(_error(f"Outbound boundary failed: {exc}"))
@@ -679,17 +689,51 @@ def _handle_send(args, *, after_send=None):
 
     try:
         from model_tools import _run_async
-        result = _run_async(
-            _send_to_platform(
-                platform,
-                pconfig,
-                chat_id,
-                cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
+        authority_execution = None
+        if isinstance(getattr(boundary_decision, "delivery_authority", None), dict):
+            authority_execution = _run_async(
+                execute_authorized_outbound_send(
+                    hooks=outbound_hooks,
+                    context=boundary_context,
+                    decision=boundary_decision,
+                    send=lambda: _send_authorized_to_platform(
+                        platform,
+                        pconfig,
+                        chat_id,
+                        cleaned_message,
+                        thread_id=thread_id,
+                        transport_request_id=boundary_decision.delivery_authority[
+                            "request"
+                        ]["request_id"],
+                    ),
+                )
             )
-        )
+            result = authority_execution.result
+        elif trusted_commit is not None:
+            result = _run_async(
+                _send_authorized_to_platform(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    cleaned_message,
+                    thread_id=thread_id,
+                    transport_request_id=trusted_commit["request"]["request_id"],
+                )
+            )
+        else:
+            result = _run_async(
+                _send_to_platform(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    cleaned_message,
+                    thread_id=thread_id,
+                    media_files=media_files,
+                    force_document=force_document_attachments,
+                )
+            )
+        if trusted_commit is not None or authority_execution is not None:
+            result = send_result_payload(result)
         transport_receipt = None
         if trusted_commit is not None:
             from gateway.transport_outbox import (
@@ -699,10 +743,6 @@ def _handle_send(args, *, after_send=None):
             )
 
             request_id = str(trusted_commit["request"]["request_id"])
-            result = dict(result) if isinstance(result, dict) else {
-                "success": False,
-                "error": "Transport returned an invalid result",
-            }
             outcome = classify_transport_outcome(result)
             try:
                 transport_receipt = commit_transport_receipt(
@@ -741,7 +781,22 @@ def _handle_send(args, *, after_send=None):
                         warnings = list(result.get("warnings", []))
                         warnings.append(f"after-send callback failed: {exc}")
                         result["warnings"] = warnings
-        if isinstance(result, dict) and result.get("success"):
+        if (
+            authority_execution is not None
+            and isinstance(result, dict)
+        ):
+            result["transport_request_id"] = authority_execution.request["request_id"]
+            if authority_execution.receipt is not None:
+                result["transport_receipt_id"] = authority_execution.receipt["receipt_id"]
+                result["transport_receipt"] = authority_execution.receipt
+            result["transport_outcome"] = authority_execution.outcome
+            if authority_execution.outcome != "confirmed":
+                result["success"] = False
+        if (
+            authority_execution is None
+            and isinstance(result, dict)
+            and result.get("success")
+        ):
             try:
                 boundary_send_payload = send_result_payload(result)
                 outbound_after_send_sync(
@@ -982,6 +1037,72 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
             "its final response to that same target. Put the intended user-facing content in "
             "your final response instead, or use a different target if you want an additional message."
         ),
+    }
+
+
+async def _send_authorized_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    content,
+    *,
+    thread_id=None,
+    transport_request_id: str,
+):
+    """Use only a live adapter's strict single-attempt authority seam."""
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(platform) if runner is not None else None
+    except Exception:
+        adapter = None
+    if adapter is not None:
+        if getattr(adapter, "supports_transport_authority", False) is not True:
+            return {
+                "success": False,
+                "error": "adapter does not support strict transport authority",
+            }
+        metadata = {"thread_id": thread_id} if thread_id else None
+        result = await adapter.send_authorized(
+            chat_id,
+            content,
+            metadata=metadata,
+            transport_request_id=transport_request_id,
+        )
+    else:
+        try:
+            from gateway.platform_registry import platform_registry
+
+            platform_name = platform.value if hasattr(platform, "value") else str(platform)
+            entry = platform_registry.get(platform_name)
+        except Exception:
+            entry = None
+        strict_sender = (
+            getattr(entry, "standalone_authorized_sender_fn", None)
+            if entry is not None
+            else None
+        )
+        if not callable(strict_sender):
+            return {
+                "success": False,
+                "error": "strict transport authority requires a conforming adapter",
+            }
+        result = await strict_sender(
+            pconfig,
+            chat_id,
+            content,
+            thread_id=thread_id,
+            transport_request_id=transport_request_id,
+        )
+    if isinstance(result, dict):
+        return result
+    return {
+        "success": bool(getattr(result, "success", False)),
+        "message_id": getattr(result, "message_id", None),
+        "error": getattr(result, "error", None),
+        "raw_response": getattr(result, "raw_response", None),
+        "transport_outcome": getattr(result, "transport_outcome", None),
     }
 
 

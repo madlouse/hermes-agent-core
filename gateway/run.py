@@ -558,6 +558,7 @@ def _operator_enforce_outbound_boundary_for_source(
             decision.reason,
         )
         return False, "", context
+    context["_boundary_decision"] = decision
     return True, decision.content or content, context
 
 
@@ -580,8 +581,10 @@ def _operator_enforce_outbound_after_send(
         )
         return
     payload = send_result_payload(send_result)
+    public_context = dict(context)
+    public_context.pop("_boundary_decision", None)
     evidence = {
-        **context,
+        **public_context,
         "send_result": payload,
         "source_outbox_id": (
             payload.get("outbox_id")
@@ -600,6 +603,98 @@ def _operator_enforce_outbound_after_send(
             "Outbound after-send audit failed after delivery: %s",
             exc,
         )
+
+
+def _send_screened_gateway_notice(
+    hooks: Any,
+    context: dict[str, Any],
+    decision: Any,
+    send: Callable[[], Any],
+) -> Any:
+    """Send one screened notice through the trusted authority path when present."""
+    if isinstance(getattr(decision, "delivery_authority", None), dict):
+        from gateway.outbound_boundary import execute_authorized_outbound_send_sync
+
+        context = {**context, "content": decision.content}
+        return execute_authorized_outbound_send_sync(
+            hooks=hooks,
+            context=context,
+            decision=decision,
+            send=send,
+        ).result
+    result = send()
+    if getattr(result, "success", False):
+        _operator_enforce_outbound_after_send(hooks, context, result)
+    return result
+
+
+def _send_gateway_approval_text(ctx: Any, message: str, decision: Any) -> Any:
+    from agent.async_utils import safe_schedule_threadsafe
+
+    authority = getattr(decision, "delivery_authority", None)
+    if isinstance(authority, dict):
+        request_id = authority["request"]["request_id"]
+        send_coro = ctx._status_adapter.send_authorized(
+            ctx._status_chat_id,
+            message,
+            metadata=ctx._status_thread_metadata,
+            transport_request_id=request_id,
+        )
+    else:
+        send_coro = ctx._status_adapter.send(
+            ctx._status_chat_id,
+            message,
+            metadata=ctx._status_thread_metadata,
+        )
+    send_future = safe_schedule_threadsafe(
+        send_coro,
+        ctx._loop_for_step,
+        logger=logger,
+        log_message="Approval text-send scheduling error",
+    )
+    if send_future is None:
+        send_coro.close()
+        raise RuntimeError("Approval text-send loop unavailable")
+    return send_future.result(timeout=15)
+
+
+async def _send_queued_first_response(
+    *,
+    adapter: Any,
+    source: Any,
+    content: str,
+    metadata: Any,
+    hooks: Any,
+    context: dict[str, Any] | None,
+    decision: Any,
+) -> None:
+    if decision is not None and isinstance(
+        getattr(decision, "delivery_authority", None), dict
+    ):
+        from gateway.outbound_boundary import execute_authorized_outbound_send
+
+        context = dict(context or {})
+        context["content"] = content
+        await execute_authorized_outbound_send(
+            hooks=hooks,
+            context=context,
+            decision=decision,
+            send=lambda: adapter.send_authorized(
+                source.chat_id,
+                content,
+                metadata=metadata,
+                transport_request_id=decision.delivery_authority["request"][
+                    "request_id"
+                ],
+            ),
+        )
+        return
+    send_result = await adapter.send(
+        source.chat_id,
+        content,
+        metadata=metadata,
+    )
+    _operator_enforce_outbound_after_send(hooks, context, send_result)
 
 
 def _non_conversational_metadata(
@@ -5439,6 +5534,9 @@ class TurnRunner:
                 is not None
                 and approval_decision.decision == "allow"
                 and approval_decision.content == approval_text
+                and not isinstance(
+                    getattr(approval_decision, "delivery_authority", None), dict
+                )
             ):
                 try:
                     _approval_fut = safe_schedule_threadsafe(
@@ -5481,24 +5579,19 @@ class TurnRunner:
             # Slack threads and reserved by Matrix clients.
             msg = approval_decision.content
             try:
-                _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
-                        ctx._status_chat_id,
+                def _send_approval_text():  # pragma: no cover - tested via helper
+                    return _send_gateway_approval_text(
+                        ctx,
                         msg,
-                        metadata=ctx._status_thread_metadata,
-                    ),
-                    ctx._loop_for_step,
-                    logger=logger,
-                    log_message="Approval text-send scheduling error",
+                        approval_decision,
+                    )
+
+                _send_screened_gateway_notice(  # pragma: no cover - tested via helper
+                    approval_hooks,
+                    approval_context,
+                    approval_decision,
+                    _send_approval_text,
                 )
-                if _approval_send_fut is not None:
-                    _approval_result = _approval_send_fut.result(timeout=15)
-                    if getattr(_approval_result, "success", False):
-                        _operator_enforce_outbound_after_send(
-                            approval_hooks,
-                            approval_context,
-                            _approval_result,
-                        )
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
 
@@ -18481,7 +18574,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
-            # Auto voice reply: send TTS audio before the text response
+            # Auto voice reply is deferred to BasePlatformAdapter, after the
+            # shared outbound boundary has allowed or rewritten final bytes.
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
             _stts_adapter = self._adapter_for_source(source)
@@ -18489,11 +18583,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _stts_adapter is not None
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
-            if (
-                not _streaming_tts_done
-                and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
-            ):
-                await self._send_voice_reply(event, response)
+            self._defer_auto_voice_reply(
+                event,
+                response,
+                agent_messages,
+                already_sent=_already_sent,
+                streaming_tts_done=_streaming_tts_done,
+            )
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -19526,6 +19622,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if is_voice_input and not already_sent:
             return False
 
+        return True
+
+    def _defer_auto_voice_reply(
+        self,
+        event: MessageEvent,
+        response: str,
+        agent_messages: list,
+        *,
+        already_sent: bool,
+        streaming_tts_done: bool,
+    ) -> bool:
+        if streaming_tts_done or not self._should_send_voice_reply(
+            event,
+            response,
+            agent_messages,
+            already_sent=already_sent,
+        ):
+            return False
+        setattr(event, "_hermes_auto_voice_reply_requested", True)
         return True
 
     def _should_echo_stt_transcripts(self) -> bool:
@@ -25951,15 +26066,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                     session_key or "?",
                                 )
-                                _first_send_result = await adapter.send(
-                                    source.chat_id,
-                                    first_response,
-                                    metadata=_status_thread_metadata,
+                                _boundary_decision = (  # pragma: no cover - thin integration wrapper
+                                    _boundary_context.pop("_boundary_decision", None)
+                                    if _boundary_context is not None
+                                    else None
                                 )
-                                _operator_enforce_outbound_after_send(
-                                    getattr(self, "hooks", None),
-                                    _boundary_context,
-                                    _first_send_result,
+                                await _send_queued_first_response(  # pragma: no cover - tested via helper
+                                    adapter=adapter,
+                                    source=source,
+                                    content=first_response,
+                                    metadata=_status_thread_metadata,
+                                    hooks=getattr(self, "hooks", None),
+                                    context=_boundary_context,
+                                    decision=_boundary_decision,
                                 )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)

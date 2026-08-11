@@ -1738,6 +1738,34 @@ class TestVoiceTTSPlayback:
         runner = self._make_runner()
         assert self._call_should_reply(runner, "all", MessageType.TEXT, already_sent=False) is True
 
+    def test_voice_all_defers_text_reply_on_event_for_boundary_delivery(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session import SessionSource
+
+        runner = self._make_runner()
+        runner._voice_mode["discord:ch1"] = "all"
+        event = MessageEvent(
+            source=SessionSource(
+                platform=Platform.DISCORD,
+                chat_id="ch1",
+                user_id="1",
+                user_name="test",
+                chat_type="channel",
+            ),
+            text="test",
+            message_type=MessageType.TEXT,
+        )
+
+        assert runner._defer_auto_voice_reply(
+            event,
+            "final response",
+            [],
+            already_sent=False,
+            streaming_tts_done=False,
+        ) is True
+        assert event._hermes_auto_voice_reply_requested is True
+
 
     def test_error_response_no_tts(self):
         """Error response: no TTS regardless of voice_mode."""
