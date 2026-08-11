@@ -69,7 +69,10 @@ def test_real_cli_send_recover_and_duplicate_suppress_transport(
     final_transport = AsyncMock(
         return_value={"success": True, "message_id": "om_cli_native"}
     )
-    monkeypatch.setattr("tools.send_message_tool._send_to_platform", final_transport)
+    monkeypatch.setattr(
+        "tools.send_message_tool._send_authorized_to_platform",
+        final_transport,
+    )
     request = {
         "request_id": "request-cli-e2e",
         "profile_id": "atlas",
