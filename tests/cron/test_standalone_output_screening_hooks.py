@@ -423,7 +423,7 @@ def test_same_profile_waiter_cannot_consume_replacement_registry(
     assert not first.is_alive()
     assert not second.is_alive()
     assert results == {"first": None, "second": None}
-    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
 def test_same_profile_waiter_rejects_replaced_then_restored_claim(
@@ -458,10 +458,9 @@ def test_same_profile_waiter_rejects_replaced_then_restored_claim(
     assert waiter_entered.wait(timeout=2)
 
     with scheduler._standalone_outbound_hooks_lock:
-        scheduler._standalone_outbound_hook_registries[profile] = replacement
-        with pytest.raises(ValueError, match="authority is immutable"):
-            scheduler._standalone_outbound_hook_registries[profile] = token
-    assert token.revoked is True
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries[profile] = replacement
+    assert token.revoked is False
 
     release_lookup.set()
     first.join(timeout=2)
@@ -469,8 +468,8 @@ def test_same_profile_waiter_rejects_replaced_then_restored_claim(
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert results == {"first": None, "second": None}
-    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+    assert results == {"first": live_hooks, "second": live_hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: live_hooks}
 
 
 def test_same_profile_waiter_rejects_sentinel_then_restored_claim(
@@ -504,12 +503,11 @@ def test_same_profile_waiter_rejects_sentinel_then_restored_claim(
     assert waiter_entered.wait(timeout=2)
 
     with scheduler._standalone_outbound_hooks_lock:
-        scheduler._standalone_outbound_hook_registries[profile] = (
-            scheduler._UNRESOLVED_OUTBOUND_HOOK_RESULT
-        )
-        with pytest.raises(ValueError, match="authority is immutable"):
-            scheduler._standalone_outbound_hook_registries[profile] = token
-    assert token.revoked is True
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries[profile] = (
+                scheduler._UNRESOLVED_OUTBOUND_HOOK_RESULT
+            )
+    assert token.revoked is False
 
     release_lookup.set()
     first.join(timeout=2)
@@ -517,10 +515,8 @@ def test_same_profile_waiter_rejects_sentinel_then_restored_claim(
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert results == {"first": None, "second": None}
-    assert scheduler._standalone_outbound_hook_registries == {
-        profile: scheduler._UNRESOLVED_OUTBOUND_HOOK_RESULT
-    }
+    assert results == {"first": live_hooks, "second": live_hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: live_hooks}
 
 
 def test_registry_store_reinitialization_revokes_unresolved_claim(tmp_path):
@@ -556,6 +552,8 @@ def test_registry_store_has_no_dict_base_mutation_bypass(tmp_path):
 
     with pytest.raises(TypeError):
         dict.update(store, {profile_b: object()})
+    with pytest.raises(AttributeError):
+        store._data = {profile_b: object()}
 
     assert token.revoked is False
     assert store == {profile_a: token}
@@ -568,24 +566,9 @@ def test_registry_store_serializes_claim_publish_with_cross_profile_write(tmp_pa
     hooks_a = object()
     hooks_b = object()
     store = scheduler._OutboundHookRegistryStore({profile_a: token})
-    publish_checked = threading.Event()
-    continue_publish = threading.Event()
     mutation_started = threading.Event()
     mutation_finished = threading.Event()
     results = {}
-
-    class BlockingGet(dict):
-        def get(self, key, default=None):
-            result = super().get(key, default)
-            if key == profile_a and threading.current_thread().name == "publisher":
-                publish_checked.set()
-                assert continue_publish.wait(timeout=2)
-            return result
-
-    store._data = BlockingGet(store._data)
-
-    def publish():
-        results["publish"] = store._resolve_claim(profile_a, token, hooks_a)
 
     def mutate():
         mutation_started.set()
@@ -596,17 +579,13 @@ def test_registry_store_serializes_claim_publish_with_cross_profile_write(tmp_pa
         finally:
             mutation_finished.set()
 
-    publisher = threading.Thread(target=publish, name="publisher")
     mutation = threading.Thread(target=mutate, name="mutation")
-    publisher.start()
-    assert publish_checked.wait(timeout=2)
-    mutation.start()
-    assert mutation_started.wait(timeout=2)
-    continue_publish.set()
-    publisher.join(timeout=2)
+    with store.lock:
+        mutation.start()
+        assert mutation_started.wait(timeout=2)
+        results["publish"] = store._resolve_claim(profile_a, token, hooks_a)
     mutation.join(timeout=2)
 
-    assert not publisher.is_alive()
     assert not mutation.is_alive()
     assert mutation_finished.is_set()
     assert results == {
@@ -659,7 +638,7 @@ def test_published_claim_blocks_reset_until_waiter_consumes(monkeypatch, tmp_pat
     release_lookup.set()
     assert waiter_woke.wait(timeout=2)
 
-    with pytest.raises(ValueError, match="pending waiters"):
+    with pytest.raises(ValueError, match="active waiters"):
         scheduler._standalone_outbound_hook_registries.clear()
     results["late"] = _load_with_profile_override(profile_a)
     results["profile-b"] = _load_with_profile_override(profile_b)
@@ -810,7 +789,7 @@ def test_waiter_consume_control_signal_does_not_strand_published_result(
 
     monkeypatch.setattr(token.done, "wait", release_then_wait)
     monkeypatch.setattr(
-        scheduler._standalone_outbound_hook_registries,
+        scheduler._OutboundHookRegistryStore,
         "_consume_waiter",
         MagicMock(side_effect=KeyboardInterrupt),
     )
@@ -824,7 +803,7 @@ def test_waiter_consume_control_signal_does_not_strand_published_result(
     assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
 
 
-def test_same_profile_waiter_rejects_cross_profile_store_mutation(
+def test_active_waiter_rejects_cross_profile_store_mutation_without_revocation(
     monkeypatch, tmp_path
 ):
     profile_a = tmp_path / "profile-a"
@@ -857,9 +836,9 @@ def test_same_profile_waiter_rejects_cross_profile_store_mutation(
     assert waiter_entered.wait(timeout=2)
 
     with scheduler._standalone_outbound_hooks_lock:
-        with pytest.raises(ValueError, match="already bound"):
+        with pytest.raises(ValueError, match="active waiters"):
             scheduler._standalone_outbound_hook_registries[profile_b] = hooks_b
-    assert token.revoked is True
+    assert token.revoked is False
 
     release_lookup.set()
     first.join(timeout=2)
@@ -867,8 +846,8 @@ def test_same_profile_waiter_rejects_cross_profile_store_mutation(
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert results == {"first": None, "second": None}
-    assert scheduler._standalone_outbound_hook_registries == {profile_a: None}
+    assert results == {"first": hooks_a, "second": hooks_a}
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: hooks_a}
 
 
 def test_hook_discovery_reentry_fails_closed_without_deadlock(monkeypatch, tmp_path):

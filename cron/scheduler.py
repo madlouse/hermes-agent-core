@@ -2621,7 +2621,9 @@ _MISSING_OUTBOUND_HOOK_REGISTRY = object()
 
 
 class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
-    """Serialize ordinary mutations and exact claim publication."""
+    """One lock-owned Profile authority projected as a mapping."""
+
+    __slots__ = ("_lock", "_profile", "_state")
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         initial = dict(*args, **kwargs)
@@ -2629,33 +2631,18 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             raise ValueError("Outbound Hook registry store accepts one Profile")
         if not hasattr(self, "_lock"):
             self._lock = threading.RLock()
-            self._data: dict[Path, Any | None] = {}
+            self._profile: Path | None = None
+            self._state: Any = _MISSING_OUTBOUND_HOOK_REGISTRY
         with self._lock:
-            self._revoke_all_claims_locked()
-            self._data.clear()
-            self._data.update(initial)
+            self._prepare_mutation_locked()
+            self._profile = None
+            self._state = _MISSING_OUTBOUND_HOOK_REGISTRY
+            if initial:
+                self._profile, self._state = next(iter(initial.items()))
 
     @property
     def lock(self):
         return self._lock
-
-    @staticmethod
-    def _revoke(value: Any) -> None:
-        if isinstance(value, _UnresolvedOutboundHooks):
-            value.revoked = True
-
-    def _revoke_all_claims_locked(self) -> None:
-        self._finalize_abandoned_waiters_locked()
-        pending = [
-            value
-            for value in self._data.values()
-            if isinstance(value, _UnresolvedOutboundHooks)
-            and value.result is not _UNRESOLVED_OUTBOUND_HOOK_RESULT
-        ]
-        if pending:
-            raise ValueError("Outbound Hook registry result has pending waiters")
-        for value in self._data.values():
-            self._revoke(value)
 
     def _active_waiters_locked(
         self,
@@ -2673,53 +2660,72 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         key: Path,
         claim_token: _UnresolvedOutboundHooks,
     ) -> None:
-        if self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
+        if self._profile != key or self._state is not claim_token:
             return
         if self._active_waiters_locked(claim_token):
             return
         result = claim_token.result
         if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT:
             return
-        self._data[key] = None if claim_token.revoked else result
+        self._state = None if claim_token.revoked else result
 
-    def _finalize_abandoned_waiters_locked(self) -> None:
-        for key, value in tuple(self._data.items()):
-            if isinstance(value, _UnresolvedOutboundHooks):
-                self._finalize_claim_locked(key, value)
+    def _prepare_mutation_locked(self) -> None:
+        if not isinstance(self._state, _UnresolvedOutboundHooks):
+            return
+        claim_token = self._state
+        self._finalize_claim_locked(self._profile, claim_token)
+        if self._state is not claim_token:
+            return
+        if self._active_waiters_locked(claim_token):
+            raise ValueError("Outbound Hook registry claim has active waiters")
+        claim_token.revoked = True
 
     def __getitem__(self, key: Path) -> Any | None:
         with self._lock:
-            return self._data[key]
+            if key != self._profile or self._state is _MISSING_OUTBOUND_HOOK_REGISTRY:
+                raise KeyError(key)
+            return self._state
 
     def __setitem__(self, key: Path, value: Any | None) -> None:
         with self._lock:
-            self._revoke_all_claims_locked()
-            if self._data and key not in self._data:
+            self._prepare_mutation_locked()
+            if self._profile is not None and key != self._profile:
                 raise ValueError("Outbound Hook registry store is already bound")
-            current = self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY)
-            if current is not _MISSING_OUTBOUND_HOOK_REGISTRY and not isinstance(
-                current,
+            if self._state is not _MISSING_OUTBOUND_HOOK_REGISTRY and not isinstance(
+                self._state,
                 _UnresolvedOutboundHooks,
             ):
                 raise ValueError("Outbound Hook registry authority is immutable")
-            self._data[key] = value
+            self._profile = key
+            self._state = value
 
     def __delitem__(self, key: Path) -> None:
         with self._lock:
-            self._revoke_all_claims_locked()
-            del self._data[key]
+            self._prepare_mutation_locked()
+            if key != self._profile or self._state is _MISSING_OUTBOUND_HOOK_REGISTRY:
+                raise KeyError(key)
+            self._profile = None
+            self._state = _MISSING_OUTBOUND_HOOK_REGISTRY
 
     def __iter__(self) -> Iterator[Path]:
         with self._lock:
-            return iter(tuple(self._data))
+            if self._profile is None or self._state is _MISSING_OUTBOUND_HOOK_REGISTRY:
+                return iter(())
+            return iter((self._profile,))
 
     def __len__(self) -> int:
         with self._lock:
-            return len(self._data)
+            return int(
+                self._profile is not None
+                and self._state is not _MISSING_OUTBOUND_HOOK_REGISTRY
+            )
 
     def __contains__(self, key: object) -> bool:
         with self._lock:
-            return key in self._data
+            return (
+                key == self._profile
+                and self._state is not _MISSING_OUTBOUND_HOOK_REGISTRY
+            )
 
     def _resolve_claim(
         self,
@@ -2729,7 +2735,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     ) -> bool:
         """Publish success only for the exact active claim."""
         with self._lock:
-            if self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
+            if self._profile != key or self._state is not claim_token:
                 return False
             if claim_token.revoked:
                 return False
@@ -2745,7 +2751,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     ) -> bool:
         """Terminalize an exact claim without treating cleanup as replacement."""
         with self._lock:
-            if self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
+            if self._profile != key or self._state is not claim_token:
                 return False
             claim_token.result = None
             claim_token.done.set()
