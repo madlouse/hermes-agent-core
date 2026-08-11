@@ -201,6 +201,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT:
                 result = None
                 claim_token.result = None
+                self.__generation += 1
             self._finalize_claim_locked(key, claim_token)
             return result, revoked
 

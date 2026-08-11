@@ -808,6 +808,24 @@ def test_reentrant_update_rejects_revision_aba(tmp_path):
     assert store == {profile_a: second_token}
 
 
+def test_waiter_terminalization_increments_authority_revision(tmp_path):
+    profile = tmp_path / "profile"
+    token = scheduler._UnresolvedOutboundHooks()
+    first_waiter = scheduler._OutboundHookWaiter()
+    second_waiter = scheduler._OutboundHookWaiter()
+    token.waiters.update({first_waiter, second_waiter})
+    token.done.set()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+    revision_before = store._OutboundHookRegistryStore__generation
+
+    assert store._consume_waiter(profile, token, first_waiter) == (None, False)
+    assert store._OutboundHookRegistryStore__generation == revision_before + 1
+    assert store[profile] is token
+    assert store._consume_waiter(profile, token, second_waiter) == (None, False)
+    assert store == {profile: None}
+
+
 def test_direct_file_alias_reuses_canonical_process_authority(tmp_path):
     scheduler._standalone_outbound_hook_registries.clear()
     spec = importlib.util.spec_from_file_location(
@@ -1582,6 +1600,18 @@ def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
     lock_held = threading.Event()
     release_lock = threading.Event()
     lookup_started = threading.Event()
+    failure_publish_started = threading.Event()
+    original_fail_claim = scheduler._fail_outbound_hook_claim
+
+    def observed_fail_claim(*args, **kwargs):
+        failure_publish_started.set()
+        return original_fail_claim(*args, **kwargs)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_fail_outbound_hook_claim",
+        observed_fail_claim,
+    )
 
     def hold_lock():
         with scheduler._standalone_outbound_hooks_lock:
@@ -1598,13 +1628,19 @@ def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
 
     monkeypatch.setattr("gateway.run._gateway_runner_ref", fail_with_lock_held)
     result = []
-    worker = threading.Thread(
-        target=lambda: result.append(_load_with_profile_override(profile))
-    )
+    worker_completed = threading.Event()
+
+    def run_worker():
+        try:
+            result.append(_load_with_profile_override(profile))
+        finally:
+            worker_completed.set()
+
+    worker = threading.Thread(target=run_worker)
     worker.start()
     assert lookup_started.wait(timeout=2)
-    worker.join(timeout=0.1)
-    assert worker.is_alive()
+    assert failure_publish_started.wait(timeout=2)
+    assert not worker_completed.is_set()
 
     release_lock.set()
     holder.join(timeout=2)
@@ -1612,6 +1648,7 @@ def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
 
     assert not holder.is_alive()
     assert not worker.is_alive()
+    assert worker_completed.is_set()
     assert result == [None]
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
