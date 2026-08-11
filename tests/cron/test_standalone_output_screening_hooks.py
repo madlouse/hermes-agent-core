@@ -548,6 +548,50 @@ def test_discovery_control_signal_does_not_wait_for_held_cleanup_lock(
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
+def test_direct_standalone_lock_signal_marks_claim_done(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    original_lock = scheduler._standalone_outbound_hooks_lock
+
+    class InterruptSecondEntry:
+        def __init__(self):
+            self.entries = 0
+
+        def __enter__(self):
+            self.entries += 1
+            if self.entries == 2:
+                raise KeyboardInterrupt
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            original_lock.release()
+
+        def acquire(self, blocking=True):
+            return original_lock.acquire(blocking)
+
+        def release(self):
+            original_lock.release()
+
+    interrupting_lock = InterruptSecondEntry()
+    monkeypatch.setattr(
+        scheduler,
+        "_standalone_outbound_hooks_lock",
+        interrupting_lock,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        scheduler._standalone_outbound_hooks(profile_home=profile)
+
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
+
+    monkeypatch.setattr(scheduler, "_standalone_outbound_hooks_lock", original_lock)
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
 def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
     monkeypatch, tmp_path
 ):

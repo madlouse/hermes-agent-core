@@ -2699,11 +2699,13 @@ def _standalone_outbound_hooks(
         if not isinstance(claimed, _UnresolvedOutboundHooks):
             return claimed
         claim_token = claimed
-    with _standalone_outbound_hooks_lock:
-        cached = _standalone_outbound_hook_registries.get(profile_home)
-        if cached is not claim_token:
-            raise ValueError("Standalone Cron Profile Hook registry ownership changed")
     try:
+        with _standalone_outbound_hooks_lock:
+            cached = _standalone_outbound_hook_registries.get(profile_home)
+            if cached is not claim_token:
+                raise ValueError(
+                    "Standalone Cron Profile Hook registry ownership changed"
+                )
         try:
             from gateway.hooks import HookRegistry
 
