@@ -2606,8 +2606,15 @@ class _UnresolvedOutboundHooks:
         self.owner_thread_id = threading.get_ident()
         self.result: Any = _UNRESOLVED_OUTBOUND_HOOK_RESULT
         self.revoked = False
-        self.waiter_count = 0
+        self.waiters: set[_OutboundHookWaiter] = set()
         self.done = threading.Event()
+
+
+class _OutboundHookWaiter:
+    """Thread-safe cancellation marker for one same-Profile waiter."""
+
+    def __init__(self) -> None:
+        self.abandoned = threading.Event()
 
 
 _MISSING_OUTBOUND_HOOK_REGISTRY = object()
@@ -2617,15 +2624,15 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     """Serialize ordinary mutations and exact claim publication."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        initial = dict(*args, **kwargs)
+        if len(initial) > 1:
+            raise ValueError("Outbound Hook registry store accepts one Profile")
         if not hasattr(self, "_lock"):
             self._lock = threading.RLock()
             self._data: dict[Path, Any | None] = {}
         with self._lock:
             self._revoke_all_claims_locked()
             self._data.clear()
-            initial = dict(*args, **kwargs)
-            if len(initial) > 1:
-                raise ValueError("Outbound Hook registry store accepts one Profile")
             self._data.update(initial)
 
     @property
@@ -2638,6 +2645,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             value.revoked = True
 
     def _revoke_all_claims_locked(self) -> None:
+        self._finalize_abandoned_waiters_locked()
         pending = [
             value
             for value in self._data.values()
@@ -2648,6 +2656,36 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             raise ValueError("Outbound Hook registry result has pending waiters")
         for value in self._data.values():
             self._revoke(value)
+
+    def _active_waiters_locked(
+        self,
+        claim_token: _UnresolvedOutboundHooks,
+    ) -> set[_OutboundHookWaiter]:
+        claim_token.waiters = {
+            waiter
+            for waiter in claim_token.waiters
+            if not waiter.abandoned.is_set()
+        }
+        return claim_token.waiters
+
+    def _finalize_claim_locked(
+        self,
+        key: Path,
+        claim_token: _UnresolvedOutboundHooks,
+    ) -> None:
+        if self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY) is not claim_token:
+            return
+        if self._active_waiters_locked(claim_token):
+            return
+        result = claim_token.result
+        if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT:
+            return
+        self._data[key] = None if claim_token.revoked else result
+
+    def _finalize_abandoned_waiters_locked(self) -> None:
+        for key, value in tuple(self._data.items()):
+            if isinstance(value, _UnresolvedOutboundHooks):
+                self._finalize_claim_locked(key, value)
 
     def __getitem__(self, key: Path) -> Any | None:
         with self._lock:
@@ -2697,8 +2735,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
                 return False
             claim_token.result = result
             claim_token.done.set()
-            if claim_token.waiter_count == 0:
-                self._data[key] = result
+            self._finalize_claim_locked(key, claim_token)
             return True
 
     def _fail_claim(
@@ -2712,51 +2749,49 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
                 return False
             claim_token.result = None
             claim_token.done.set()
-            if claim_token.waiter_count == 0:
-                self._data[key] = None
+            self._finalize_claim_locked(key, claim_token)
             return True
 
     def _consume_waiter(
         self,
         key: Path,
         claim_token: _UnresolvedOutboundHooks,
+        waiter: _OutboundHookWaiter,
     ) -> tuple[Any, bool]:
         """Consume one registered waiter and finalize its published result."""
         with self._lock:
-            if claim_token.waiter_count <= 0:
+            if waiter not in claim_token.waiters:
                 raise RuntimeError("Outbound Hook claim waiter count underflow")
-            claim_token.waiter_count -= 1
+            claim_token.waiters.remove(waiter)
             result = claim_token.result
             revoked = claim_token.revoked
             if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT:
                 result = None
                 claim_token.result = None
-            if (
-                self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY)
-                is claim_token
-                and claim_token.waiter_count == 0
-            ):
-                self._data[key] = None if revoked else result
+            self._finalize_claim_locked(key, claim_token)
             return result, revoked
 
-    def _abandon_waiter(
+    def _abandon_waiter_during_control_signal(
         self,
         key: Path,
         claim_token: _UnresolvedOutboundHooks,
+        waiter: _OutboundHookWaiter,
     ) -> None:
-        """Remove an interrupted waiter without stranding published authority."""
-        with self._lock:
-            if claim_token.waiter_count <= 0:
-                return
-            claim_token.waiter_count -= 1
-            result = claim_token.result
-            if (
-                self._data.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY)
-                is claim_token
-                and claim_token.waiter_count == 0
-                and result is not _UNRESOLVED_OUTBOUND_HOOK_RESULT
-            ):
-                self._data[key] = None if claim_token.revoked else result
+        """Publish waiter abandonment without delaying the original signal."""
+        waiter.abandoned.set()
+        try:
+            acquired = self._lock.acquire(False)
+        except BaseException:
+            return
+        if not acquired:
+            return
+        try:
+            self._finalize_claim_locked(key, claim_token)
+        finally:
+            try:
+                self._lock.release()
+            except BaseException:
+                pass
 
     def __ior__(self, other: Any) -> "_OutboundHookRegistryStore":
         self.update(other)
@@ -2779,12 +2814,13 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
     """Atomically bind the first selected Profile before any hook lookup."""
     published_token: _UnresolvedOutboundHooks | None = None
     wait_token: _UnresolvedOutboundHooks | None = None
+    waiter: _OutboundHookWaiter | None = None
     try:
         with _standalone_outbound_hooks_lock:
             if profile_home in _standalone_outbound_hook_registries:
                 cached = _standalone_outbound_hook_registries[profile_home]
                 if isinstance(cached, _UnresolvedOutboundHooks):
-                    if cached.revoked or cached.done.is_set():
+                    if cached.revoked:
                         _standalone_outbound_hook_registries._fail_claim(
                             profile_home,
                             cached,
@@ -2792,11 +2828,26 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
                         raise ValueError(
                             "Standalone Cron Profile Hook registry is unavailable"
                         )
+                    if cached.done.is_set():
+                        if cached.result is None:
+                            raise ValueError(
+                                "Standalone Cron Profile Hook registry is unavailable"
+                            )
+                        if cached.result is _UNRESOLVED_OUTBOUND_HOOK_RESULT:
+                            _standalone_outbound_hook_registries._fail_claim(
+                                profile_home,
+                                cached,
+                            )
+                            raise ValueError(
+                                "Standalone Cron Profile Hook registry is unavailable"
+                            )
+                        return cached.result
                     if cached.owner_thread_id == threading.get_ident():
                         raise ValueError(
                             "Standalone Cron Profile Hook registry is resolving"
                         )
-                    cached.waiter_count += 1
+                    waiter = _OutboundHookWaiter()
+                    cached.waiters.add(waiter)
                     wait_token = cached
                 elif cached is None:
                     raise ValueError(
@@ -2818,17 +2869,20 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
         raise
 
     assert wait_token is not None
+    assert waiter is not None
     try:
         wait_token.done.wait()
     except BaseException:
-        _standalone_outbound_hook_registries._abandon_waiter(
+        _standalone_outbound_hook_registries._abandon_waiter_during_control_signal(
             profile_home,
             wait_token,
+            waiter,
         )
         raise
     result, revoked = _standalone_outbound_hook_registries._consume_waiter(
         profile_home,
         wait_token,
+        waiter,
     )
     if revoked:
         raise ValueError("Standalone Cron Profile Hook registry ownership changed")
