@@ -503,12 +503,13 @@ def test_runner_control_signal_does_not_wait_for_held_cleanup_lock(
 
     token = scheduler._standalone_outbound_hook_registries[profile]
     assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
     release_lock.set()
     holder.join(timeout=2)
     assert not holder.is_alive()
     monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
     assert _load_with_profile_override(profile) is None
-    assert scheduler._standalone_outbound_hook_registries == {profile: token}
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
 def test_discovery_control_signal_does_not_wait_for_held_cleanup_lock(
@@ -539,11 +540,54 @@ def test_discovery_control_signal_does_not_wait_for_held_cleanup_lock(
 
     token = scheduler._standalone_outbound_hook_registries[profile]
     assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
     release_lock.set()
     holder.join(timeout=2)
     assert not holder.is_alive()
     assert _load_with_profile_override(profile) is None
-    assert scheduler._standalone_outbound_hook_registries == {profile: token}
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    lookup_started = threading.Event()
+
+    def hold_lock():
+        with scheduler._standalone_outbound_hooks_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock)
+
+    def fail_with_lock_held():
+        holder.start()
+        assert lock_held.wait(timeout=2)
+        lookup_started.set()
+        raise RuntimeError("runner failed")
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", fail_with_lock_held)
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(_load_with_profile_override(profile))
+    )
+    worker.start()
+    assert lookup_started.wait(timeout=2)
+    worker.join(timeout=0.1)
+    assert worker.is_alive()
+
+    release_lock.set()
+    holder.join(timeout=2)
+    worker.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert not worker.is_alive()
+    assert result == [None]
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
 def test_logging_failure_cannot_replace_fail_closed_result(monkeypatch, tmp_path):
