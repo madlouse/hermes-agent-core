@@ -232,6 +232,128 @@ def test_first_selected_profile_owns_before_gateway_lookup(monkeypatch, tmp_path
     assert scheduler._standalone_outbound_hook_registries == {profile_a: live_hooks}
 
 
+def test_same_profile_concurrent_lookup_reuses_first_registry(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    lookup_calls = []
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_calls.append(threading.current_thread().name)
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    second.start()
+    second.join(timeout=0.1)
+
+    assert second.is_alive()
+    assert lookup_calls == ["first"]
+
+    release_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": live_hooks, "second": live_hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: live_hooks}
+
+
+def test_same_profile_concurrent_lookup_shares_terminal_failure(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    lookup_calls = []
+    results = {}
+
+    def failing_runner_ref():
+        lookup_calls.append(threading.current_thread().name)
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        raise OSError("runner unavailable")
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", failing_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    second.start()
+    second.join(timeout=0.1)
+
+    assert second.is_alive()
+    assert lookup_calls == ["first"]
+
+    release_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": None, "second": None}
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_same_profile_waiter_cannot_consume_replacement_registry(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile / "hooks")
+    replacement = HookRegistry(profile / "replacement-hooks")
+    lookup_entered = threading.Event()
+    install_replacement = threading.Event()
+    results = {}
+
+    def replace_claim_before_return():
+        lookup_entered.set()
+        assert install_replacement.wait(timeout=2)
+        scheduler._standalone_outbound_hook_registries[profile] = replacement
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", replace_claim_before_return)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    second.start()
+    second.join(timeout=0.1)
+
+    assert second.is_alive()
+
+    install_replacement.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": None, "second": None}
+    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+
+
 def test_hook_discovery_reentry_fails_closed_without_deadlock(monkeypatch, tmp_path):
     profile = tmp_path / "profile"
     _write_screening_hook(profile)
