@@ -592,6 +592,56 @@ def test_direct_standalone_lock_signal_marks_claim_done(monkeypatch, tmp_path):
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
+@pytest.mark.parametrize("entrypoint", ("direct", "active"))
+def test_claim_lock_exit_signal_marks_published_claim_done(
+    monkeypatch, tmp_path, entrypoint
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    original_lock = scheduler._standalone_outbound_hooks_lock
+
+    class InterruptFirstExit:
+        def __init__(self):
+            self.exits = 0
+
+        def __enter__(self):
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            original_lock.release()
+            self.exits += 1
+            if self.exits == 1:
+                raise KeyboardInterrupt
+
+        def acquire(self, blocking=True):
+            return original_lock.acquire(blocking)
+
+        def release(self):
+            original_lock.release()
+
+    monkeypatch.setattr(
+        scheduler,
+        "_standalone_outbound_hooks_lock",
+        InterruptFirstExit(),
+    )
+    monkeypatch.setattr(scheduler, "get_hermes_home", lambda: profile)
+
+    with pytest.raises(KeyboardInterrupt):
+        if entrypoint == "direct":
+            scheduler._standalone_outbound_hooks(profile_home=profile)
+        else:
+            scheduler._active_outbound_hooks()
+
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
+
+    monkeypatch.setattr(scheduler, "_standalone_outbound_hooks_lock", original_lock)
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
 def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
     monkeypatch, tmp_path
 ):

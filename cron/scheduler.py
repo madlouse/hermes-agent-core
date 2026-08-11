@@ -2616,26 +2616,36 @@ def _warn_outbound_hook_failure(message: str, *args: Any, exc_info: bool = False
 
 def _claim_outbound_hook_profile(profile_home: Path) -> Any:
     """Atomically bind the first selected Profile before any hook lookup."""
-    with _standalone_outbound_hooks_lock:
-        if profile_home in _standalone_outbound_hook_registries:
-            cached = _standalone_outbound_hook_registries[profile_home]
-            if isinstance(cached, _UnresolvedOutboundHooks):
-                if cached.done.is_set():
-                    _standalone_outbound_hook_registries[profile_home] = None
+    published_token: _UnresolvedOutboundHooks | None = None
+    try:
+        with _standalone_outbound_hooks_lock:
+            if profile_home in _standalone_outbound_hook_registries:
+                cached = _standalone_outbound_hook_registries[profile_home]
+                if isinstance(cached, _UnresolvedOutboundHooks):
+                    if cached.done.is_set():
+                        _standalone_outbound_hook_registries[profile_home] = None
+                        raise ValueError(
+                            "Standalone Cron Profile Hook registry is unavailable"
+                        )
+                    raise ValueError(
+                        "Standalone Cron Profile Hook registry is resolving"
+                    )
+                if cached is None:
                     raise ValueError(
                         "Standalone Cron Profile Hook registry is unavailable"
                     )
-                raise ValueError("Standalone Cron Profile Hook registry is resolving")
-            if cached is None:
-                raise ValueError("Standalone Cron Profile Hook registry is unavailable")
-            return cached
-        if _standalone_outbound_hook_registries:
-            raise ValueError(
-                "Standalone Cron process is already bound to another Profile"
-            )
-        token = _UnresolvedOutboundHooks()
-        _standalone_outbound_hook_registries[profile_home] = token
-        return token
+                return cached
+            if _standalone_outbound_hook_registries:
+                raise ValueError(
+                    "Standalone Cron process is already bound to another Profile"
+                )
+            published_token = _UnresolvedOutboundHooks()
+            _standalone_outbound_hook_registries[profile_home] = published_token
+            return published_token
+    except BaseException:
+        if published_token is not None:
+            published_token.done.set()
+        raise
 
 
 def _bind_live_outbound_hooks(
