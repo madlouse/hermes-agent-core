@@ -73,11 +73,19 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         if not isinstance(self.__state, _UnresolvedOutboundHooks):
             return
         claim_token = self.__state
-        self._finalize_claim_locked(self.__profile, claim_token)
-        if self.__state is not claim_token:
-            return
         self._reject_active_waiters_locked()
         claim_token.revoked = True
+
+    def _normalize_abandoned_waiters_locked(self) -> bool:
+        previous = self.__state
+        if isinstance(self.__state, _UnresolvedOutboundHooks):
+            self._finalize_claim_locked(self.__profile, self.__state)
+        return self.__state is not previous
+
+    def _guard_mutation_start_locked(self) -> None:
+        if self._normalize_abandoned_waiters_locked():
+            raise ValueError("Outbound Hook registry authority was finalized")
+        self._reject_active_waiters_locked()
 
     def _reject_active_waiters_locked(self) -> None:
         if not isinstance(self.__state, _UnresolvedOutboundHooks):
@@ -96,7 +104,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             self._setitem_locked(key, value)
 
     def _setitem_locked(self, key: Path, value: Any | None) -> None:
-        self._reject_active_waiters_locked()
+        self._guard_mutation_start_locked()
         if key == self.__profile and self.__state is value:
             return
         if self.__profile is not None and key != self.__profile:
@@ -112,7 +120,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
 
     def __delitem__(self, key: Path) -> None:
         with self.__lock:
-            self._reject_active_waiters_locked()
+            self._guard_mutation_start_locked()
             if key != self.__profile or self.__state is _MISSING_OUTBOUND_HOOK_REGISTRY:
                 raise KeyError(key)
             self._prepare_mutation_locked()
@@ -150,6 +158,8 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
                 return False
             if claim_token.revoked:
                 return False
+            if claim_token.result is not _UNRESOLVED_OUTBOUND_HOOK_RESULT:
+                return False
             claim_token.result = result
             claim_token.done.set()
             self._finalize_claim_locked(key, claim_token)
@@ -162,6 +172,8 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     ) -> bool:
         with self.__lock:
             if self.__profile != key or self.__state is not claim_token:
+                return False
+            if claim_token.result is not _UNRESOLVED_OUTBOUND_HOOK_RESULT:
                 return False
             claim_token.result = None
             claim_token.done.set()
@@ -217,14 +229,14 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             raise ValueError("Outbound Hook registry store accepts one Profile")
         with self.__lock:
             if not candidate:
-                self._reject_active_waiters_locked()
+                self._guard_mutation_start_locked()
                 return
             key, value = next(iter(candidate.items()))
             self._setitem_locked(key, value)
 
     def setdefault(self, key: Path, default: Any | None = None) -> Any | None:
         with self.__lock:
-            self._reject_active_waiters_locked()
+            self._guard_mutation_start_locked()
             if key == self.__profile and self.__state is not _MISSING_OUTBOUND_HOOK_REGISTRY:
                 return self.__state
             self._setitem_locked(key, default)
@@ -234,7 +246,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         if len(default) > 1:
             raise TypeError(f"pop expected at most 2 arguments, got {len(default) + 1}")
         with self.__lock:
-            self._reject_active_waiters_locked()
+            self._guard_mutation_start_locked()
             if key != self.__profile or self.__state is _MISSING_OUTBOUND_HOOK_REGISTRY:
                 if default:
                     return default[0]
@@ -247,7 +259,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
 
     def popitem(self) -> tuple[Path, Any | None]:
         with self.__lock:
-            self._reject_active_waiters_locked()
+            self._guard_mutation_start_locked()
             if self.__profile is None or self.__state is _MISSING_OUTBOUND_HOOK_REGISTRY:
                 raise KeyError("popitem(): mapping is empty")
             key = self.__profile

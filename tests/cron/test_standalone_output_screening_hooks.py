@@ -633,6 +633,66 @@ def test_noop_and_failed_mapping_mutations_preserve_exact_claim(tmp_path):
     assert store == {profile: hooks}
 
 
+def test_terminal_claim_publication_is_one_shot(tmp_path):
+    profile = tmp_path / "profile"
+    first = object()
+    second = object()
+    token = scheduler._UnresolvedOutboundHooks()
+    waiter = scheduler._OutboundHookWaiter()
+    token.waiters.add(waiter)
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+
+    assert store._resolve_claim(profile, token, first) is True
+    assert store._resolve_claim(profile, token, second) is False
+    assert store._fail_claim(profile, token) is False
+    assert store._consume_waiter(profile, token, waiter) == (first, False)
+    assert store == {profile: first}
+
+    failed_token = scheduler._UnresolvedOutboundHooks()
+    failed_waiter = scheduler._OutboundHookWaiter()
+    failed_token.waiters.add(failed_waiter)
+    failed_store = scheduler._OutboundHookRegistryStore()
+    failed_store[profile] = failed_token
+
+    assert failed_store._fail_claim(profile, failed_token) is True
+    assert failed_store._resolve_claim(profile, failed_token, first) is False
+    assert failed_store._consume_waiter(profile, failed_token, failed_waiter) == (
+        None,
+        False,
+    )
+    assert failed_store == {profile: None}
+
+
+@pytest.mark.parametrize("operation", ("set", "delete", "pop"))
+def test_mutation_rejects_authority_finalized_during_normalization(
+    tmp_path,
+    operation,
+):
+    profile = tmp_path / "profile"
+    token = scheduler._UnresolvedOutboundHooks()
+    waiter = scheduler._OutboundHookWaiter()
+    token.waiters.add(waiter)
+    hooks = object()
+    replacement = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+    token.result = hooks
+    token.done.set()
+    waiter.abandoned.set()
+
+    with pytest.raises(ValueError, match="authority was finalized"):
+        if operation == "set":
+            store[profile] = replacement
+        elif operation == "delete":
+            del store[profile]
+        else:
+            store.pop(profile)
+
+    assert token.revoked is False
+    assert store == {profile: hooks}
+
+
 def test_direct_file_alias_reuses_canonical_process_authority(tmp_path):
     scheduler._standalone_outbound_hook_registries.clear()
     spec = importlib.util.spec_from_file_location(
