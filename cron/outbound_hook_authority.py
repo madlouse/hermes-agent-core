@@ -224,6 +224,8 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         return self
 
     def update(self, *args: Any, **kwargs: Any) -> None:
+        with self.__lock:
+            self._guard_mutation_start_locked()
         candidate = dict(*args, **kwargs)
         if len(candidate) > 1:
             raise ValueError("Outbound Hook registry store accepts one Profile")
@@ -243,10 +245,12 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             return default
 
     def pop(self, key: Path, *default: Any) -> Any:
-        if len(default) > 1:
-            raise TypeError(f"pop expected at most 2 arguments, got {len(default) + 1}")
         with self.__lock:
             self._guard_mutation_start_locked()
+            if len(default) > 1:
+                raise TypeError(
+                    f"pop expected at most 2 arguments, got {len(default) + 1}"
+                )
             if key != self.__profile or self.__state is _MISSING_OUTBOUND_HOOK_REGISTRY:
                 if default:
                     return default[0]

@@ -693,6 +693,58 @@ def test_mutation_rejects_authority_finalized_during_normalization(
     assert store == {profile: hooks}
 
 
+@pytest.mark.parametrize("operation", ("invalid-update", "invalid-pop"))
+def test_invalid_mutation_normalizes_abandoned_terminal_before_validation(
+    tmp_path,
+    operation,
+):
+    profile = tmp_path / "profile"
+    other = tmp_path / "other"
+    token = scheduler._UnresolvedOutboundHooks()
+    waiter = scheduler._OutboundHookWaiter()
+    token.waiters.add(waiter)
+    hooks = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+    token.result = hooks
+    token.done.set()
+    waiter.abandoned.set()
+
+    with pytest.raises(ValueError, match="authority was finalized"):
+        if operation == "invalid-update":
+            store.update({profile: hooks, other: object()})
+        else:
+            store.pop(profile, None, None)
+
+    assert token.revoked is False
+    assert store == {profile: hooks}
+
+
+def test_abandoned_terminal_normalizes_before_update_iterates_input(tmp_path):
+    profile = tmp_path / "profile"
+    token = scheduler._UnresolvedOutboundHooks()
+    waiter = scheduler._OutboundHookWaiter()
+    token.waiters.add(waiter)
+    hooks = object()
+    iterated = []
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+    token.result = hooks
+    token.done.set()
+    waiter.abandoned.set()
+
+    def raising_items():
+        iterated.append(True)
+        raise OSError("must not iterate")
+        yield
+
+    with pytest.raises(ValueError, match="authority was finalized"):
+        store.update(raising_items())
+
+    assert iterated == []
+    assert store == {profile: hooks}
+
+
 def test_direct_file_alias_reuses_canonical_process_authority(tmp_path):
     scheduler._standalone_outbound_hook_registries.clear()
     spec = importlib.util.spec_from_file_location(
