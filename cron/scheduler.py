@@ -2596,21 +2596,41 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+_UNRESOLVED_OUTBOUND_HOOKS = object()
 _standalone_outbound_hook_registries: dict[Path, Any | None] = {}
 _standalone_outbound_hooks_lock = threading.Lock()
+
+
+def _claim_outbound_hook_profile(profile_home: Path) -> None:
+    """Atomically bind the first selected Profile before any hook lookup."""
+    with _standalone_outbound_hooks_lock:
+        if profile_home in _standalone_outbound_hook_registries:
+            return
+        if _standalone_outbound_hook_registries:
+            raise ValueError(
+                "Standalone Cron process is already bound to another Profile"
+            )
+        _standalone_outbound_hook_registries[profile_home] = (
+            _UNRESOLVED_OUTBOUND_HOOKS
+        )
 
 
 def _bind_live_outbound_hooks(profile_home: Path, hooks: Any) -> Any:
     """Bind a matching live registry to the process-wide Profile owner."""
     with _standalone_outbound_hooks_lock:
-        if (
-            _standalone_outbound_hook_registries
-            and profile_home not in _standalone_outbound_hook_registries
-        ):
+        if profile_home in _standalone_outbound_hook_registries:
+            cached = _standalone_outbound_hook_registries[profile_home]
+            if cached is _UNRESOLVED_OUTBOUND_HOOKS:
+                _standalone_outbound_hook_registries[profile_home] = hooks
+                return hooks
+            if cached is None:
+                raise ValueError("Standalone Cron Profile Hook registry is unavailable")
+            return cached
+        if _standalone_outbound_hook_registries:
             raise ValueError(
                 "Standalone Cron process is already bound to another Profile"
             )
-        _standalone_outbound_hook_registries.setdefault(profile_home, hooks)
+        _standalone_outbound_hook_registries[profile_home] = hooks
     return hooks
 
 
@@ -2620,12 +2640,18 @@ def _standalone_outbound_hooks():
     if not profile_home.is_absolute():
         profile_home = Path.cwd() / profile_home
     with _standalone_outbound_hooks_lock:
-        if profile_home in _standalone_outbound_hook_registries:
-            cached = _standalone_outbound_hook_registries[profile_home]
+        cached = _standalone_outbound_hook_registries.get(
+            profile_home,
+            _UNRESOLVED_OUTBOUND_HOOKS,
+        )
+        if cached is not _UNRESOLVED_OUTBOUND_HOOKS:
             if cached is None:
                 raise ValueError("Standalone Cron Profile Hook registry is unavailable")
             return cached
-        if _standalone_outbound_hook_registries:
+        if (
+            _standalone_outbound_hook_registries
+            and profile_home not in _standalone_outbound_hook_registries
+        ):
             raise ValueError(
                 "Standalone Cron process is already bound to another Profile"
             )
@@ -2648,6 +2674,11 @@ def _active_outbound_hooks():
     profile_home = get_hermes_home().expanduser()
     if not profile_home.is_absolute():
         profile_home = Path.cwd() / profile_home
+    try:
+        _claim_outbound_hook_profile(profile_home)
+    except ValueError:
+        logger.warning("Standalone Cron output hooks unavailable", exc_info=True)
+        return None
     gateway_run = sys.modules.get("gateway.run")
     runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
     if callable(runner_ref):

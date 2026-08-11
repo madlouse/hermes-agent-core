@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -144,6 +145,91 @@ def test_gateway_profile_binding_blocks_later_standalone_profile(
         getattr(module, "PROFILE_REASON", "") == "profile-b"
         for module in tuple(sys.modules.values())
     )
+
+
+def test_failed_standalone_profile_cannot_switch_to_live_gateway_registry(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+    assert _load_with_profile_override(profile) is None
+    live_hooks = HookRegistry(profile / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+
+    hooks = _load_with_profile_override(profile)
+    decision = asyncio.run(outbound_before_send(hooks, _required_context(profile)))
+
+    assert hooks is None
+    assert decision.reason == "required_output_screening_hook_missing"
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_standalone_profile_cannot_switch_to_second_live_registry(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    _write_screening_hook(profile, reason="standalone")
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    standalone_hooks = _load_with_profile_override(profile)
+    live_hooks = HookRegistry(profile / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+
+    selected = _load_with_profile_override(profile)
+
+    assert selected is standalone_hooks
+    assert selected is not live_hooks
+    assert scheduler._standalone_outbound_hook_registries == {
+        profile: standalone_hooks
+    }
+
+
+def test_first_selected_profile_owns_before_gateway_lookup(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile_a / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    lookup_calls = []
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_calls.append(threading.current_thread().name)
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(profile, key):
+        results[key] = _load_with_profile_override(profile)
+
+    thread_a = threading.Thread(target=load, args=(profile_a, "a"), name="profile-a")
+    thread_b = threading.Thread(target=load, args=(profile_b, "b"), name="profile-b")
+    thread_a.start()
+    assert lookup_entered.wait(timeout=2)
+    thread_b.start()
+    thread_b.join(timeout=2)
+
+    assert not thread_b.is_alive()
+    assert results["b"] is None
+    assert lookup_calls == ["profile-a"]
+
+    release_lookup.set()
+    thread_a.join(timeout=2)
+
+    assert not thread_a.is_alive()
+    assert results["a"] is live_hooks
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: live_hooks}
 
 
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):
