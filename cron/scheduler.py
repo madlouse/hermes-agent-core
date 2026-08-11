@@ -2676,7 +2676,7 @@ def _standalone_outbound_hooks(
             quiet=True,
         )
         registry.discover_and_load()
-    except Exception:
+    except BaseException:
         _fail_outbound_hook_claim(profile_home, claim_token)
         raise
     with _standalone_outbound_hooks_lock:
@@ -2703,10 +2703,13 @@ def _active_outbound_hooks():
     if callable(runner_ref):
         try:
             runner = runner_ref()
-        except Exception:  # noqa: BLE001 - a broken optional runner must not disable standalone screening
+        except Exception:  # noqa: BLE001 - an invalid live owner must fail closed
             _fail_outbound_hook_claim(profile_home, claimed)
             logger.warning("Gateway hook registry lookup failed", exc_info=True)
             return None
+        except BaseException:
+            _fail_outbound_hook_claim(profile_home, claimed)
+            raise
         else:
             if runner is None:
                 runner_ref = None
@@ -2718,10 +2721,13 @@ def _active_outbound_hooks():
                         Path(hooks_dir).expanduser().absolute()
                         == (profile_home / "hooks").absolute()
                     )
-                except Exception:  # noqa: BLE001 - untrusted live registry inspection must terminalize its claim
+                except Exception:  # noqa: BLE001 - untrusted registry inspection must fail closed
                     _fail_outbound_hook_claim(profile_home, claimed)
                     logger.warning("Gateway hook registry inspection failed", exc_info=True)
                     return None
+                except BaseException:
+                    _fail_outbound_hook_claim(profile_home, claimed)
+                    raise
                 if not hooks_match:
                     _fail_outbound_hook_claim(profile_home, claimed)
                     logger.warning(

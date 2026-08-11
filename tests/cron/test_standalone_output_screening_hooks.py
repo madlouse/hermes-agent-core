@@ -385,6 +385,64 @@ def test_discovery_runtime_error_after_lost_claim_fails_closed(
     assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
 
 
+def test_gateway_control_signal_terminalizes_exact_claim_and_propagates(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+    live_hooks = HookRegistry(profile / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+    assert _load_with_profile_override(profile) is None
+
+
+def test_gateway_control_signal_preserves_replacement_claim(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    replacement = HookRegistry(profile / "replacement-hooks")
+
+    def replace_then_interrupt():
+        scheduler._standalone_outbound_hook_registries[profile] = replacement
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", replace_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+
+
+def test_discovery_control_signal_terminalizes_exact_claim_and_propagates(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    monkeypatch.setattr(
+        HookRegistry,
+        "discover_and_load",
+        lambda registry: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+    assert _load_with_profile_override(profile) is None
+
+
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):
     profile = tmp_path / "missing-profile"
     _reset_standalone_cache(monkeypatch, profile)
