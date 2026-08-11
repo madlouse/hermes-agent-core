@@ -2636,11 +2636,6 @@ def _bind_live_outbound_hooks(
             if cached is claim_token:
                 _standalone_outbound_hook_registries[profile_home] = hooks
                 return hooks
-            if isinstance(cached, _UnresolvedOutboundHooks):
-                raise ValueError("Standalone Cron Profile Hook registry is resolving")
-            if cached is None:
-                raise ValueError("Standalone Cron Profile Hook registry is unavailable")
-            return cached
         raise ValueError("Standalone Cron Profile Hook registry ownership changed")
 
 
@@ -2656,11 +2651,13 @@ def _fail_outbound_hook_claim(
 
 def _standalone_outbound_hooks(
     claim_token: _UnresolvedOutboundHooks | None = None,
+    profile_home: Path | None = None,
 ):
     """Load the selected Profile's normal hooks for a standalone Cron run."""
-    profile_home = get_hermes_home().expanduser()
-    if not profile_home.is_absolute():
-        profile_home = Path.cwd() / profile_home
+    if profile_home is None:
+        profile_home = get_hermes_home().expanduser()
+        if not profile_home.is_absolute():
+            profile_home = Path.cwd() / profile_home
     if claim_token is None:
         claimed = _claim_outbound_hook_profile(profile_home)
         if not isinstance(claimed, _UnresolvedOutboundHooks):
@@ -2669,11 +2666,7 @@ def _standalone_outbound_hooks(
     with _standalone_outbound_hooks_lock:
         cached = _standalone_outbound_hook_registries.get(profile_home)
         if cached is not claim_token:
-            if isinstance(cached, _UnresolvedOutboundHooks):
-                raise ValueError("Standalone Cron Profile Hook registry is resolving")
-            if cached is None:
-                raise ValueError("Standalone Cron Profile Hook registry is unavailable")
-            return cached
+            raise ValueError("Standalone Cron Profile Hook registry ownership changed")
     try:
         from gateway.hooks import HookRegistry
 
@@ -2711,37 +2704,40 @@ def _active_outbound_hooks():
         try:
             runner = runner_ref()
         except Exception:  # noqa: BLE001 - a broken optional runner must not disable standalone screening
+            _fail_outbound_hook_claim(profile_home, claimed)
             logger.warning("Gateway hook registry lookup failed", exc_info=True)
+            return None
         else:
-            try:
-                hooks = getattr(runner, "hooks", None) if runner is not None else None
-                hooks_dir = getattr(hooks, "hooks_dir", None)
-                hooks_match = hooks is not None and hooks_dir is not None and (
-                    Path(hooks_dir).expanduser().absolute()
-                    == (profile_home / "hooks").absolute()
-                )
-            except Exception:  # noqa: BLE001 - untrusted live registry inspection must terminalize its claim
-                _fail_outbound_hook_claim(profile_home, claimed)
-                logger.warning("Gateway hook registry inspection failed", exc_info=True)
-                return None
-            if hooks_match:
+            if runner is None:
+                runner_ref = None
+            else:
+                try:
+                    hooks = getattr(runner, "hooks", None)
+                    hooks_dir = getattr(hooks, "hooks_dir", None)
+                    hooks_match = hooks is not None and hooks_dir is not None and (
+                        Path(hooks_dir).expanduser().absolute()
+                        == (profile_home / "hooks").absolute()
+                    )
+                except Exception:  # noqa: BLE001 - untrusted live registry inspection must terminalize its claim
+                    _fail_outbound_hook_claim(profile_home, claimed)
+                    logger.warning("Gateway hook registry inspection failed", exc_info=True)
+                    return None
+                if not hooks_match:
+                    _fail_outbound_hook_claim(profile_home, claimed)
+                    logger.warning(
+                        "Gateway hook registry does not match the selected Profile"
+                    )
+                    return None
                 try:
                     return _bind_live_outbound_hooks(profile_home, hooks, claimed)
                 except ValueError:
                     logger.warning(
-                        "Gateway hook registry matches a Profile other than the "
-                        "process owner",
+                        "Gateway hook registry lost the selected Profile claim",
                         exc_info=True,
                     )
                     return None
-            if hooks is not None:
-                logger.warning(
-                    "Gateway hook registry belongs to another Profile; "
-                    "loading hooks for %s",
-                    profile_home,
-                )
     try:
-        return _standalone_outbound_hooks(claimed)
+        return _standalone_outbound_hooks(claimed, profile_home)
     except (NotImplementedError, OSError, UnicodeError, ValueError):
         logger.warning("Standalone Cron output hooks unavailable", exc_info=True)
         return None

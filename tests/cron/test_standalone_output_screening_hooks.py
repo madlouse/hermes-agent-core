@@ -292,6 +292,79 @@ def test_live_registry_inspection_failure_terminalizes_exact_claim(
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
+def test_live_registry_lookup_failure_does_not_fallback(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    _write_screening_hook(profile)
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: (_ for _ in ()).throw(OSError("runner unavailable")),
+    )
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_mismatched_live_registry_does_not_fallback(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_screening_hook(profile_b)
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile_a / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+
+    hooks = _load_with_profile_override(profile_b)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile_b: None}
+
+
+def test_lost_claim_cannot_consume_replacement_registry(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    replacement = HookRegistry(profile / "replacement-hooks")
+    live_hooks = HookRegistry(profile / "hooks")
+
+    def replace_claim_before_return():
+        scheduler._standalone_outbound_hook_registries[profile] = replacement
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", replace_claim_before_return)
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+
+
+def test_profile_home_is_captured_once_for_claim_and_discovery(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_screening_hook(profile_a)
+    scheduler._standalone_outbound_hook_registries.clear()
+    profiles = iter((profile_a, profile_b))
+    calls = []
+
+    def drifting_profile_home():
+        selected = next(profiles)
+        calls.append(selected)
+        return selected
+
+    monkeypatch.setattr(scheduler, "get_hermes_home", drifting_profile_home)
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+    hooks = scheduler._active_outbound_hooks()
+
+    assert hooks is not None
+    assert calls == [profile_a]
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: hooks}
+
+
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):
     profile = tmp_path / "missing-profile"
     _reset_standalone_cache(monkeypatch, profile)
