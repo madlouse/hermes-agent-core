@@ -1,4 +1,5 @@
 import asyncio
+import importlib.util
 import os
 import sys
 import threading
@@ -50,6 +51,18 @@ def _load_with_profile_override(profile):
         return scheduler._active_outbound_hooks()
     finally:
         reset_hermes_home_override(token)
+
+
+def _observe_claim_wait(monkeypatch, token):
+    waiter_entered = threading.Event()
+    original_wait = token.done.wait
+
+    def observed_wait(*args, **kwargs):
+        waiter_entered.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(token.done, "wait", observed_wait)
+    return waiter_entered
 
 
 def _required_context(profile):
@@ -230,6 +243,951 @@ def test_first_selected_profile_owns_before_gateway_lookup(monkeypatch, tmp_path
     assert not thread_a.is_alive()
     assert results["a"] is live_hooks
     assert scheduler._standalone_outbound_hook_registries == {profile_a: live_hooks}
+
+
+def test_same_profile_concurrent_lookup_reuses_first_registry(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    lookup_calls = []
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_calls.append(threading.current_thread().name)
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    waiter_entered = _observe_claim_wait(monkeypatch, token)
+    second.start()
+
+    assert waiter_entered.wait(timeout=2)
+    assert lookup_calls == ["first"]
+
+    release_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": live_hooks, "second": live_hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: live_hooks}
+
+
+def test_same_profile_concurrent_lookup_shares_terminal_failure(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    lookup_calls = []
+    results = {}
+
+    def failing_runner_ref():
+        lookup_calls.append(threading.current_thread().name)
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        raise OSError("runner unavailable")
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", failing_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    waiter_entered = _observe_claim_wait(monkeypatch, token)
+    second.start()
+
+    assert waiter_entered.wait(timeout=2)
+    assert lookup_calls == ["first"]
+
+    release_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": None, "second": None}
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_late_same_profile_caller_reuses_published_terminal_failure(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    waiter_entered = threading.Event()
+    waiter_woke = threading.Event()
+    release_waiter = threading.Event()
+    results = {}
+
+    def failing_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        raise OSError("runner unavailable")
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", failing_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load, args=("owner",), name="owner")
+    waiter = threading.Thread(target=load, args=("waiter",), name="waiter")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    original_wait = token.done.wait
+
+    def delayed_wait(*args, **kwargs):
+        waiter_entered.set()
+        result = original_wait(*args, **kwargs)
+        waiter_woke.set()
+        assert release_waiter.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(token.done, "wait", delayed_wait)
+    waiter.start()
+    assert waiter_entered.wait(timeout=2)
+    release_lookup.set()
+    assert waiter_woke.wait(timeout=2)
+
+    results["late"] = _load_with_profile_override(profile)
+    release_waiter.set()
+    owner.join(timeout=2)
+    waiter.join(timeout=2)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert results == {"owner": None, "waiter": None, "late": None}
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_same_profile_waiter_cannot_consume_replacement_registry(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile / "hooks")
+    replacement = HookRegistry(profile / "replacement-hooks")
+    lookup_entered = threading.Event()
+    install_replacement = threading.Event()
+    results = {}
+
+    def replace_claim_before_return():
+        lookup_entered.set()
+        assert install_replacement.wait(timeout=2)
+        scheduler._standalone_outbound_hook_registries[profile] = replacement
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", replace_claim_before_return)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    waiter_entered = _observe_claim_wait(monkeypatch, token)
+    second.start()
+
+    assert waiter_entered.wait(timeout=2)
+
+    install_replacement.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": None, "second": None}
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_same_profile_waiter_rejects_replaced_then_restored_claim(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile / "hooks")
+    replacement = HookRegistry(profile / "replacement-hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    waiter_entered = _observe_claim_wait(monkeypatch, token)
+    second.start()
+    assert waiter_entered.wait(timeout=2)
+
+    with scheduler._standalone_outbound_hooks_lock:
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries[profile] = replacement
+    assert token.revoked is False
+
+    release_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": live_hooks, "second": live_hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: live_hooks}
+
+
+def test_same_profile_waiter_rejects_sentinel_then_restored_claim(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    waiter_entered = _observe_claim_wait(monkeypatch, token)
+    second.start()
+    assert waiter_entered.wait(timeout=2)
+
+    with scheduler._standalone_outbound_hooks_lock:
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries[profile] = (
+                scheduler._UNRESOLVED_OUTBOUND_HOOK_RESULT
+            )
+    assert token.revoked is False
+
+    release_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": live_hooks, "second": live_hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: live_hooks}
+
+
+def test_registry_store_reinitialization_revokes_unresolved_claim(tmp_path):
+    profile = tmp_path / "profile"
+    token = scheduler._UnresolvedOutboundHooks()
+    replacement = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+
+    store[profile] = replacement
+
+    assert token.revoked is True
+    assert store == {profile: replacement}
+
+
+def test_rejected_store_reinitialization_preserves_existing_authority(tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_c = tmp_path / "profile-c"
+    hooks_a = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile_a] = hooks_a
+
+    with pytest.raises(TypeError):
+        store.__init__({profile_b: object(), profile_c: object()})
+
+    assert store == {profile_a: hooks_a}
+
+
+def test_repeated_empty_initialization_preserves_existing_authority(tmp_path):
+    profile = tmp_path / "profile"
+    hooks = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = hooks
+    original_lock = store.lock
+
+    with pytest.raises(RuntimeError, match="already initialized"):
+        store.__init__()
+
+    assert store.lock is original_lock
+    assert store == {profile: hooks}
+
+
+def test_update_and_ior_validate_before_atomic_authority_mutation(tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    hooks_a = object()
+    hooks_b = object()
+    store = scheduler._OutboundHookRegistryStore()
+
+    with pytest.raises(ValueError, match="accepts one Profile"):
+        store.update({profile_a: hooks_a, profile_b: hooks_b})
+    assert store == {}
+
+    def raising_items():
+        yield profile_a, hooks_a
+        raise OSError("mapping iteration failed")
+
+    with pytest.raises(OSError, match="mapping iteration failed"):
+        store.update(raising_items())
+    assert store == {}
+
+    with pytest.raises(ValueError, match="accepts one Profile"):
+        store |= {profile_a: hooks_a, profile_b: hooks_b}
+    assert store == {}
+
+    store.update({profile_a: hooks_a})
+    assert store == {profile_a: hooks_a}
+
+
+def test_registry_store_has_no_dict_base_mutation_bypass(tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    token = scheduler._UnresolvedOutboundHooks()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile_a] = token
+
+    with pytest.raises(TypeError):
+        dict.update(store, {profile_b: object()})
+    with pytest.raises(AttributeError):
+        store._data = {profile_b: object()}
+    with pytest.raises(AttributeError):
+        store._profile = profile_b
+    with pytest.raises(AttributeError):
+        store._state = object()
+
+    assert token.revoked is False
+    assert store == {profile_a: token}
+
+
+def test_noop_and_failed_mapping_mutations_preserve_exact_claim(tmp_path):
+    profile = tmp_path / "profile"
+    missing = tmp_path / "missing"
+    token = scheduler._UnresolvedOutboundHooks()
+    hooks = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+
+    store[profile] = token
+    store.update({profile: token})
+    store |= store
+    with pytest.raises(ValueError, match="already bound"):
+        store[missing] = object()
+    with pytest.raises(ValueError, match="already bound"):
+        store.update({missing: object()})
+    with pytest.raises(ValueError, match="already bound"):
+        store.setdefault(missing, object())
+    with pytest.raises(KeyError):
+        del store[missing]
+
+    assert token.revoked is False
+    assert store._resolve_claim(profile, token, hooks) is True
+    assert store == {profile: hooks}
+
+
+def test_terminal_claim_publication_is_one_shot(tmp_path):
+    profile = tmp_path / "profile"
+    first = object()
+    second = object()
+    token = scheduler._UnresolvedOutboundHooks()
+    waiter = scheduler._OutboundHookWaiter()
+    token.waiters.add(waiter)
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+
+    assert store._resolve_claim(profile, token, first) is True
+    assert store._resolve_claim(profile, token, second) is False
+    assert store._fail_claim(profile, token) is False
+    assert store._consume_waiter(profile, token, waiter) == (first, False)
+    assert store == {profile: first}
+
+    failed_token = scheduler._UnresolvedOutboundHooks()
+    failed_waiter = scheduler._OutboundHookWaiter()
+    failed_token.waiters.add(failed_waiter)
+    failed_store = scheduler._OutboundHookRegistryStore()
+    failed_store[profile] = failed_token
+
+    assert failed_store._fail_claim(profile, failed_token) is True
+    assert failed_store._resolve_claim(profile, failed_token, first) is False
+    assert failed_store._consume_waiter(profile, failed_token, failed_waiter) == (
+        None,
+        False,
+    )
+    assert failed_store == {profile: None}
+
+
+@pytest.mark.parametrize("operation", ("set", "delete", "pop"))
+def test_mutation_rejects_authority_finalized_during_normalization(
+    tmp_path,
+    operation,
+):
+    profile = tmp_path / "profile"
+    token = scheduler._UnresolvedOutboundHooks()
+    waiter = scheduler._OutboundHookWaiter()
+    token.waiters.add(waiter)
+    hooks = object()
+    replacement = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+    token.result = hooks
+    token.done.set()
+    waiter.abandoned.set()
+
+    with pytest.raises(ValueError, match="authority was finalized"):
+        if operation == "set":
+            store[profile] = replacement
+        elif operation == "delete":
+            del store[profile]
+        else:
+            store.pop(profile)
+
+    assert token.revoked is False
+    assert store == {profile: hooks}
+
+
+@pytest.mark.parametrize("operation", ("invalid-update", "invalid-pop"))
+def test_invalid_mutation_normalizes_abandoned_terminal_before_validation(
+    tmp_path,
+    operation,
+):
+    profile = tmp_path / "profile"
+    other = tmp_path / "other"
+    token = scheduler._UnresolvedOutboundHooks()
+    waiter = scheduler._OutboundHookWaiter()
+    token.waiters.add(waiter)
+    hooks = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+    token.result = hooks
+    token.done.set()
+    waiter.abandoned.set()
+
+    with pytest.raises(ValueError, match="authority was finalized"):
+        if operation == "invalid-update":
+            store.update({profile: hooks, other: object()})
+        else:
+            store.pop(profile, None, None)
+
+    assert token.revoked is False
+    assert store == {profile: hooks}
+
+
+def test_abandoned_terminal_normalizes_before_update_iterates_input(tmp_path):
+    profile = tmp_path / "profile"
+    token = scheduler._UnresolvedOutboundHooks()
+    waiter = scheduler._OutboundHookWaiter()
+    token.waiters.add(waiter)
+    hooks = object()
+    iterated = []
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+    token.result = hooks
+    token.done.set()
+    waiter.abandoned.set()
+
+    def raising_items():
+        iterated.append(True)
+        raise OSError("must not iterate")
+        yield
+
+    with pytest.raises(ValueError, match="authority was finalized"):
+        store.update(raising_items())
+
+    assert iterated == []
+    assert store == {profile: hooks}
+
+
+@pytest.mark.parametrize("operation", ("update", "ior"))
+def test_slow_update_rejects_stale_intent_and_preserves_new_claim(
+    tmp_path,
+    operation,
+):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    token = scheduler._UnresolvedOutboundHooks()
+    replacement = object()
+    store = scheduler._OutboundHookRegistryStore()
+    iteration_entered = threading.Event()
+    release_iteration = threading.Event()
+    result = {}
+
+    def slow_items():
+        iteration_entered.set()
+        assert release_iteration.wait(timeout=2)
+        yield profile_b, replacement
+
+    def mutate():
+        try:
+            if operation == "update":
+                store.update(slow_items())
+            else:
+                store.__ior__(slow_items())
+        except ValueError as exc:
+            result["error"] = str(exc)
+
+    worker = threading.Thread(target=mutate, name=operation)
+    worker.start()
+    assert iteration_entered.wait(timeout=2)
+    store[profile_a] = token
+    release_iteration.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result == {"error": "Outbound Hook registry authority changed"}
+    assert token.revoked is False
+    assert store == {profile_a: token}
+
+
+def test_reentrant_update_rejects_revision_aba(tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    first_token = scheduler._UnresolvedOutboundHooks()
+    second_token = scheduler._UnresolvedOutboundHooks()
+    replacement = object()
+    store = scheduler._OutboundHookRegistryStore()
+
+    def reentrant_items():
+        store[profile_a] = first_token
+        store.clear()
+        store[profile_a] = second_token
+        yield profile_b, replacement
+
+    with pytest.raises(ValueError, match="authority changed"):
+        store.update(reentrant_items())
+
+    assert first_token.revoked is True
+    assert second_token.revoked is False
+    assert store == {profile_a: second_token}
+
+
+def test_waiter_terminalization_increments_authority_revision(tmp_path):
+    profile = tmp_path / "profile"
+    token = scheduler._UnresolvedOutboundHooks()
+    first_waiter = scheduler._OutboundHookWaiter()
+    second_waiter = scheduler._OutboundHookWaiter()
+    replacement = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+    revision_before = store._OutboundHookRegistryStore__generation
+    iteration_entered = threading.Event()
+    release_iteration = threading.Event()
+    update_result = {}
+
+    def slow_items():
+        iteration_entered.set()
+        assert release_iteration.wait(timeout=2)
+        yield profile, replacement
+
+    def mutate():
+        try:
+            store.update(slow_items())
+        except ValueError as exc:
+            update_result["error"] = str(exc)
+
+    worker = threading.Thread(target=mutate, name="stale-update")
+    worker.start()
+    assert iteration_entered.wait(timeout=2)
+    with store.lock:
+        token.waiters.update({first_waiter, second_waiter})
+        token.done.set()
+
+    assert store._consume_waiter(profile, token, first_waiter) == (None, False)
+    assert store._OutboundHookRegistryStore__generation == revision_before + 1
+    assert store[profile] is token
+    assert store._consume_waiter(profile, token, second_waiter) == (None, False)
+    assert store._OutboundHookRegistryStore__generation == revision_before + 2
+    assert store == {profile: None}
+
+    release_iteration.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert update_result == {"error": "Outbound Hook registry authority changed"}
+    assert store == {profile: None}
+
+
+def test_direct_file_alias_reuses_canonical_process_authority(tmp_path):
+    scheduler._standalone_outbound_hook_registries.clear()
+    spec = importlib.util.spec_from_file_location(
+        "cron_scheduler_direct_alias",
+        scheduler.__file__,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    alias = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(alias)
+
+    assert (
+        alias._standalone_outbound_hook_registries
+        is scheduler._standalone_outbound_hook_registries
+    )
+    assert alias._standalone_outbound_hooks_lock is scheduler._standalone_outbound_hooks_lock
+    assert alias._UnresolvedOutboundHooks is scheduler._UnresolvedOutboundHooks
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    claimed = scheduler._claim_outbound_hook_profile(profile_a)
+    assert isinstance(claimed, scheduler._UnresolvedOutboundHooks)
+    with pytest.raises(ValueError, match="already bound to another Profile"):
+        alias._claim_outbound_hook_profile(profile_b)
+    scheduler._standalone_outbound_hook_registries.clear()
+
+
+def test_registry_store_serializes_claim_publish_with_cross_profile_write(tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    token = scheduler._UnresolvedOutboundHooks()
+    hooks_a = object()
+    hooks_b = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile_a] = token
+    mutation_started = threading.Event()
+    mutation_finished = threading.Event()
+    results = {}
+
+    def mutate():
+        mutation_started.set()
+        try:
+            store[profile_b] = hooks_b
+        except ValueError as exc:
+            results["mutation"] = str(exc)
+        finally:
+            mutation_finished.set()
+
+    mutation = threading.Thread(target=mutate, name="mutation")
+    with store.lock:
+        mutation.start()
+        assert mutation_started.wait(timeout=2)
+        results["publish"] = store._resolve_claim(profile_a, token, hooks_a)
+    mutation.join(timeout=2)
+
+    assert not mutation.is_alive()
+    assert mutation_finished.is_set()
+    assert results == {
+        "publish": True,
+        "mutation": "Outbound Hook registry store is already bound",
+    }
+    assert store == {profile_a: hooks_a}
+
+
+def test_published_claim_blocks_reset_until_waiter_consumes(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks_a = HookRegistry(profile_a / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    waiter_entered = threading.Event()
+    waiter_woke = threading.Event()
+    release_waiter = threading.Event()
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks_a)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(profile, key):
+        results[key] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load, args=(profile_a, "owner"), name="owner")
+    waiter = threading.Thread(target=load, args=(profile_a, "waiter"), name="waiter")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile_a]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    original_wait = token.done.wait
+
+    def delayed_wait(*args, **kwargs):
+        waiter_entered.set()
+        result = original_wait(*args, **kwargs)
+        waiter_woke.set()
+        assert release_waiter.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(token.done, "wait", delayed_wait)
+    waiter.start()
+    assert waiter_entered.wait(timeout=2)
+    release_lookup.set()
+    assert waiter_woke.wait(timeout=2)
+
+    with pytest.raises(ValueError, match="active waiters"):
+        scheduler._standalone_outbound_hook_registries.clear()
+    results["late"] = _load_with_profile_override(profile_a)
+    results["profile-b"] = _load_with_profile_override(profile_b)
+
+    release_waiter.set()
+    owner.join(timeout=2)
+    waiter.join(timeout=2)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert results == {
+        "owner": hooks_a,
+        "waiter": hooks_a,
+        "late": hooks_a,
+        "profile-b": None,
+    }
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: hooks_a}
+
+
+def test_interrupted_waiter_does_not_strand_profile_authority(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    owner_result = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load_owner():
+        owner_result["hooks"] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load_owner, name="owner")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    monkeypatch.setattr(
+        token.done,
+        "wait",
+        MagicMock(side_effect=KeyboardInterrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert not token.waiters
+    release_lookup.set()
+    owner.join(timeout=2)
+
+    assert not owner.is_alive()
+    assert owner_result == {"hooks": hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
+def test_waiter_control_signal_does_not_wait_for_authority_lock(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    owner_result = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load_owner():
+        owner_result["hooks"] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load_owner, name="owner")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+
+    def hold_lock():
+        with scheduler._standalone_outbound_hooks_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock, name="holder")
+
+    def interrupt_while_lock_held(*args, **kwargs):
+        holder.start()
+        assert lock_held.wait(timeout=2)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(token.done, "wait", interrupt_while_lock_held)
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert holder.is_alive()
+    release_lock.set()
+    holder.join(timeout=2)
+    release_lookup.set()
+    owner.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert not owner.is_alive()
+    assert owner_result == {"hooks": hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
+def test_waiter_consume_control_signal_does_not_strand_published_result(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    owner_result = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load_owner():
+        owner_result["hooks"] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load_owner, name="owner")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    original_wait = token.done.wait
+
+    def release_then_wait(*args, **kwargs):
+        release_lookup.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(token.done, "wait", release_then_wait)
+    monkeypatch.setattr(
+        scheduler._OutboundHookRegistryStore,
+        "_consume_waiter",
+        MagicMock(side_effect=KeyboardInterrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    owner.join(timeout=2)
+    assert not owner.is_alive()
+    assert owner_result == {"hooks": hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
+def test_active_waiter_rejects_cross_profile_store_mutation_without_revocation(
+    monkeypatch, tmp_path
+):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks_a = HookRegistry(profile_a / "hooks")
+    hooks_b = HookRegistry(profile_b / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks_a)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile_a)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile_a]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    waiter_entered = _observe_claim_wait(monkeypatch, token)
+    second.start()
+    assert waiter_entered.wait(timeout=2)
+
+    with scheduler._standalone_outbound_hooks_lock:
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.update({})
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.__ior__({})
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.setdefault(
+                profile_a,
+                hooks_b,
+            )
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.pop(
+                profile_b,
+                hooks_b,
+            )
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.pop(profile_b)
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.popitem()
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries[profile_b] = hooks_b
+    assert token.revoked is False
+
+    release_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": hooks_a, "second": hooks_a}
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: hooks_a}
 
 
 def test_hook_discovery_reentry_fails_closed_without_deadlock(monkeypatch, tmp_path):
@@ -518,12 +1476,13 @@ def test_runner_control_signal_does_not_wait_for_held_cleanup_lock(
     with pytest.raises(KeyboardInterrupt):
         _load_with_profile_override(profile)
 
-    token = scheduler._standalone_outbound_hook_registries[profile]
-    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
-    assert token.done.is_set()
+    assert holder.is_alive()
     release_lock.set()
     holder.join(timeout=2)
     assert not holder.is_alive()
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
     monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
     assert _load_with_profile_override(profile) is None
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
@@ -555,12 +1514,13 @@ def test_discovery_control_signal_does_not_wait_for_held_cleanup_lock(
     with pytest.raises(KeyboardInterrupt):
         _load_with_profile_override(profile)
 
-    token = scheduler._standalone_outbound_hook_registries[profile]
-    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
-    assert token.done.is_set()
+    assert holder.is_alive()
     release_lock.set()
     holder.join(timeout=2)
     assert not holder.is_alive()
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
     assert _load_with_profile_override(profile) is None
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
@@ -659,6 +1619,65 @@ def test_claim_lock_exit_signal_marks_published_claim_done(
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
+def test_waiter_lock_exit_signal_abandons_registered_waiter(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    owner_result = {}
+    original_lock = scheduler._standalone_outbound_hooks_lock
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load_owner():
+        owner_result["hooks"] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load_owner, name="owner")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+
+    class InterruptWaiterExit:
+        def __enter__(self):
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            original_lock.release()
+            raise KeyboardInterrupt
+
+        def acquire(self, blocking=True):
+            return original_lock.acquire(blocking)
+
+        def release(self):
+            original_lock.release()
+
+    monkeypatch.setattr(
+        scheduler,
+        "_standalone_outbound_hooks_lock",
+        InterruptWaiterExit(),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert not token.waiters
+    monkeypatch.setattr(scheduler, "_standalone_outbound_hooks_lock", original_lock)
+    release_lookup.set()
+    owner.join(timeout=2)
+
+    assert not owner.is_alive()
+    assert owner_result == {"hooks": hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
 def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
     monkeypatch, tmp_path
 ):
@@ -667,6 +1686,18 @@ def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
     lock_held = threading.Event()
     release_lock = threading.Event()
     lookup_started = threading.Event()
+    failure_publish_started = threading.Event()
+    original_fail_claim = scheduler._fail_outbound_hook_claim
+
+    def observed_fail_claim(*args, **kwargs):
+        failure_publish_started.set()
+        return original_fail_claim(*args, **kwargs)
+
+    monkeypatch.setattr(
+        scheduler,
+        "_fail_outbound_hook_claim",
+        observed_fail_claim,
+    )
 
     def hold_lock():
         with scheduler._standalone_outbound_hooks_lock:
@@ -683,13 +1714,19 @@ def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
 
     monkeypatch.setattr("gateway.run._gateway_runner_ref", fail_with_lock_held)
     result = []
-    worker = threading.Thread(
-        target=lambda: result.append(_load_with_profile_override(profile))
-    )
+    worker_completed = threading.Event()
+
+    def run_worker():
+        try:
+            result.append(_load_with_profile_override(profile))
+        finally:
+            worker_completed.set()
+
+    worker = threading.Thread(target=run_worker)
     worker.start()
     assert lookup_started.wait(timeout=2)
-    worker.join(timeout=0.1)
-    assert worker.is_alive()
+    assert failure_publish_started.wait(timeout=2)
+    assert not worker_completed.is_set()
 
     release_lock.set()
     holder.join(timeout=2)
@@ -697,6 +1734,7 @@ def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
 
     assert not holder.is_alive()
     assert not worker.is_alive()
+    assert worker_completed.is_set()
     assert result == [None]
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
