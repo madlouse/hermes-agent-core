@@ -2609,6 +2609,10 @@ def _standalone_outbound_hooks():
         cached = _standalone_outbound_hook_registries.get(profile_home)
         if cached is not None:
             return cached
+        if _standalone_outbound_hook_registries:
+            raise ValueError(
+                "Standalone Cron process is already bound to another Profile"
+            )
 
         from gateway.hooks import HookRegistry
 
