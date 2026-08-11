@@ -546,6 +546,47 @@ def test_rejected_store_reinitialization_preserves_existing_authority(tmp_path):
     assert store == {profile_a: hooks_a}
 
 
+def test_repeated_empty_initialization_preserves_existing_authority(tmp_path):
+    profile = tmp_path / "profile"
+    hooks = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = hooks
+    original_lock = store.lock
+
+    with pytest.raises(RuntimeError, match="already initialized"):
+        store.__init__()
+
+    assert store.lock is original_lock
+    assert store == {profile: hooks}
+
+
+def test_update_and_ior_validate_before_atomic_authority_mutation(tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    hooks_a = object()
+    hooks_b = object()
+    store = scheduler._OutboundHookRegistryStore()
+
+    with pytest.raises(ValueError, match="accepts one Profile"):
+        store.update({profile_a: hooks_a, profile_b: hooks_b})
+    assert store == {}
+
+    def raising_items():
+        yield profile_a, hooks_a
+        raise OSError("mapping iteration failed")
+
+    with pytest.raises(OSError, match="mapping iteration failed"):
+        store.update(raising_items())
+    assert store == {}
+
+    with pytest.raises(ValueError, match="accepts one Profile"):
+        store |= {profile_a: hooks_a, profile_b: hooks_b}
+    assert store == {}
+
+    store.update({profile_a: hooks_a})
+    assert store == {profile_a: hooks_a}
+
+
 def test_registry_store_has_no_dict_base_mutation_bypass(tmp_path):
     profile_a = tmp_path / "profile-a"
     profile_b = tmp_path / "profile-b"

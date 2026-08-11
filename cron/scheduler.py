@@ -2626,6 +2626,8 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     __slots__ = ("__lock", "__profile", "__state")
 
     def __init__(self) -> None:
+        if hasattr(self, "_OutboundHookRegistryStore__lock"):
+            raise RuntimeError("Outbound Hook registry store is already initialized")
         self.__lock = threading.RLock()
         self.__profile: Path | None = None
         self.__state: Any = _MISSING_OUTBOUND_HOOK_REGISTRY
@@ -2678,16 +2680,19 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
 
     def __setitem__(self, key: Path, value: Any | None) -> None:
         with self.__lock:
-            self._prepare_mutation_locked()
-            if self.__profile is not None and key != self.__profile:
-                raise ValueError("Outbound Hook registry store is already bound")
-            if self.__state is not _MISSING_OUTBOUND_HOOK_REGISTRY and not isinstance(
-                self.__state,
-                _UnresolvedOutboundHooks,
-            ):
-                raise ValueError("Outbound Hook registry authority is immutable")
-            self.__profile = key
-            self.__state = value
+            self._setitem_locked(key, value)
+
+    def _setitem_locked(self, key: Path, value: Any | None) -> None:
+        self._prepare_mutation_locked()
+        if self.__profile is not None and key != self.__profile:
+            raise ValueError("Outbound Hook registry store is already bound")
+        if self.__state is not _MISSING_OUTBOUND_HOOK_REGISTRY and not isinstance(
+            self.__state,
+            _UnresolvedOutboundHooks,
+        ):
+            raise ValueError("Outbound Hook registry authority is immutable")
+        self.__profile = key
+        self.__state = value
 
     def __delitem__(self, key: Path) -> None:
         with self.__lock:
@@ -2792,6 +2797,16 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     def __ior__(self, other: Any) -> "_OutboundHookRegistryStore":
         self.update(other)
         return self
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        candidate = dict(*args, **kwargs)
+        if len(candidate) > 1:
+            raise ValueError("Outbound Hook registry store accepts one Profile")
+        if not candidate:
+            return
+        key, value = next(iter(candidate.items()))
+        with self.__lock:
+            self._setitem_locked(key, value)
 
 
 _standalone_outbound_hook_registries = _OutboundHookRegistryStore()
