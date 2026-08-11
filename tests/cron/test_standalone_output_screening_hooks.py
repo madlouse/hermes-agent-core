@@ -114,6 +114,36 @@ def test_gateway_registry_is_preferred_without_standalone_discovery(
     )
 
     assert scheduler._active_outbound_hooks() is live_hooks
+    assert scheduler._standalone_outbound_hook_registries == {profile: live_hooks}
+
+
+def test_gateway_profile_binding_blocks_later_standalone_profile(
+    monkeypatch, tmp_path
+):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_screening_hook(profile_b, reason="profile-b")
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile_a / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+
+    hooks_a = _load_with_profile_override(profile_a)
+    hooks_b = _load_with_profile_override(profile_b)
+    decision_b = asyncio.run(
+        outbound_before_send(hooks_b, _required_context(profile_b))
+    )
+
+    assert hooks_a is live_hooks
+    assert hooks_b is None
+    assert decision_b.reason == "required_output_screening_hook_missing"
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: live_hooks}
+    assert not any(
+        getattr(module, "PROFILE_REASON", "") == "profile-b"
+        for module in tuple(sys.modules.values())
+    )
 
 
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):

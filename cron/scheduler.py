@@ -2600,6 +2600,20 @@ _standalone_outbound_hook_registries: dict[Path, Any | None] = {}
 _standalone_outbound_hooks_lock = threading.Lock()
 
 
+def _bind_live_outbound_hooks(profile_home: Path, hooks: Any) -> Any:
+    """Bind a matching live registry to the process-wide Profile owner."""
+    with _standalone_outbound_hooks_lock:
+        if (
+            _standalone_outbound_hook_registries
+            and profile_home not in _standalone_outbound_hook_registries
+        ):
+            raise ValueError(
+                "Standalone Cron process is already bound to another Profile"
+            )
+        _standalone_outbound_hook_registries.setdefault(profile_home, hooks)
+    return hooks
+
+
 def _standalone_outbound_hooks():
     """Load the selected Profile's normal hooks for a standalone Cron run."""
     profile_home = get_hermes_home().expanduser()
@@ -2648,7 +2662,15 @@ def _active_outbound_hooks():
                 Path(hooks_dir).expanduser().absolute()
                 == (profile_home / "hooks").absolute()
             ):
-                return hooks
+                try:
+                    return _bind_live_outbound_hooks(profile_home, hooks)
+                except ValueError:
+                    logger.warning(
+                        "Gateway hook registry matches a Profile other than the "
+                        "process owner",
+                        exc_info=True,
+                    )
+                    return None
             if hooks is not None:
                 logger.warning(
                     "Gateway hook registry belongs to another Profile; "
