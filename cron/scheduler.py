@@ -2625,8 +2625,12 @@ class _OutboundHookRegistryStore(dict[Path, Any | None]):
         if isinstance(value, _UnresolvedOutboundHooks):
             value.revoked = True
 
+    def _revoke_all_claims(self) -> None:
+        for value in self.values():
+            self._revoke(value)
+
     def __setitem__(self, key: Path, value: Any | None) -> None:
-        self._revoke(self.get(key, _MISSING_OUTBOUND_HOOK_REGISTRY))
+        self._revoke_all_claims()
         super().__setitem__(key, value)
 
     def resolve_claim(
@@ -2657,24 +2661,23 @@ class _OutboundHookRegistryStore(dict[Path, Any | None]):
         return True
 
     def __delitem__(self, key: Path) -> None:
-        self._revoke(self[key])
+        self._revoke_all_claims()
         super().__delitem__(key)
 
     def clear(self) -> None:
-        for value in self.values():
-            self._revoke(value)
+        self._revoke_all_claims()
         super().clear()
 
     def pop(self, key: Path, *default: Any) -> Any:
         if key in self:
-            self._revoke(self[key])
+            self._revoke_all_claims()
         return super().pop(key, *default)
 
     def popitem(self) -> tuple[Path, Any | None]:
         if not self:
             raise KeyError("popitem(): dictionary is empty")
         key = next(reversed(self))
-        self._revoke(self[key])
+        self._revoke_all_claims()
         return super().popitem()
 
     def setdefault(self, key: Path, default: Any | None = None) -> Any | None:

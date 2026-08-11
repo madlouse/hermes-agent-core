@@ -477,6 +477,55 @@ def test_registry_store_reinitialization_revokes_unresolved_claim(tmp_path):
     assert store == {profile: replacement}
 
 
+def test_same_profile_waiter_rejects_cross_profile_store_mutation(
+    monkeypatch, tmp_path
+):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks_a = HookRegistry(profile_a / "hooks")
+    hooks_b = HookRegistry(profile_b / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks_a)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(key):
+        results[key] = _load_with_profile_override(profile_a)
+
+    first = threading.Thread(target=load, args=("first",), name="first")
+    second = threading.Thread(target=load, args=("second",), name="second")
+    first.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile_a]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    waiter_entered = _observe_claim_wait(monkeypatch, token)
+    second.start()
+    assert waiter_entered.wait(timeout=2)
+
+    with scheduler._standalone_outbound_hooks_lock:
+        scheduler._standalone_outbound_hook_registries[profile_b] = hooks_b
+    assert token.revoked is True
+
+    release_lookup.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert results == {"first": None, "second": None}
+    assert scheduler._standalone_outbound_hook_registries == {
+        profile_a: None,
+        profile_b: hooks_b,
+    }
+
+
 def test_hook_discovery_reentry_fails_closed_without_deadlock(monkeypatch, tmp_path):
     profile = tmp_path / "profile"
     _write_screening_hook(profile)
