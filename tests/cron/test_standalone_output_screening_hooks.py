@@ -608,6 +608,31 @@ def test_registry_store_has_no_dict_base_mutation_bypass(tmp_path):
     assert store == {profile_a: token}
 
 
+def test_noop_and_failed_mapping_mutations_preserve_exact_claim(tmp_path):
+    profile = tmp_path / "profile"
+    missing = tmp_path / "missing"
+    token = scheduler._UnresolvedOutboundHooks()
+    hooks = object()
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
+
+    store[profile] = token
+    store.update({profile: token})
+    store |= store
+    with pytest.raises(ValueError, match="already bound"):
+        store[missing] = object()
+    with pytest.raises(ValueError, match="already bound"):
+        store.update({missing: object()})
+    with pytest.raises(ValueError, match="already bound"):
+        store.setdefault(missing, object())
+    with pytest.raises(KeyError):
+        del store[missing]
+
+    assert token.revoked is False
+    assert store._resolve_claim(profile, token, hooks) is True
+    assert store == {profile: hooks}
+
+
 def test_direct_file_alias_reuses_canonical_process_authority(tmp_path):
     scheduler._standalone_outbound_hook_registries.clear()
     spec = importlib.util.spec_from_file_location(

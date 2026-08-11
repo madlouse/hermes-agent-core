@@ -96,7 +96,9 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             self._setitem_locked(key, value)
 
     def _setitem_locked(self, key: Path, value: Any | None) -> None:
-        self._prepare_mutation_locked()
+        self._reject_active_waiters_locked()
+        if key == self.__profile and self.__state is value:
+            return
         if self.__profile is not None and key != self.__profile:
             raise ValueError("Outbound Hook registry store is already bound")
         if self.__state is not _MISSING_OUTBOUND_HOOK_REGISTRY and not isinstance(
@@ -104,14 +106,16 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             _UnresolvedOutboundHooks,
         ):
             raise ValueError("Outbound Hook registry authority is immutable")
+        self._prepare_mutation_locked()
         self.__profile = key
         self.__state = value
 
     def __delitem__(self, key: Path) -> None:
         with self.__lock:
-            self._prepare_mutation_locked()
+            self._reject_active_waiters_locked()
             if key != self.__profile or self.__state is _MISSING_OUTBOUND_HOOK_REGISTRY:
                 raise KeyError(key)
+            self._prepare_mutation_locked()
             self.__profile = None
             self.__state = _MISSING_OUTBOUND_HOOK_REGISTRY
 
