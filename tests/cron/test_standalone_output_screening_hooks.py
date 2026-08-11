@@ -813,16 +813,43 @@ def test_waiter_terminalization_increments_authority_revision(tmp_path):
     token = scheduler._UnresolvedOutboundHooks()
     first_waiter = scheduler._OutboundHookWaiter()
     second_waiter = scheduler._OutboundHookWaiter()
-    token.waiters.update({first_waiter, second_waiter})
-    token.done.set()
+    replacement = object()
     store = scheduler._OutboundHookRegistryStore()
     store[profile] = token
     revision_before = store._OutboundHookRegistryStore__generation
+    iteration_entered = threading.Event()
+    release_iteration = threading.Event()
+    update_result = {}
+
+    def slow_items():
+        iteration_entered.set()
+        assert release_iteration.wait(timeout=2)
+        yield profile, replacement
+
+    def mutate():
+        try:
+            store.update(slow_items())
+        except ValueError as exc:
+            update_result["error"] = str(exc)
+
+    worker = threading.Thread(target=mutate, name="stale-update")
+    worker.start()
+    assert iteration_entered.wait(timeout=2)
+    with store.lock:
+        token.waiters.update({first_waiter, second_waiter})
+        token.done.set()
 
     assert store._consume_waiter(profile, token, first_waiter) == (None, False)
     assert store._OutboundHookRegistryStore__generation == revision_before + 1
     assert store[profile] is token
     assert store._consume_waiter(profile, token, second_waiter) == (None, False)
+    assert store._OutboundHookRegistryStore__generation == revision_before + 2
+    assert store == {profile: None}
+
+    release_iteration.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert update_result == {"error": "Outbound Hook registry authority changed"}
     assert store == {profile: None}
 
 
