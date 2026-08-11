@@ -372,6 +372,34 @@ def test_context_selected_profiles_fail_closed_after_first_profile_binding(
     assert list(scheduler._standalone_outbound_hook_registries) == [profile_a]
 
 
+def test_failed_first_profile_load_still_owns_process_binding(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_screening_hook(profile_a, reason="profile-a")
+    _write_screening_hook(profile_b, reason="profile-b")
+    scheduler._standalone_outbound_hook_registries.clear()
+    original_discover = HookRegistry.discover_and_load
+    calls = []
+
+    def fail_first(registry):
+        calls.append(registry.hooks_dir)
+        raise OSError("first Profile unavailable")
+
+    monkeypatch.setattr(HookRegistry, "discover_and_load", fail_first)
+    assert _load_with_profile_override(profile_a) is None
+    monkeypatch.setattr(HookRegistry, "discover_and_load", original_discover)
+
+    hooks_b = _load_with_profile_override(profile_b)
+    decision_b = asyncio.run(
+        outbound_before_send(hooks_b, _required_context(profile_b))
+    )
+
+    assert hooks_b is None
+    assert decision_b.reason == "required_output_screening_hook_missing"
+    assert calls == [profile_a / "hooks"]
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: None}
+
+
 def test_second_profile_handler_is_not_loaded_after_process_binding(tmp_path):
     profile_a = tmp_path / "profile-a"
     profile_b = tmp_path / "profile-b"

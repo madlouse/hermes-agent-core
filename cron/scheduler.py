@@ -2596,7 +2596,7 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
-_standalone_outbound_hook_registries: dict[Path, Any] = {}
+_standalone_outbound_hook_registries: dict[Path, Any | None] = {}
 _standalone_outbound_hooks_lock = threading.Lock()
 
 
@@ -2606,13 +2606,16 @@ def _standalone_outbound_hooks():
     if not profile_home.is_absolute():
         profile_home = Path.cwd() / profile_home
     with _standalone_outbound_hooks_lock:
-        cached = _standalone_outbound_hook_registries.get(profile_home)
-        if cached is not None:
+        if profile_home in _standalone_outbound_hook_registries:
+            cached = _standalone_outbound_hook_registries[profile_home]
+            if cached is None:
+                raise ValueError("Standalone Cron Profile Hook registry is unavailable")
             return cached
         if _standalone_outbound_hook_registries:
             raise ValueError(
                 "Standalone Cron process is already bound to another Profile"
             )
+        _standalone_outbound_hook_registries[profile_home] = None
 
         from gateway.hooks import HookRegistry
 
