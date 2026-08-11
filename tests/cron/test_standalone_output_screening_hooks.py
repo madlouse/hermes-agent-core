@@ -457,6 +457,23 @@ def test_runner_reference_attribute_error_terminalizes_claim(monkeypatch, tmp_pa
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
+def test_noncallable_runner_reference_fails_closed_without_discovery(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    _write_screening_hook(profile, reason="must-not-load")
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", object())
+
+    hooks = _load_with_profile_override(profile)
+    decision = asyncio.run(outbound_before_send(hooks, _required_context(profile)))
+
+    assert hooks is None
+    assert decision.transmit is False
+    assert decision.reason == "required_output_screening_hook_missing"
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
 def test_runner_reference_attribute_control_signal_propagates(monkeypatch, tmp_path):
     profile = tmp_path / "profile"
     scheduler._standalone_outbound_hook_registries.clear()

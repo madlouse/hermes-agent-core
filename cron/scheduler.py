@@ -2768,6 +2768,13 @@ def _resolve_claimed_outbound_hooks(
         _fail_outbound_hook_claim_during_control_signal(profile_home, claimed)
         raise
 
+    if runner_ref is not None and not callable(runner_ref):
+        _fail_outbound_hook_claim(profile_home, claimed)
+        _warn_outbound_hook_failure(
+            "Gateway runner reference is not callable"
+        )
+        return None
+
     if callable(runner_ref):
         try:
             runner = runner_ref()
