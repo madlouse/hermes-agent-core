@@ -347,7 +347,7 @@ def test_standalone_discovery_is_quiet(monkeypatch, tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_context_selected_profiles_load_isolated_hook_registries(
+def test_context_selected_profiles_fail_closed_after_first_profile_binding(
     monkeypatch, tmp_path
 ):
     profile_a = tmp_path / "profile-a"
@@ -366,12 +366,41 @@ def test_context_selected_profiles_load_isolated_hook_registries(
         outbound_before_send(hooks_b, _required_context(profile_b))
     )
 
-    assert hooks_a is not hooks_b
+    assert hooks_b is None
     assert decision_a.reason == "profile-a"
-    assert decision_b.reason == "profile-b"
+    assert decision_b.reason == "required_output_screening_hook_missing"
+    assert list(scheduler._standalone_outbound_hook_registries) == [profile_a]
 
 
-def test_context_selected_profiles_keep_distinct_hook_module_identity(tmp_path):
+def test_failed_first_profile_load_still_owns_process_binding(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_screening_hook(profile_a, reason="profile-a")
+    _write_screening_hook(profile_b, reason="profile-b")
+    scheduler._standalone_outbound_hook_registries.clear()
+    original_discover = HookRegistry.discover_and_load
+    calls = []
+
+    def fail_first(registry):
+        calls.append(registry.hooks_dir)
+        raise OSError("first Profile unavailable")
+
+    monkeypatch.setattr(HookRegistry, "discover_and_load", fail_first)
+    assert _load_with_profile_override(profile_a) is None
+    monkeypatch.setattr(HookRegistry, "discover_and_load", original_discover)
+
+    hooks_b = _load_with_profile_override(profile_b)
+    decision_b = asyncio.run(
+        outbound_before_send(hooks_b, _required_context(profile_b))
+    )
+
+    assert hooks_b is None
+    assert decision_b.reason == "required_output_screening_hook_missing"
+    assert calls == [profile_a / "hooks"]
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: None}
+
+
+def test_second_profile_handler_is_not_loaded_after_process_binding(tmp_path):
     profile_a = tmp_path / "profile-a"
     profile_b = tmp_path / "profile-b"
     for profile, reason in ((profile_a, "profile-a"), (profile_b, "profile-b")):
@@ -402,7 +431,12 @@ def test_context_selected_profiles_keep_distinct_hook_module_identity(tmp_path):
     )
 
     assert decision_a.reason == "profile-a"
-    assert decision_b.reason == "profile-b"
+    assert hooks_b is None
+    assert decision_b.reason == "required_output_screening_hook_missing"
+    assert not any(
+        getattr(module, "PROFILE_REASON", "") == "profile-b"
+        for module in tuple(sys.modules.values())
+    )
 
 
 def test_mismatched_gateway_registry_does_not_cross_profiles(
@@ -429,8 +463,8 @@ def test_mismatched_gateway_registry_does_not_cross_profiles(
         outbound_before_send(hooks_b, _required_context(profile_b))
     )
 
-    assert hooks_b is not hooks_a
-    assert decision.reason == "profile-b"
+    assert hooks_b is None
+    assert decision.reason == "required_output_screening_hook_missing"
 
 
 def test_standalone_cron_delivery_discovers_hook_before_sender(
