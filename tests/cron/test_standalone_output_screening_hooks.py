@@ -523,9 +523,10 @@ def test_registry_store_reinitialization_revokes_unresolved_claim(tmp_path):
     profile = tmp_path / "profile"
     token = scheduler._UnresolvedOutboundHooks()
     replacement = object()
-    store = scheduler._OutboundHookRegistryStore({profile: token})
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile] = token
 
-    store.__init__({profile: replacement})
+    store[profile] = replacement
 
     assert token.revoked is True
     assert store == {profile: replacement}
@@ -536,9 +537,10 @@ def test_rejected_store_reinitialization_preserves_existing_authority(tmp_path):
     profile_b = tmp_path / "profile-b"
     profile_c = tmp_path / "profile-c"
     hooks_a = object()
-    store = scheduler._OutboundHookRegistryStore({profile_a: hooks_a})
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile_a] = hooks_a
 
-    with pytest.raises(ValueError, match="accepts one Profile"):
+    with pytest.raises(TypeError):
         store.__init__({profile_b: object(), profile_c: object()})
 
     assert store == {profile_a: hooks_a}
@@ -548,12 +550,17 @@ def test_registry_store_has_no_dict_base_mutation_bypass(tmp_path):
     profile_a = tmp_path / "profile-a"
     profile_b = tmp_path / "profile-b"
     token = scheduler._UnresolvedOutboundHooks()
-    store = scheduler._OutboundHookRegistryStore({profile_a: token})
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile_a] = token
 
     with pytest.raises(TypeError):
         dict.update(store, {profile_b: object()})
     with pytest.raises(AttributeError):
         store._data = {profile_b: object()}
+    with pytest.raises(AttributeError):
+        store._profile = profile_b
+    with pytest.raises(AttributeError):
+        store._state = object()
 
     assert token.revoked is False
     assert store == {profile_a: token}
@@ -565,7 +572,8 @@ def test_registry_store_serializes_claim_publish_with_cross_profile_write(tmp_pa
     token = scheduler._UnresolvedOutboundHooks()
     hooks_a = object()
     hooks_b = object()
-    store = scheduler._OutboundHookRegistryStore({profile_a: token})
+    store = scheduler._OutboundHookRegistryStore()
+    store[profile_a] = token
     mutation_started = threading.Event()
     mutation_finished = threading.Event()
     results = {}

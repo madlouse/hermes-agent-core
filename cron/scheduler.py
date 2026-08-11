@@ -2623,26 +2623,16 @@ _MISSING_OUTBOUND_HOOK_REGISTRY = object()
 class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
     """One lock-owned Profile authority projected as a mapping."""
 
-    __slots__ = ("_lock", "_profile", "_state")
+    __slots__ = ("__lock", "__profile", "__state")
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        initial = dict(*args, **kwargs)
-        if len(initial) > 1:
-            raise ValueError("Outbound Hook registry store accepts one Profile")
-        if not hasattr(self, "_lock"):
-            self._lock = threading.RLock()
-            self._profile: Path | None = None
-            self._state: Any = _MISSING_OUTBOUND_HOOK_REGISTRY
-        with self._lock:
-            self._prepare_mutation_locked()
-            self._profile = None
-            self._state = _MISSING_OUTBOUND_HOOK_REGISTRY
-            if initial:
-                self._profile, self._state = next(iter(initial.items()))
+    def __init__(self) -> None:
+        self.__lock = threading.RLock()
+        self.__profile: Path | None = None
+        self.__state: Any = _MISSING_OUTBOUND_HOOK_REGISTRY
 
     @property
     def lock(self):
-        return self._lock
+        return self.__lock
 
     def _active_waiters_locked(
         self,
@@ -2660,71 +2650,71 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         key: Path,
         claim_token: _UnresolvedOutboundHooks,
     ) -> None:
-        if self._profile != key or self._state is not claim_token:
+        if self.__profile != key or self.__state is not claim_token:
             return
         if self._active_waiters_locked(claim_token):
             return
         result = claim_token.result
         if result is _UNRESOLVED_OUTBOUND_HOOK_RESULT:
             return
-        self._state = None if claim_token.revoked else result
+        self.__state = None if claim_token.revoked else result
 
     def _prepare_mutation_locked(self) -> None:
-        if not isinstance(self._state, _UnresolvedOutboundHooks):
+        if not isinstance(self.__state, _UnresolvedOutboundHooks):
             return
-        claim_token = self._state
-        self._finalize_claim_locked(self._profile, claim_token)
-        if self._state is not claim_token:
+        claim_token = self.__state
+        self._finalize_claim_locked(self.__profile, claim_token)
+        if self.__state is not claim_token:
             return
         if self._active_waiters_locked(claim_token):
             raise ValueError("Outbound Hook registry claim has active waiters")
         claim_token.revoked = True
 
     def __getitem__(self, key: Path) -> Any | None:
-        with self._lock:
-            if key != self._profile or self._state is _MISSING_OUTBOUND_HOOK_REGISTRY:
+        with self.__lock:
+            if key != self.__profile or self.__state is _MISSING_OUTBOUND_HOOK_REGISTRY:
                 raise KeyError(key)
-            return self._state
+            return self.__state
 
     def __setitem__(self, key: Path, value: Any | None) -> None:
-        with self._lock:
+        with self.__lock:
             self._prepare_mutation_locked()
-            if self._profile is not None and key != self._profile:
+            if self.__profile is not None and key != self.__profile:
                 raise ValueError("Outbound Hook registry store is already bound")
-            if self._state is not _MISSING_OUTBOUND_HOOK_REGISTRY and not isinstance(
-                self._state,
+            if self.__state is not _MISSING_OUTBOUND_HOOK_REGISTRY and not isinstance(
+                self.__state,
                 _UnresolvedOutboundHooks,
             ):
                 raise ValueError("Outbound Hook registry authority is immutable")
-            self._profile = key
-            self._state = value
+            self.__profile = key
+            self.__state = value
 
     def __delitem__(self, key: Path) -> None:
-        with self._lock:
+        with self.__lock:
             self._prepare_mutation_locked()
-            if key != self._profile or self._state is _MISSING_OUTBOUND_HOOK_REGISTRY:
+            if key != self.__profile or self.__state is _MISSING_OUTBOUND_HOOK_REGISTRY:
                 raise KeyError(key)
-            self._profile = None
-            self._state = _MISSING_OUTBOUND_HOOK_REGISTRY
+            self.__profile = None
+            self.__state = _MISSING_OUTBOUND_HOOK_REGISTRY
 
     def __iter__(self) -> Iterator[Path]:
-        with self._lock:
-            if self._profile is None or self._state is _MISSING_OUTBOUND_HOOK_REGISTRY:
+        with self.__lock:
+            if self.__profile is None or self.__state is _MISSING_OUTBOUND_HOOK_REGISTRY:
                 return iter(())
-            return iter((self._profile,))
+            return iter((self.__profile,))
 
     def __len__(self) -> int:
-        with self._lock:
+        with self.__lock:
             return int(
-                self._profile is not None
-                and self._state is not _MISSING_OUTBOUND_HOOK_REGISTRY
+                self.__profile is not None
+                and self.__state is not _MISSING_OUTBOUND_HOOK_REGISTRY
             )
 
     def __contains__(self, key: object) -> bool:
-        with self._lock:
+        with self.__lock:
             return (
-                key == self._profile
-                and self._state is not _MISSING_OUTBOUND_HOOK_REGISTRY
+                key == self.__profile
+                and self.__state is not _MISSING_OUTBOUND_HOOK_REGISTRY
             )
 
     def _resolve_claim(
@@ -2734,8 +2724,8 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         result: Any,
     ) -> bool:
         """Publish success only for the exact active claim."""
-        with self._lock:
-            if self._profile != key or self._state is not claim_token:
+        with self.__lock:
+            if self.__profile != key or self.__state is not claim_token:
                 return False
             if claim_token.revoked:
                 return False
@@ -2750,8 +2740,8 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         claim_token: _UnresolvedOutboundHooks,
     ) -> bool:
         """Terminalize an exact claim without treating cleanup as replacement."""
-        with self._lock:
-            if self._profile != key or self._state is not claim_token:
+        with self.__lock:
+            if self.__profile != key or self.__state is not claim_token:
                 return False
             claim_token.result = None
             claim_token.done.set()
@@ -2765,7 +2755,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         waiter: _OutboundHookWaiter,
     ) -> tuple[Any, bool]:
         """Consume one registered waiter and finalize its published result."""
-        with self._lock:
+        with self.__lock:
             if waiter not in claim_token.waiters:
                 raise RuntimeError("Outbound Hook claim waiter count underflow")
             claim_token.waiters.remove(waiter)
@@ -2786,7 +2776,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         """Publish waiter abandonment without delaying the original signal."""
         waiter.abandoned.set()
         try:
-            acquired = self._lock.acquire(False)
+            acquired = self.__lock.acquire(False)
         except BaseException:
             return
         if not acquired:
@@ -2795,7 +2785,7 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
             self._finalize_claim_locked(key, claim_token)
         finally:
             try:
-                self._lock.release()
+                self.__lock.release()
             except BaseException:
                 pass
 
@@ -2836,6 +2826,10 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
                         )
                     if cached.done.is_set():
                         if cached.result is None:
+                            _standalone_outbound_hook_registries._finalize_claim_locked(
+                                profile_home,
+                                cached,
+                            )
                             raise ValueError(
                                 "Standalone Cron Profile Hook registry is unavailable"
                             )
@@ -2847,6 +2841,10 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
                             raise ValueError(
                                 "Standalone Cron Profile Hook registry is unavailable"
                             )
+                        _standalone_outbound_hook_registries._finalize_claim_locked(
+                            profile_home,
+                            cached,
+                        )
                         return cached.result
                     if cached.owner_thread_id == threading.get_ident():
                         raise ValueError(
