@@ -553,6 +553,61 @@ def test_cleanup_interruption_retries_exact_token_and_preserves_original_signal(
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
+def test_persistent_cleanup_signals_do_not_spin_or_replace_original_signal(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    cleanup_calls = []
+
+    def cleanup_always_interrupted(profile_home, claim_token):
+        cleanup_calls.append((profile_home, claim_token))
+        raise SystemExit("cleanup interrupted")
+
+    monkeypatch.setattr(
+        scheduler,
+        "_fail_outbound_hook_claim",
+        cleanup_always_interrupted,
+    )
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.failed is True
+    assert len(cleanup_calls) == scheduler._CONTROL_SIGNAL_CLEANUP_ATTEMPTS
+
+    monkeypatch.setattr(
+        scheduler,
+        "_fail_outbound_hook_claim",
+        lambda profile_home, claim_token: None,
+    )
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_logging_failure_cannot_replace_fail_closed_result(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: (_ for _ in ()).throw(RuntimeError("runner failed")),
+    )
+    monkeypatch.setattr(
+        scheduler.logger,
+        "warning",
+        lambda *args, **kwargs: (_ for _ in ()).throw(SystemExit("logger failed")),
+    )
+
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):
     profile = tmp_path / "missing-profile"
     _reset_standalone_cache(monkeypatch, profile)
