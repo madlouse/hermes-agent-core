@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -114,6 +115,607 @@ def test_gateway_registry_is_preferred_without_standalone_discovery(
     )
 
     assert scheduler._active_outbound_hooks() is live_hooks
+    assert scheduler._standalone_outbound_hook_registries == {profile: live_hooks}
+
+
+def test_gateway_profile_binding_blocks_later_standalone_profile(
+    monkeypatch, tmp_path
+):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_screening_hook(profile_b, reason="profile-b")
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile_a / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+
+    hooks_a = _load_with_profile_override(profile_a)
+    hooks_b = _load_with_profile_override(profile_b)
+    decision_b = asyncio.run(
+        outbound_before_send(hooks_b, _required_context(profile_b))
+    )
+
+    assert hooks_a is live_hooks
+    assert hooks_b is None
+    assert decision_b.reason == "required_output_screening_hook_missing"
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: live_hooks}
+    assert not any(
+        getattr(module, "PROFILE_REASON", "") == "profile-b"
+        for module in tuple(sys.modules.values())
+    )
+
+
+def test_failed_standalone_profile_cannot_switch_to_live_gateway_registry(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+    assert _load_with_profile_override(profile) is None
+    live_hooks = HookRegistry(profile / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+
+    hooks = _load_with_profile_override(profile)
+    decision = asyncio.run(outbound_before_send(hooks, _required_context(profile)))
+
+    assert hooks is None
+    assert decision.reason == "required_output_screening_hook_missing"
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_standalone_profile_cannot_switch_to_second_live_registry(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    _write_screening_hook(profile, reason="standalone")
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    standalone_hooks = _load_with_profile_override(profile)
+    live_hooks = HookRegistry(profile / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+
+    selected = _load_with_profile_override(profile)
+
+    assert selected is standalone_hooks
+    assert selected is not live_hooks
+    assert scheduler._standalone_outbound_hook_registries == {
+        profile: standalone_hooks
+    }
+
+
+def test_first_selected_profile_owns_before_gateway_lookup(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile_a / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    lookup_calls = []
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_calls.append(threading.current_thread().name)
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(profile, key):
+        results[key] = _load_with_profile_override(profile)
+
+    thread_a = threading.Thread(target=load, args=(profile_a, "a"), name="profile-a")
+    thread_b = threading.Thread(target=load, args=(profile_b, "b"), name="profile-b")
+    thread_a.start()
+    assert lookup_entered.wait(timeout=2)
+    thread_b.start()
+    thread_b.join(timeout=2)
+
+    assert not thread_b.is_alive()
+    assert results["b"] is None
+    assert lookup_calls == ["profile-a"]
+
+    release_lookup.set()
+    thread_a.join(timeout=2)
+
+    assert not thread_a.is_alive()
+    assert results["a"] is live_hooks
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: live_hooks}
+
+
+def test_hook_discovery_reentry_fails_closed_without_deadlock(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    _write_screening_hook(profile)
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    original_discover = HookRegistry.discover_and_load
+    reentrant_results = []
+
+    def discover_with_reentry(registry):
+        reentrant_results.append(_load_with_profile_override(profile))
+        return original_discover(registry)
+
+    monkeypatch.setattr(HookRegistry, "discover_and_load", discover_with_reentry)
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is not None
+    assert reentrant_results == [None]
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
+def test_live_registry_cannot_commit_after_claim_is_lost(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile / "hooks")
+
+    def clear_claim_before_return():
+        scheduler._standalone_outbound_hook_registries.clear()
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", clear_claim_before_return)
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {}
+
+
+def test_live_registry_inspection_failure_terminalizes_exact_claim(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+
+    class BrokenHooks:
+        @property
+        def hooks_dir(self):
+            raise OSError("hooks directory unavailable")
+
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=BrokenHooks()),
+    )
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_live_registry_lookup_failure_does_not_fallback(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    _write_screening_hook(profile)
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: (_ for _ in ()).throw(OSError("runner unavailable")),
+    )
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_mismatched_live_registry_does_not_fallback(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_screening_hook(profile_b)
+    scheduler._standalone_outbound_hook_registries.clear()
+    live_hooks = HookRegistry(profile_a / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+
+    hooks = _load_with_profile_override(profile_b)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile_b: None}
+
+
+def test_lost_claim_cannot_consume_replacement_registry(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    replacement = HookRegistry(profile / "replacement-hooks")
+    live_hooks = HookRegistry(profile / "hooks")
+
+    def replace_claim_before_return():
+        scheduler._standalone_outbound_hook_registries[profile] = replacement
+        return SimpleNamespace(hooks=live_hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", replace_claim_before_return)
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+
+
+def test_profile_home_is_captured_once_for_claim_and_discovery(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_screening_hook(profile_a)
+    scheduler._standalone_outbound_hook_registries.clear()
+    profiles = iter((profile_a, profile_b))
+    calls = []
+
+    def drifting_profile_home():
+        selected = next(profiles)
+        calls.append(selected)
+        return selected
+
+    monkeypatch.setattr(scheduler, "get_hermes_home", drifting_profile_home)
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+    hooks = scheduler._active_outbound_hooks()
+
+    assert hooks is not None
+    assert calls == [profile_a]
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: hooks}
+
+
+def test_discovery_runtime_error_after_lost_claim_fails_closed(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    replacement = HookRegistry(profile / "replacement-hooks")
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+
+    def replace_claim_then_fail(registry):
+        scheduler._standalone_outbound_hook_registries[profile] = replacement
+        raise RuntimeError("discovery failed after ownership changed")
+
+    monkeypatch.setattr(HookRegistry, "discover_and_load", replace_claim_then_fail)
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+
+
+def test_gateway_control_signal_terminalizes_exact_claim_and_propagates(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+    live_hooks = HookRegistry(profile / "hooks")
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: SimpleNamespace(hooks=live_hooks),
+    )
+    assert _load_with_profile_override(profile) is None
+
+
+def test_gateway_control_signal_preserves_replacement_claim(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    replacement = HookRegistry(profile / "replacement-hooks")
+
+    def replace_then_interrupt():
+        scheduler._standalone_outbound_hook_registries[profile] = replacement
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", replace_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert scheduler._standalone_outbound_hook_registries == {profile: replacement}
+
+
+def test_discovery_control_signal_terminalizes_exact_claim_and_propagates(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    monkeypatch.setattr(
+        HookRegistry,
+        "discover_and_load",
+        lambda registry: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+    assert _load_with_profile_override(profile) is None
+
+
+def test_runner_reference_attribute_error_terminalizes_claim(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+
+    class BrokenGatewayModule:
+        def __getattr__(self, name):
+            raise RuntimeError(f"unavailable: {name}")
+
+    monkeypatch.setitem(sys.modules, "gateway.run", BrokenGatewayModule())
+
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_noncallable_runner_reference_fails_closed_without_discovery(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    _write_screening_hook(profile, reason="must-not-load")
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", object())
+
+    hooks = _load_with_profile_override(profile)
+    decision = asyncio.run(outbound_before_send(hooks, _required_context(profile)))
+
+    assert hooks is None
+    assert decision.transmit is False
+    assert decision.reason == "required_output_screening_hook_missing"
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_runner_reference_attribute_control_signal_propagates(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+
+    class InterruptedGatewayModule:
+        def __getattr__(self, name):
+            raise KeyboardInterrupt
+
+    monkeypatch.setitem(sys.modules, "gateway.run", InterruptedGatewayModule())
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_runner_control_signal_does_not_wait_for_held_cleanup_lock(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_lock():
+        with scheduler._standalone_outbound_hooks_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock)
+
+    def interrupt_with_lock_held():
+        holder.start()
+        assert lock_held.wait(timeout=2)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        interrupt_with_lock_held,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
+    release_lock.set()
+    holder.join(timeout=2)
+    assert not holder.is_alive()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_discovery_control_signal_does_not_wait_for_held_cleanup_lock(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_lock():
+        with scheduler._standalone_outbound_hooks_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock)
+
+    def interrupt_with_lock_held(registry):
+        holder.start()
+        assert lock_held.wait(timeout=2)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(HookRegistry, "discover_and_load", interrupt_with_lock_held)
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
+    release_lock.set()
+    holder.join(timeout=2)
+    assert not holder.is_alive()
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_direct_standalone_lock_signal_marks_claim_done(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    original_lock = scheduler._standalone_outbound_hooks_lock
+
+    class InterruptSecondEntry:
+        def __init__(self):
+            self.entries = 0
+
+        def __enter__(self):
+            self.entries += 1
+            if self.entries == 2:
+                raise KeyboardInterrupt
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            original_lock.release()
+
+        def acquire(self, blocking=True):
+            return original_lock.acquire(blocking)
+
+        def release(self):
+            original_lock.release()
+
+    interrupting_lock = InterruptSecondEntry()
+    monkeypatch.setattr(
+        scheduler,
+        "_standalone_outbound_hooks_lock",
+        interrupting_lock,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        scheduler._standalone_outbound_hooks(profile_home=profile)
+
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
+
+    monkeypatch.setattr(scheduler, "_standalone_outbound_hooks_lock", original_lock)
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+@pytest.mark.parametrize("entrypoint", ("direct", "active"))
+def test_claim_lock_exit_signal_marks_published_claim_done(
+    monkeypatch, tmp_path, entrypoint
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    original_lock = scheduler._standalone_outbound_hooks_lock
+
+    class InterruptFirstExit:
+        def __init__(self):
+            self.exits = 0
+
+        def __enter__(self):
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            original_lock.release()
+            self.exits += 1
+            if self.exits == 1:
+                raise KeyboardInterrupt
+
+        def acquire(self, blocking=True):
+            return original_lock.acquire(blocking)
+
+        def release(self):
+            original_lock.release()
+
+    monkeypatch.setattr(
+        scheduler,
+        "_standalone_outbound_hooks_lock",
+        InterruptFirstExit(),
+    )
+    monkeypatch.setattr(scheduler, "get_hermes_home", lambda: profile)
+
+    with pytest.raises(KeyboardInterrupt):
+        if entrypoint == "direct":
+            scheduler._standalone_outbound_hooks(profile_home=profile)
+        else:
+            scheduler._active_outbound_hooks()
+
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    assert token.done.is_set()
+
+    monkeypatch.setattr(scheduler, "_standalone_outbound_hooks_lock", original_lock)
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
+    monkeypatch, tmp_path
+):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    lookup_started = threading.Event()
+
+    def hold_lock():
+        with scheduler._standalone_outbound_hooks_lock:
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
+
+    holder = threading.Thread(target=hold_lock)
+
+    def fail_with_lock_held():
+        holder.start()
+        assert lock_held.wait(timeout=2)
+        lookup_started.set()
+        raise RuntimeError("runner failed")
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", fail_with_lock_held)
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(_load_with_profile_override(profile))
+    )
+    worker.start()
+    assert lookup_started.wait(timeout=2)
+    worker.join(timeout=0.1)
+    assert worker.is_alive()
+
+    release_lock.set()
+    holder.join(timeout=2)
+    worker.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert not worker.is_alive()
+    assert result == [None]
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
+
+
+def test_logging_failure_cannot_replace_fail_closed_result(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr(
+        "gateway.run._gateway_runner_ref",
+        lambda: (_ for _ in ()).throw(RuntimeError("runner failed")),
+    )
+    monkeypatch.setattr(
+        scheduler.logger,
+        "warning",
+        lambda *args, **kwargs: (_ for _ in ()).throw(SystemExit("logger failed")),
+    )
+
+    assert _load_with_profile_override(profile) is None
+    assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):

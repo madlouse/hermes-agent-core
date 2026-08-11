@@ -2595,38 +2595,243 @@ def _confirm_adapter_delivery(send_result) -> bool:
         return False
     return bool(getattr(send_result, "success"))
 
+class _UnresolvedOutboundHooks:
+    """Identity token for the one Profile lookup allowed to resolve."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+
 
 _standalone_outbound_hook_registries: dict[Path, Any | None] = {}
 _standalone_outbound_hooks_lock = threading.Lock()
 
 
-def _standalone_outbound_hooks():
-    """Load the selected Profile's normal hooks for a standalone Cron run."""
-    profile_home = get_hermes_home().expanduser()
-    if not profile_home.is_absolute():
-        profile_home = Path.cwd() / profile_home
+def _warn_outbound_hook_failure(message: str, *args: Any, exc_info: bool = False) -> None:
+    """Keep logging failures from changing output-boundary control flow."""
+    try:
+        logger.warning(message, *args, exc_info=exc_info)
+    except BaseException:
+        return
+
+
+def _claim_outbound_hook_profile(profile_home: Path) -> Any:
+    """Atomically bind the first selected Profile before any hook lookup."""
+    published_token: _UnresolvedOutboundHooks | None = None
+    try:
+        with _standalone_outbound_hooks_lock:
+            if profile_home in _standalone_outbound_hook_registries:
+                cached = _standalone_outbound_hook_registries[profile_home]
+                if isinstance(cached, _UnresolvedOutboundHooks):
+                    if cached.done.is_set():
+                        _standalone_outbound_hook_registries[profile_home] = None
+                        raise ValueError(
+                            "Standalone Cron Profile Hook registry is unavailable"
+                        )
+                    raise ValueError(
+                        "Standalone Cron Profile Hook registry is resolving"
+                    )
+                if cached is None:
+                    raise ValueError(
+                        "Standalone Cron Profile Hook registry is unavailable"
+                    )
+                return cached
+            if _standalone_outbound_hook_registries:
+                raise ValueError(
+                    "Standalone Cron process is already bound to another Profile"
+                )
+            published_token = _UnresolvedOutboundHooks()
+            _standalone_outbound_hook_registries[profile_home] = published_token
+            return published_token
+    except BaseException:
+        if published_token is not None:
+            published_token.done.set()
+        raise
+
+
+def _bind_live_outbound_hooks(
+    profile_home: Path,
+    hooks: Any,
+    claim_token: _UnresolvedOutboundHooks,
+) -> Any:
+    """Bind a matching live registry to the process-wide Profile owner."""
     with _standalone_outbound_hooks_lock:
         if profile_home in _standalone_outbound_hook_registries:
             cached = _standalone_outbound_hook_registries[profile_home]
-            if cached is None:
-                raise ValueError("Standalone Cron Profile Hook registry is unavailable")
-            return cached
-        if _standalone_outbound_hook_registries:
-            raise ValueError(
-                "Standalone Cron process is already bound to another Profile"
+            if cached is claim_token:
+                _standalone_outbound_hook_registries[profile_home] = hooks
+                return hooks
+        raise ValueError("Standalone Cron Profile Hook registry ownership changed")
+
+
+def _fail_outbound_hook_claim(
+    profile_home: Path,
+    claim_token: _UnresolvedOutboundHooks,
+) -> None:
+    """Publish failure only while the exact unresolved claim is still current."""
+    with _standalone_outbound_hooks_lock:
+        if _standalone_outbound_hook_registries.get(profile_home) is claim_token:
+            _standalone_outbound_hook_registries[profile_home] = None
+
+
+def _fail_outbound_hook_claim_during_control_signal(
+    profile_home: Path,
+    claim_token: _UnresolvedOutboundHooks,
+) -> None:
+    """Attempt exact-token cleanup without delaying the original signal."""
+    try:
+        acquired = _standalone_outbound_hooks_lock.acquire(False)
+    except BaseException:
+        return
+    if not acquired:
+        return
+    try:
+        if _standalone_outbound_hook_registries.get(profile_home) is claim_token:
+            _standalone_outbound_hook_registries[profile_home] = None
+    finally:
+        try:
+            _standalone_outbound_hooks_lock.release()
+        except BaseException:
+            pass
+
+
+def _standalone_outbound_hooks(
+    claim_token: _UnresolvedOutboundHooks | None = None,
+    profile_home: Path | None = None,
+):
+    """Load the selected Profile's normal hooks for a standalone Cron run."""
+    owns_claim = claim_token is None
+    if profile_home is None:
+        profile_home = get_hermes_home().expanduser()
+        if not profile_home.is_absolute():
+            profile_home = Path.cwd() / profile_home
+    if claim_token is None:
+        claimed = _claim_outbound_hook_profile(profile_home)
+        if not isinstance(claimed, _UnresolvedOutboundHooks):
+            return claimed
+        claim_token = claimed
+    try:
+        with _standalone_outbound_hooks_lock:
+            cached = _standalone_outbound_hook_registries.get(profile_home)
+            if cached is not claim_token:
+                raise ValueError(
+                    "Standalone Cron Profile Hook registry ownership changed"
+                )
+        try:
+            from gateway.hooks import HookRegistry
+
+            registry = HookRegistry(
+                profile_home / "hooks",
+                strict_discovery=True,
+                quiet=True,
             )
-        _standalone_outbound_hook_registries[profile_home] = None
-
-        from gateway.hooks import HookRegistry
-
-        registry = HookRegistry(
-            profile_home / "hooks",
-            strict_discovery=True,
-            quiet=True,
-        )
-        registry.discover_and_load()
-        _standalone_outbound_hook_registries[profile_home] = registry
+            registry.discover_and_load()
+        except Exception:
+            _fail_outbound_hook_claim(profile_home, claim_token)
+            raise
+        except BaseException:
+            _fail_outbound_hook_claim_during_control_signal(
+                profile_home,
+                claim_token,
+            )
+            raise
+        with _standalone_outbound_hooks_lock:
+            if (
+                _standalone_outbound_hook_registries.get(profile_home)
+                is not claim_token
+            ):
+                raise ValueError(
+                    "Standalone Cron Profile Hook registry ownership changed"
+                )
+            _standalone_outbound_hook_registries[profile_home] = registry
         return registry
+    finally:
+        if owns_claim:
+            claim_token.done.set()
+
+
+def _resolve_claimed_outbound_hooks(
+    profile_home: Path,
+    claimed: _UnresolvedOutboundHooks,
+):
+    """Resolve the exact first-Profile claim to one registry or failure."""
+    gateway_run = sys.modules.get("gateway.run")
+    try:
+        runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
+    except Exception:  # noqa: BLE001 - untrusted runner metadata must fail closed
+        _fail_outbound_hook_claim(profile_home, claimed)
+        _warn_outbound_hook_failure(
+            "Gateway runner reference lookup failed",
+            exc_info=True,
+        )
+        return None
+    except BaseException:
+        _fail_outbound_hook_claim_during_control_signal(profile_home, claimed)
+        raise
+
+    if runner_ref is not None and not callable(runner_ref):
+        _fail_outbound_hook_claim(profile_home, claimed)
+        _warn_outbound_hook_failure(
+            "Gateway runner reference is not callable"
+        )
+        return None
+
+    if callable(runner_ref):
+        try:
+            runner = runner_ref()
+        except Exception:  # noqa: BLE001 - an invalid live owner must fail closed
+            _fail_outbound_hook_claim(profile_home, claimed)
+            _warn_outbound_hook_failure(
+                "Gateway hook registry lookup failed",
+                exc_info=True,
+            )
+            return None
+        except BaseException:
+            _fail_outbound_hook_claim_during_control_signal(profile_home, claimed)
+            raise
+        if runner is not None:
+            try:
+                hooks = getattr(runner, "hooks", None)
+                hooks_dir = getattr(hooks, "hooks_dir", None)
+                hooks_match = hooks is not None and hooks_dir is not None and (
+                    Path(hooks_dir).expanduser().absolute()
+                    == (profile_home / "hooks").absolute()
+                )
+            except Exception:  # noqa: BLE001 - untrusted registry inspection must fail closed
+                _fail_outbound_hook_claim(profile_home, claimed)
+                _warn_outbound_hook_failure(
+                    "Gateway hook registry inspection failed",
+                    exc_info=True,
+                )
+                return None
+            except BaseException:
+                _fail_outbound_hook_claim_during_control_signal(
+                    profile_home,
+                    claimed,
+                )
+                raise
+            if not hooks_match:
+                _fail_outbound_hook_claim(profile_home, claimed)
+                _warn_outbound_hook_failure(
+                    "Gateway hook registry does not match the selected Profile"
+                )
+                return None
+            try:
+                return _bind_live_outbound_hooks(profile_home, hooks, claimed)
+            except ValueError:
+                _warn_outbound_hook_failure(
+                    "Gateway hook registry lost the selected Profile claim",
+                    exc_info=True,
+                )
+                return None
+
+    try:
+        return _standalone_outbound_hooks(claimed, profile_home)
+    except Exception:  # noqa: BLE001 - hook discovery must fail closed at the scheduler boundary
+        _warn_outbound_hook_failure(
+            "Standalone Cron output hooks unavailable",
+            exc_info=True,
+        )
+        return None
 
 
 def _active_outbound_hooks():
@@ -2634,32 +2839,20 @@ def _active_outbound_hooks():
     profile_home = get_hermes_home().expanduser()
     if not profile_home.is_absolute():
         profile_home = Path.cwd() / profile_home
-    gateway_run = sys.modules.get("gateway.run")
-    runner_ref = getattr(gateway_run, "_gateway_runner_ref", None)
-    if callable(runner_ref):
-        try:
-            runner = runner_ref()
-        except Exception:  # noqa: BLE001 - a broken optional runner must not disable standalone screening
-            logger.warning("Gateway hook registry lookup failed", exc_info=True)
-        else:
-            hooks = getattr(runner, "hooks", None) if runner is not None else None
-            hooks_dir = getattr(hooks, "hooks_dir", None)
-            if hooks is not None and hooks_dir is not None and (
-                Path(hooks_dir).expanduser().absolute()
-                == (profile_home / "hooks").absolute()
-            ):
-                return hooks
-            if hooks is not None:
-                logger.warning(
-                    "Gateway hook registry belongs to another Profile; "
-                    "loading hooks for %s",
-                    profile_home,
-                )
     try:
-        return _standalone_outbound_hooks()
-    except (NotImplementedError, OSError, UnicodeError, ValueError):
-        logger.warning("Standalone Cron output hooks unavailable", exc_info=True)
+        claimed = _claim_outbound_hook_profile(profile_home)
+    except ValueError:
+        _warn_outbound_hook_failure(
+            "Standalone Cron output hooks unavailable",
+            exc_info=True,
+        )
         return None
+    if not isinstance(claimed, _UnresolvedOutboundHooks):
+        return claimed
+    try:
+        return _resolve_claimed_outbound_hooks(profile_home, claimed)
+    finally:
+        claimed.done.set()
 
 
 def _record_confirmed_outbound_send(hooks, context, send_result) -> None:
