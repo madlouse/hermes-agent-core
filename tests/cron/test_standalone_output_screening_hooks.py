@@ -886,6 +886,15 @@ def test_active_waiter_rejects_cross_profile_store_mutation_without_revocation(
 
     with scheduler._standalone_outbound_hooks_lock:
         with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.update({})
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.__ior__({})
+        with pytest.raises(ValueError, match="active waiters"):
+            scheduler._standalone_outbound_hook_registries.setdefault(
+                profile_a,
+                hooks_b,
+            )
+        with pytest.raises(ValueError, match="active waiters"):
             scheduler._standalone_outbound_hook_registries[profile_b] = hooks_b
     assert token.revoked is False
 

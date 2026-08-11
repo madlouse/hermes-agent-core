@@ -2668,9 +2668,14 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         self._finalize_claim_locked(self.__profile, claim_token)
         if self.__state is not claim_token:
             return
-        if self._active_waiters_locked(claim_token):
-            raise ValueError("Outbound Hook registry claim has active waiters")
+        self._reject_active_waiters_locked()
         claim_token.revoked = True
+
+    def _reject_active_waiters_locked(self) -> None:
+        if not isinstance(self.__state, _UnresolvedOutboundHooks):
+            return
+        if self._active_waiters_locked(self.__state):
+            raise ValueError("Outbound Hook registry claim has active waiters")
 
     def __getitem__(self, key: Path) -> Any | None:
         with self.__lock:
@@ -2802,11 +2807,20 @@ class _OutboundHookRegistryStore(MutableMapping[Path, Any | None]):
         candidate = dict(*args, **kwargs)
         if len(candidate) > 1:
             raise ValueError("Outbound Hook registry store accepts one Profile")
-        if not candidate:
-            return
-        key, value = next(iter(candidate.items()))
         with self.__lock:
+            if not candidate:
+                self._reject_active_waiters_locked()
+                return
+            key, value = next(iter(candidate.items()))
             self._setitem_locked(key, value)
+
+    def setdefault(self, key: Path, default: Any | None = None) -> Any | None:
+        with self.__lock:
+            self._reject_active_waiters_locked()
+            if key == self.__profile and self.__state is not _MISSING_OUTBOUND_HOOK_REGISTRY:
+                return self.__state
+            self._setitem_locked(key, default)
+            return default
 
 
 _standalone_outbound_hook_registries = _OutboundHookRegistryStore()
