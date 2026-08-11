@@ -1619,6 +1619,65 @@ def test_claim_lock_exit_signal_marks_published_claim_done(
     assert scheduler._standalone_outbound_hook_registries == {profile: None}
 
 
+def test_waiter_lock_exit_signal_abandons_registered_waiter(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    owner_result = {}
+    original_lock = scheduler._standalone_outbound_hooks_lock
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load_owner():
+        owner_result["hooks"] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load_owner, name="owner")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+
+    class InterruptWaiterExit:
+        def __enter__(self):
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            original_lock.release()
+            raise KeyboardInterrupt
+
+        def acquire(self, blocking=True):
+            return original_lock.acquire(blocking)
+
+        def release(self):
+            original_lock.release()
+
+    monkeypatch.setattr(
+        scheduler,
+        "_standalone_outbound_hooks_lock",
+        InterruptWaiterExit(),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert not token.waiters
+    monkeypatch.setattr(scheduler, "_standalone_outbound_hooks_lock", original_lock)
+    release_lookup.set()
+    owner.join(timeout=2)
+
+    assert not owner.is_alive()
+    assert owner_result == {"hooks": hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
 def test_ordinary_runner_failure_waits_to_publish_terminal_failure(
     monkeypatch, tmp_path
 ):

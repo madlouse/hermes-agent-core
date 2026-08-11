@@ -2679,6 +2679,12 @@ def _claim_outbound_hook_profile(profile_home: Path) -> Any:
     except BaseException:
         if published_token is not None:
             published_token.done.set()
+        if wait_token is not None and waiter is not None:
+            _standalone_outbound_hook_registries._abandon_waiter_during_control_signal(
+                profile_home,
+                wait_token,
+                waiter,
+            )
         raise
 
     assert wait_token is not None
