@@ -232,6 +232,27 @@ def test_first_selected_profile_owns_before_gateway_lookup(monkeypatch, tmp_path
     assert scheduler._standalone_outbound_hook_registries == {profile_a: live_hooks}
 
 
+def test_hook_discovery_reentry_fails_closed_without_deadlock(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    _write_screening_hook(profile)
+    scheduler._standalone_outbound_hook_registries.clear()
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+    original_discover = HookRegistry.discover_and_load
+    reentrant_results = []
+
+    def discover_with_reentry(registry):
+        reentrant_results.append(_load_with_profile_override(profile))
+        return original_discover(registry)
+
+    monkeypatch.setattr(HookRegistry, "discover_and_load", discover_with_reentry)
+
+    hooks = _load_with_profile_override(profile)
+
+    assert hooks is not None
+    assert reentrant_results == [None]
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
 def test_standalone_missing_hook_root_fails_closed(monkeypatch, tmp_path):
     profile = tmp_path / "missing-profile"
     _reset_standalone_cache(monkeypatch, profile)
