@@ -549,6 +549,108 @@ def test_registry_store_serializes_claim_publish_with_cross_profile_write(tmp_pa
     assert store == {profile_a: hooks_a}
 
 
+def test_published_claim_blocks_reset_until_waiter_consumes(monkeypatch, tmp_path):
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks_a = HookRegistry(profile_a / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    waiter_entered = threading.Event()
+    waiter_woke = threading.Event()
+    release_waiter = threading.Event()
+    results = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks_a)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load(profile, key):
+        results[key] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load, args=(profile_a, "owner"), name="owner")
+    waiter = threading.Thread(target=load, args=(profile_a, "waiter"), name="waiter")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile_a]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    original_wait = token.done.wait
+
+    def delayed_wait(*args, **kwargs):
+        waiter_entered.set()
+        result = original_wait(*args, **kwargs)
+        waiter_woke.set()
+        assert release_waiter.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(token.done, "wait", delayed_wait)
+    waiter.start()
+    assert waiter_entered.wait(timeout=2)
+    release_lookup.set()
+    assert waiter_woke.wait(timeout=2)
+
+    with pytest.raises(ValueError, match="pending waiters"):
+        scheduler._standalone_outbound_hook_registries.clear()
+    results["profile-b"] = _load_with_profile_override(profile_b)
+
+    release_waiter.set()
+    owner.join(timeout=2)
+    waiter.join(timeout=2)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert results == {
+        "owner": hooks_a,
+        "waiter": hooks_a,
+        "profile-b": None,
+    }
+    assert scheduler._standalone_outbound_hook_registries == {profile_a: hooks_a}
+
+
+def test_interrupted_waiter_does_not_strand_profile_authority(monkeypatch, tmp_path):
+    profile = tmp_path / "profile"
+    scheduler._standalone_outbound_hook_registries.clear()
+    hooks = HookRegistry(profile / "hooks")
+    lookup_entered = threading.Event()
+    release_lookup = threading.Event()
+    owner_result = {}
+
+    def blocking_runner_ref():
+        lookup_entered.set()
+        assert release_lookup.wait(timeout=2)
+        return SimpleNamespace(hooks=hooks)
+
+    monkeypatch.setattr("gateway.run._gateway_runner_ref", blocking_runner_ref)
+
+    def load_owner():
+        owner_result["hooks"] = _load_with_profile_override(profile)
+
+    owner = threading.Thread(target=load_owner, name="owner")
+    owner.start()
+    assert lookup_entered.wait(timeout=2)
+    token = scheduler._standalone_outbound_hook_registries[profile]
+    assert isinstance(token, scheduler._UnresolvedOutboundHooks)
+    monkeypatch.setattr(
+        token.done,
+        "wait",
+        MagicMock(side_effect=KeyboardInterrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        _load_with_profile_override(profile)
+
+    assert token.waiter_count == 0
+    release_lookup.set()
+    owner.join(timeout=2)
+
+    assert not owner.is_alive()
+    assert owner_result == {"hooks": hooks}
+    assert scheduler._standalone_outbound_hook_registries == {profile: hooks}
+
+
 def test_same_profile_waiter_rejects_cross_profile_store_mutation(
     monkeypatch, tmp_path
 ):
