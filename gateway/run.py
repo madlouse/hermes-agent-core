@@ -9097,7 +9097,69 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    def _apply_pre_gateway_dispatch(self, event: MessageEvent) -> tuple[MessageEvent, str]:
+        """Run the same pre_gateway_dispatch hooks used by the cold path.
+
+        Busy-session follow-ups previously skipped this seam and went straight
+        to steer/redirect/queue. Confirmation plugins (hck-gateway admin-reply
+        matcher + runtime-intake) therefore never saw concurrent user replies
+        while a DM turn was already active, which dropped native message ids
+        from the confirmation inbox and rewrote free-form semantic approvals
+        into ordinary agent chatter.
+
+        Returns ``(event, disposition)`` where disposition is:
+        - ``skip``  -> busy path must stop (plugin deny already final)
+        - ``queue`` -> confirmation rewrite; force next-turn queue, no steer
+        - ``continue`` -> ordinary busy handling with possibly rewritten text
+        """
+        if bool(getattr(event, "internal", False)):
+            return event, "continue"
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            hook_results = _invoke_hook(
+                "pre_gateway_dispatch",
+                event=event,
+                gateway=self,
+                session_store=getattr(self, "session_store", None),
+            )
+        except Exception as hook_exc:
+            logger.warning("pre_gateway_dispatch invocation failed: %s", hook_exc)
+            return event, "continue"
+
+        source = event.source
+        for result in hook_results or []:
+            if not isinstance(result, dict):
+                continue
+            action = result.get("action")
+            if action == "skip":
+                logger.info(
+                    "pre_gateway_dispatch skip on busy path: reason=%s platform=%s chat=%s",
+                    result.get("reason"),
+                    source.platform.value if getattr(source, "platform", None) else "unknown",
+                    getattr(source, "chat_id", None) or "unknown",
+                )
+                return event, "skip"
+            if action == "rewrite":
+                new_text = result.get("text")
+                if isinstance(new_text, str):
+                    event = dataclasses.replace(event, text=new_text)
+                # Bound confirmation packets must become the next turn, not a
+                # mid-run steer/redirect into the unrelated busy conversation.
+                return event, "queue"
+            if action == "allow":
+                break
+        return event, "continue"
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Confirmation/runtime intake must see busy-path user follow-ups before
+        # steer/redirect consumes them. Same hook contract as the cold path.
+        event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
+        if pre_gateway_disposition == "skip":
+            return True
+        if pre_gateway_disposition == "queue":
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -14894,42 +14956,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
+        # Busy-session follow-ups reuse the same helper so confirmation plugins
+        # cannot be bypassed while a DM turn is already active.
         if not is_internal:
-            try:
-                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-                _hook_results = _invoke_hook(
-                    "pre_gateway_dispatch",
-                    event=event,
-                    gateway=self,
-                    # getattr: bare-runner tests build GatewayRunner via
-                    # object.__new__ without __init__ (pitfall #17), and the
-                    # hook must not fail dispatch over a missing attribute.
-                    session_store=getattr(self, "session_store", None),
-                )
-            except Exception as _hook_exc:
-                logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
-
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
-                        source.platform.value if source.platform else "unknown",
-                        source.chat_id or "unknown",
-                    )
-                    return None
-                if _action == "rewrite":
-                    _new_text = _result.get("text")
-                    if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "allow":
-                    break
+            event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
+            source = event.source
+            if pre_gateway_disposition == "skip":
+                return None
+            # Cold path treats rewrite/continue the same: continue into the
+            # normal authorized agent turn with the (possibly rewritten) text.
 
         if is_internal:
             pass
