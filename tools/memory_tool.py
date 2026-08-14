@@ -1062,6 +1062,11 @@ def memory_tool(
 
     Returns JSON string with results.
     """
+    from tools.cron_write_guard import deny_active_cron_execution
+
+    cron_denial = deny_active_cron_execution("memory")
+    if cron_denial:
+        return tool_error(cron_denial, success=False)
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
@@ -1234,7 +1239,6 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
 
 

@@ -403,6 +403,8 @@ _CRON_GOVERNANCE_HOOK_OWNED_FIELDS = frozenset({
     "process_charter_ref",
     "approval_evidence_ref",
     "read_scope_ref",
+    "write_scope_ref",
+    "write_scope",
     "disclosure_policy_ref",
     "risk_tier",
     "implementation_path_evidence_ref",
@@ -520,6 +522,8 @@ _CRON_GOVERNANCE_PATCH_FIELDS = frozenset({
     "process_charter_ref",
     "approval_evidence_ref",
     "read_scope_ref",
+    "write_scope_ref",
+    "write_scope",
     "disclosure_policy_ref",
     "risk_tier",
     "implementation_categories",
@@ -563,6 +567,8 @@ _CRON_GOVERNANCE_SELF_REFERENTIAL_FIELDS = frozenset({
 _CRON_GOVERNANCE_CALLER_BINDING_FIELDS = frozenset({
     "authorized_behavior_ref",
     "implementation_categories",
+    "write_scope_ref",
+    "write_scope",
 })
 
 
@@ -2064,7 +2070,9 @@ class CronRuntimeAdmissionError(PermissionError):
         )
 
 
-def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
+def _apply_cron_runtime_governance(
+    job: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
     """Run mandatory runtime admission before both cron execution paths."""
     required = (
         _cron_creation_governance_expected()
@@ -2081,7 +2089,7 @@ def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
     except Exception as exc:
         if not required:
             logger.warning("pre_cron_job_run discovery failed", exc_info=True)
-            return
+            return None
         decision = {
             "action": "block",
             "reason": "runtime_governance_unavailable",
@@ -2134,7 +2142,7 @@ def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
         )
     allowed = [item for item in decisions if item.get("action") == "allow"]
     if not allowed and not required and callback_count == 0:
-        return
+        return None
     if len(allowed) != 1:
         decision = {
             "action": "block",
@@ -2146,6 +2154,7 @@ def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
             decision=decision,
             job=job,
         )
+    return copy.deepcopy(allowed[0])
 
 
 def _dispatch_post_cron_persist_effects(

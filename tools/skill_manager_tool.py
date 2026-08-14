@@ -1527,6 +1527,11 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    from tools.cron_write_guard import deny_active_cron_execution
+
+    cron_denial = deny_active_cron_execution("skill_manage")
+    if cron_denial:
+        return tool_error(cron_denial, success=False)
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)

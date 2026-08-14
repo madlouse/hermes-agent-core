@@ -782,8 +782,12 @@ class _DeferredCronAgentCollector:
             _teardown_cron_agent(agent, self._job_id)
 
 
-def _cron_authorization_values(job: dict) -> dict[str, str]:
-    """Project a persisted job into the in-process authorization context."""
+def _cron_authorization_values(
+    job: dict,
+    *,
+    runtime_admission: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Project job identity plus verified admission into runtime context."""
     categories = job.get("implementation_categories")
     if isinstance(categories, (list, tuple, set)):
         category_items = [
@@ -795,6 +799,18 @@ def _cron_authorization_values(job: dict) -> dict[str, str]:
     else:
         categories_text = str(categories or "")
     join_keys = job.get("join_keys") if isinstance(job.get("join_keys"), dict) else {}
+    admission = runtime_admission if isinstance(runtime_admission, dict) else {}
+    write_scope = admission.get("write_scope")
+    write_scope_text = (
+        json.dumps(
+            write_scope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if isinstance(write_scope, dict)
+        else ""
+    )
     return {
         "HERMES_CRON_JOB_ID": str(job.get("id") or ""),
         "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": str(
@@ -812,6 +828,8 @@ def _cron_authorization_values(job: dict) -> dict[str, str]:
         "HERMES_CRON_CANDIDATE_HASH": str(
             job.get("candidate_hash") or join_keys.get("candidate_hash") or ""
         ),
+        "HERMES_CRON_WRITE_SCOPE_REF": str(admission.get("write_scope_ref") or ""),
+        "HERMES_CRON_WRITE_SCOPE": write_scope_text,
     }
 
 
@@ -5379,7 +5397,7 @@ def _run_job_body(
     from cron.jobs import CronRuntimeAdmissionError, _apply_cron_runtime_governance
 
     try:
-        _apply_cron_runtime_governance(job)
+        runtime_admission = _apply_cron_runtime_governance(job)
     except CronRuntimeAdmissionError as exc:
         return _RunJobResult(
             success=False,
@@ -5764,7 +5782,11 @@ def _run_job_body(
     _cron_auth_tokens = []
     try:
         _cron_auth_tokens = set_cron_authorization(
-            _cron_authorization_values(job), lease=_run_control.lease
+            _cron_authorization_values(
+                job,
+                runtime_admission=runtime_admission,
+            ),
+            lease=_run_control.lease,
         )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,

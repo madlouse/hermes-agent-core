@@ -1605,6 +1605,8 @@ class TestRunJobSessionPersistence:
             "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": "evidence.impl.bound-job",
             "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": "evidence.scope.bound-job",
             "HERMES_CRON_CANDIDATE_HASH": "sha256:bound-job",
+            "HERMES_CRON_WRITE_SCOPE_REF": "",
+            "HERMES_CRON_WRITE_SCOPE": "",
         }
         assert seen["failed-job"]["context"] == {
             "HERMES_CRON_JOB_ID": "failed-job",

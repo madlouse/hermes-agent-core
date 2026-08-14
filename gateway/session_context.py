@@ -154,6 +154,12 @@ _CRON_OBSERVED_SCOPE_EVIDENCE_REF: ContextVar = ContextVar(
 _CRON_CANDIDATE_HASH: ContextVar = ContextVar(
     "HERMES_CRON_CANDIDATE_HASH", default=_UNSET
 )
+_CRON_WRITE_SCOPE_REF: ContextVar = ContextVar(
+    "HERMES_CRON_WRITE_SCOPE_REF", default=_UNSET
+)
+_CRON_WRITE_SCOPE: ContextVar = ContextVar(
+    "HERMES_CRON_WRITE_SCOPE", default=_UNSET
+)
 # Every copied cron/delegate context shares this revocation lease. Resetting the
 # root scope clears it before restoring local tokens, so an agent thread still
 # unwinding after a deadline can no longer read durable authorization identity.
@@ -180,6 +186,8 @@ class CronRuntimeContext:
     implementation_path_evidence_ref: str
     observed_scope_evidence_ref: str
     candidate_hash: str
+    write_scope_ref: str
+    write_scope: Mapping[str, Any] | None
 
 
 class _CronRuntimeLease:
@@ -220,6 +228,8 @@ _CRON_AUTH_VAR_MAP = {
     "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": _CRON_IMPLEMENTATION_PATH_EVIDENCE_REF,
     "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": _CRON_OBSERVED_SCOPE_EVIDENCE_REF,
     "HERMES_CRON_CANDIDATE_HASH": _CRON_CANDIDATE_HASH,
+    "HERMES_CRON_WRITE_SCOPE_REF": _CRON_WRITE_SCOPE_REF,
+    "HERMES_CRON_WRITE_SCOPE": _CRON_WRITE_SCOPE,
 }
 
 _VAR_MAP = {
@@ -339,6 +349,23 @@ def set_cron_authorization(
     categories = tuple(
         str(item).strip() for item in parsed_categories if str(item or "").strip()
     )
+    raw_write_scope = values.get("HERMES_CRON_WRITE_SCOPE")
+    if isinstance(raw_write_scope, str):
+        try:
+            parsed_write_scope = json.loads(raw_write_scope)
+        except json.JSONDecodeError:
+            parsed_write_scope = None
+    elif isinstance(raw_write_scope, Mapping):
+        try:
+            parsed_write_scope = json.loads(
+                json.dumps(raw_write_scope, ensure_ascii=False)
+            )
+        except (TypeError, ValueError):
+            parsed_write_scope = None
+    else:
+        parsed_write_scope = raw_write_scope
+    if not isinstance(parsed_write_scope, Mapping):
+        parsed_write_scope = None
     runtime_context = CronRuntimeContext(
         job_id=str(values.get("HERMES_CRON_JOB_ID") or ""),
         authorized_behavior_ref=str(
@@ -356,6 +383,8 @@ def set_cron_authorization(
             values.get("HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF") or ""
         ),
         candidate_hash=str(values.get("HERMES_CRON_CANDIDATE_HASH") or ""),
+        write_scope_ref=str(values.get("HERMES_CRON_WRITE_SCOPE_REF") or ""),
+        write_scope=parsed_write_scope,
     )
     tokens = [
         (_CRON_AUTH_SCOPE, _CRON_AUTH_SCOPE.set(active)),
@@ -366,6 +395,13 @@ def set_cron_authorization(
     ]
     for name, var in _CRON_AUTH_VAR_MAP.items():
         value = values.get(name, "")
+        if name == "HERMES_CRON_WRITE_SCOPE" and isinstance(value, Mapping):
+            value = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         tokens.append((var, var.set(str(value or ""))))
     return tokens
 

@@ -601,7 +601,14 @@ def test_resume_create_does_not_repair_empty_control_character_store(
 
 @pytest.mark.parametrize(
     "field",
-    ["operation", "source_route", "join_keys", "creation_governance_receipt"],
+    [
+        "operation",
+        "source_route",
+        "join_keys",
+        "creation_governance_receipt",
+        "write_scope_ref",
+        "write_scope",
+    ],
 )
 def test_hook_owned_binding_fields_cannot_be_mutated_by_callers(
     governed_store: Path,
@@ -961,3 +968,28 @@ def test_runtime_mandatory_callback_failure_keeps_provenance(
 
     assert exc_info.value.decision["reason"] == "runtime_governance_callback_failed"
     assert exc_info.value.decision["callback_failures"] == [failure]
+
+
+def test_runtime_governance_returns_the_single_verified_allow_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cron.jobs import _apply_cron_runtime_governance
+
+    allowed = {
+        "action": "allow",
+        "reason": "runtime_binding_verified",
+        "write_scope_ref": "sha256:verified",
+        "write_scope": {"schema_version": "cron-write-scope/v1", "roots": []},
+    }
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_mandatory_hook",
+        lambda *_args, **_kwargs: _mandatory_report([allowed], callback_count=1),
+    )
+
+    result = _apply_cron_runtime_governance({
+        "id": "runtime-job",
+        "creation_governance_receipt": _receipt(),
+    })
+
+    assert result == allowed
+    assert result is not allowed
