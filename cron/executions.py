@@ -154,43 +154,47 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     return record  # type: ignore[return-value]
 
 
-def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
-    """Transition one claimed attempt to running exactly once."""
+def mark_execution_running(
+    execution_id: str, *, job_id: str
+) -> Optional[Dict[str, Any]]:
+    """Transition one job-bound claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET status='running', started_at=?
-               WHERE id=? AND status='claimed'""",
-            (now, execution_id),
+               WHERE id=? AND job_id=? AND status='claimed'""",
+            (now, execution_id, str(job_id)),
         )
         if cur.rowcount != 1:
             return None
         record = _record(conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
+            "SELECT * FROM executions WHERE id=? AND job_id=?",
+            (execution_id, str(job_id)),
         ).fetchone())
     _emit_execution_state(record)
     return record
 
 
 def finish_execution(
-    execution_id: str, *, success: bool, error: Optional[str] = None,
+    execution_id: str, *, job_id: str, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write one job-bound terminal result; terminal attempts are immutable."""
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?
-               WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+               WHERE id=? AND job_id=? AND status IN ('claimed','running')""",
+            (status, now, detail, execution_id, str(job_id)),
         )
         if cur.rowcount != 1:
             return None
         _prune_unlocked(conn)
         record = _record(conn.execute(
-            "SELECT * FROM executions WHERE id=?", (execution_id,)
+            "SELECT * FROM executions WHERE id=? AND job_id=?",
+            (execution_id, str(job_id)),
         ).fetchone())
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     return record

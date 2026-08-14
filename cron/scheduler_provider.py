@@ -109,8 +109,13 @@ class CronScheduler(ABC):
         job = get_job(job_id)
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        execution = create_execution(job_id, source=self.name)
+        return run_one_job(
+            job,
+            execution_id=execution["id"],
+            adapters=adapters,
+            loop=loop,
+        )
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
