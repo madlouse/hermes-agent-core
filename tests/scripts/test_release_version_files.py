@@ -45,7 +45,7 @@ def test_repository_release_versions_are_identical():
     ).group(1)
 
     assert len(versions) == 1
-    assert release_date == "2026.8.14.1"
+    assert release_date == "2026.8.14.2"
 
 
 def test_version_update_and_stage_list_cover_desktop_lockfile(tmp_path, monkeypatch):
