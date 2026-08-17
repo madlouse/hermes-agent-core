@@ -554,6 +554,46 @@ def test_run_one_job_running_transition_exception_terminalizes_claimed_attempt(m
     assert terminal[0][1]["error"] == "running transition failed"
 
 
+def test_authoritative_reload_exception_terminalizes_claimed_attempt_once(monkeypatch):
+    import cron.scheduler as scheduler
+
+    terminal = []
+    running = []
+    business = []
+    monkeypatch.setattr(
+        scheduler,
+        "get_persisted_job",
+        lambda _job_id: (_ for _ in ()).throw(OSError("persisted job unavailable")),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "mark_execution_running",
+        lambda *_args, **_kwargs: running.append("running"),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "begin_job_run_outcome",
+        lambda _job: business.append("business"),
+    )
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "finish_execution",
+        lambda execution_id, **kwargs: terminal.append((execution_id, kwargs))
+        or {"id": execution_id, "status": "failed"},
+    )
+
+    assert scheduler.run_one_job(
+        {"id": "reload-error"}, execution_id="reload-attempt"
+    ) is False
+    assert running == []
+    assert business == []
+    assert len(terminal) == 1
+    assert terminal[0][0] == "reload-attempt"
+    assert terminal[0][1]["job_id"] == "reload-error"
+    assert terminal[0][1]["error"] == "persisted job unavailable"
+
+
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
     import cron.scheduler_provider as provider
 

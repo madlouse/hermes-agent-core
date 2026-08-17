@@ -29,6 +29,10 @@ _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
 @pytest.fixture(autouse=True)
 def _manual_execution_attempt(monkeypatch):
     monkeypatch.setattr(
+        "tools.cronjob_tools.get_persisted_job",
+        lambda _job_id: dict(_JOB),
+    )
+    monkeypatch.setattr(
         "cron.executions.create_execution",
         lambda job_id, *, source: {
             "id": f"manual-exec-{job_id}",
@@ -53,7 +57,7 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
         m_run.assert_called_once_with(
-            ran,
+            _JOB,
             execution_id="manual-exec-job-run-1",
         )
 
@@ -74,6 +78,7 @@ class TestCronjobRunExecutesImmediately:
         calls = []
 
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("tools.cronjob_tools.get_persisted_job", return_value=claimed_job), \
              patch("tools.cronjob_tools.get_job", return_value=claimed_job), \
              patch(
                  "cron.executions.create_execution",

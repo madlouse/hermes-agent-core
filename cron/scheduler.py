@@ -948,6 +948,8 @@ from cron.jobs import (
     cron_creation_profile_identity,
     get_due_jobs,
     get_cron_profile_home,
+    get_persisted_job,
+    _normalize_job_record,
     heartbeat_operational_notice_delivery,
     heartbeat_job_run_outcome,
     heartbeat_run_claim,
@@ -5409,6 +5411,11 @@ def _run_job_body(
         )
     _run_control.raise_if_expired("runtime governance")
 
+    # Governance must inspect the exact persisted Job. Reader compatibility
+    # defaults (for example absent prompt/skill fields becoming ""/None/[])
+    # are safe only after admission, otherwise they change the semantic hash.
+    job = _normalize_job_record(job)
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -6887,10 +6894,17 @@ def run_one_job(
             _renew_run_outcome_claim_or_raise(job["id"], run_outcome_claim)
 
     try:
+        # Every production caller has already created a claimed attempt. Keep
+        # the authoritative reload under the once-only terminalizer so an I/O
+        # or corruption failure cannot strand that attempt in ``claimed``.
+        execution_transition_attempted = True
+        persisted_job = get_persisted_job(job_id)
+        if persisted_job is not None:
+            job = persisted_job
+
         # The execution ledger is the attempt authority, not Job data. Claim the
         # exact execution_id + job_id tuple before any Job, tool, or delivery
         # side effect. A forged, stale, terminal, or cross-Job ID fails closed.
-        execution_transition_attempted = True
         if mark_execution_running(execution_id, job_id=job_id) is None:
             execution_transition_attempted = False
             logger.error(

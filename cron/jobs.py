@@ -4027,6 +4027,22 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def get_persisted_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Return the exact stored Job mapping for governance and execution.
+
+    ``get_job`` intentionally supplies reader defaults for UI and legacy
+    callers. Those defaults are derived data, however, and must not enter the
+    authorization hash seen by ``pre_cron_job_run``. Execution paths use this
+    accessor so the mandatory hook receives the complete persisted mapping
+    field-for-field, including unknown future semantic fields.
+    """
+    jobs = load_jobs()
+    for job in jobs:
+        if job.get("id") == job_id:
+            return copy.deepcopy(job)
+    return None
+
+
 class AmbiguousJobReference(LookupError):
     """Raised when a job name matches more than one job."""
 
@@ -5339,7 +5355,12 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             rj["id"] = rj.pop("job_id", None) or uuid.uuid4().hex[:12]
             needs_save = True
 
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    jobs = [
+        copy.deepcopy(j)
+        if _cron_candidate_requires_governance(j)
+        else _apply_skill_fields(j)
+        for j in raw_jobs
+    ]
     due = []
 
     # Normalize malformed "schedule" records (direct jobs.json edit, old writers,

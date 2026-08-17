@@ -1,6 +1,7 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
 import asyncio
+import copy
 import contextlib
 import itertools
 import json
@@ -4165,6 +4166,41 @@ def test_run_job_routes_no_agent_script_through_optional_snapshot():
         assert kwargs["workdir"] is None
         assert kwargs["script_snapshot"] == b"claimed"
         assert isinstance(kwargs["run_control"], scheduler._CronRunControl)
+
+
+@pytest.mark.parametrize(
+    "semantic_fields",
+    [
+        {},
+        {
+            "prompt": "changed prompt",
+            "skill": "changed-skill",
+            "skills": ["changed-skill"],
+            "future_semantic_field": {"mode": "strict"},
+        },
+    ],
+)
+def test_runtime_governance_sees_job_before_reader_normalization(semantic_fields):
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "governance-before-normalization",
+        "name": "Governed",
+        "no_agent": True,
+        "script": "task.py",
+        **semantic_fields,
+    }
+    seen = []
+
+    def governance(candidate):
+        seen.append(copy.deepcopy(candidate))
+        return None
+
+    with patch("cron.jobs._apply_cron_runtime_governance", side_effect=governance), \
+         patch("cron.scheduler._run_job_script", return_value=(True, "payload")):
+        assert scheduler.run_job(job)[0] is True
+
+    assert seen == [job]
 
 
 def test_run_one_job_passes_claimed_script_snapshot_to_executor():

@@ -43,6 +43,7 @@ from cron.jobs import (
     claim_job_for_fire,
     create_job,
     get_job,
+    get_persisted_job,
     list_jobs,
     mark_job_run,
     parse_schedule,
@@ -626,7 +627,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
 
-        claimed_job = get_job(job_id)
+        claimed_job = get_persisted_job(job_id)
         if claimed_job is None:
             return {
                 "claimed": True,
