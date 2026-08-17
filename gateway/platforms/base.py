@@ -5798,6 +5798,15 @@ class BasePlatformAdapter(ABC):
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
 
+            # A hook may durably claim and rewrite this exact event before the
+            # runner discovers that its FIFO is unavailable. Preserve that
+            # identity for cold replay instead of merging into an older text
+            # event and losing the dispatched marker. Replacement also keeps
+            # this emergency fallback bounded to the existing head slot.
+            if bool(getattr(event, "_hermes_busy_fallback_preserve_identity", False)):
+                self._pending_messages[session_key] = event
+                return
+
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,
             # then process them immediately after the current task finishes.

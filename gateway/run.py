@@ -9021,13 +9021,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # follow-ups is far beyond any realistic conversational backlog while
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
+    _BUSY_QUEUE_EMERGENCY_MAX_PENDING = _BUSY_QUEUE_MAX_PENDING + 1
 
     def _queue_or_replace_pending_event(
         self,
         session_key: str,
         event: MessageEvent,
         *,
-        force: bool = False,
+        emergency: bool = False,
     ) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -9059,15 +9060,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True
 
-        if (
-            not force
-            and self._queue_depth(session_key, adapter=adapter)
-            >= self._BUSY_QUEUE_MAX_PENDING
-        ):
+        queue_limit = (
+            self._BUSY_QUEUE_EMERGENCY_MAX_PENDING
+            if emergency
+            else self._BUSY_QUEUE_MAX_PENDING
+        )
+        if self._queue_depth(session_key, adapter=adapter) >= queue_limit:
             logger.warning(
-                "Refusing busy-mode follow-up for session %s — pending queue at cap (%d).",
+                "Refusing busy-mode follow-up for session %s — pending queue at %s cap (%d).",
                 session_key,
-                self._BUSY_QUEUE_MAX_PENDING,
+                "emergency" if emergency else "ordinary",
+                queue_limit,
             )
             return False
 
@@ -9159,7 +9162,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if action == "rewrite":
                 new_text = result.get("text")
                 if isinstance(new_text, str):
-                    event = dataclasses.replace(event, text=new_text)
+                    # Preserve the adapter-owned event identity. If internal
+                    # FIFO admission fails, BasePlatformAdapter falls back to
+                    # this same object and must replay the claimed rewrite
+                    # without invoking the hook a second time.
+                    event.text = new_text
                 event._hermes_pre_gateway_dispatched = True
                 # Bound confirmation packets must become the next turn, not a
                 # mid-run steer/redirect into the unrelated busy conversation.
@@ -9170,6 +9177,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return event, "continue"
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Authorize user traffic before hooks. A busy shared channel must not
+        # let an unauthorized sender trigger a durable claim or queue retry.
+        if not bool(getattr(event, "internal", False)) and not self._is_user_authorized(
+            event.source
+        ):
+            logger.warning(
+                "Dropping message from unauthorized user in active session: "
+                "user=%s (%s), platform=%s, session=%s",
+                event.source.user_id,
+                event.source.user_name,
+                event.source.platform.value if event.source.platform else "unknown",
+                session_key,
+            )
+            return True  # handled (silently dropped); do not fall through
+
         # Confirmation/runtime intake must see busy-path user follow-ups before
         # steer/redirect consumes them. Same hook contract as the cold path.
         event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
@@ -9180,40 +9202,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 admitted = self._queue_or_replace_pending_event(
                     session_key,
                     event,
-                    force=True,
+                    emergency=True,
                 )
             except Exception:
+                if pre_gateway_disposition == "queue":
+                    event._hermes_busy_fallback_preserve_identity = True
                 logger.warning(
-                    "Forced busy-path queue admission failed for session %s; "
-                    "falling back to the platform adapter queue",
+                    "Emergency busy-path queue admission failed for session %s; %s",
                     session_key,
+                    (
+                        "dropping unclaimed hook retry"
+                        if pre_gateway_disposition == "retry"
+                        else "falling back to the platform adapter queue"
+                    ),
                     exc_info=True,
                 )
-                return False
+                return pre_gateway_disposition == "retry"
             if not admitted:
+                if pre_gateway_disposition == "queue":
+                    event._hermes_busy_fallback_preserve_identity = True
                 logger.warning(
-                    "Forced busy-path queue admission unavailable for session %s; "
-                    "falling back to the platform adapter queue",
+                    "Emergency busy-path queue admission unavailable for session %s; %s",
                     session_key,
+                    (
+                        "dropping unclaimed hook retry"
+                        if pre_gateway_disposition == "retry"
+                        else "falling back to the platform adapter queue"
+                    ),
                 )
-                return False
+                return pre_gateway_disposition == "retry"
             return True
-
-        # --- Authorization gate (#17775) ---
-        # The cold path (_handle_message) checks _is_user_authorized before
-        # creating a session.  The busy path must enforce the same check;
-        # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
-        # can inject messages into an active session they don't own.
-        if not self._is_user_authorized(event.source):
-            logger.warning(
-                "Dropping message from unauthorized user in active session: "
-                "user=%s (%s), platform=%s, session=%s",
-                event.source.user_id,
-                event.source.user_name,
-                event.source.platform.value if event.source.platform else "unknown",
-                session_key,
-            )
-            return True  # handled (silently dropped); do not fall through
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
