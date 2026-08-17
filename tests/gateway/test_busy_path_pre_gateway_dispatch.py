@@ -49,6 +49,65 @@ def _event(text: str = "按这个方案继续执行吧", *, internal: bool = Fal
     )
 
 
+def _queue_state(events=None):
+    return MagicMock(conversation=MagicMock(queued_events=list(events or [])))
+
+
+def test_fifo_admission_reports_unavailable_adapter_or_pending_slot():
+    runner = object.__new__(GatewayRunner)
+    event = _event()
+
+    assert GatewayRunner._enqueue_fifo(runner, "session-key", event, None) is False
+    assert (
+        GatewayRunner._enqueue_fifo(
+            runner, "session-key", event, MagicMock(spec=[])
+        )
+        is False
+    )
+
+
+def test_non_forced_admission_reports_queue_cap():
+    runner = object.__new__(GatewayRunner)
+    session_key = "session-key"
+    adapter = MagicMock()
+    adapter._pending_messages = {session_key: _event("already queued")}
+    state = _queue_state([_event(f"queued-{index}") for index in range(31)])
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner._peek_session_state = MagicMock(return_value=state)
+
+    admitted = GatewayRunner._queue_or_replace_pending_event(
+        runner, session_key, _event("over cap")
+    )
+
+    assert admitted is False
+    assert len(state.conversation.queued_events) == 31
+
+
+def test_photo_merge_reports_success(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    session_key = "session-key"
+    existing = _event("photo")
+    existing.message_type = MessageType.PHOTO
+    adapter = MagicMock()
+    adapter._pending_messages = {session_key: existing}
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    merge = MagicMock()
+    monkeypatch.setattr("gateway.run.merge_pending_message_event", merge)
+    incoming = _event("caption")
+
+    admitted = GatewayRunner._queue_or_replace_pending_event(
+        runner, session_key, incoming
+    )
+
+    assert admitted is True
+    merge.assert_called_once_with(
+        adapter._pending_messages,
+        session_key,
+        incoming,
+        merge_text=True,
+    )
+
+
 @pytest.mark.asyncio
 async def test_busy_path_runs_pre_gateway_and_skips_steer_on_plugin_skip(monkeypatch):
     runner = object.__new__(GatewayRunner)
@@ -63,7 +122,7 @@ async def test_busy_path_runs_pre_gateway_and_skips_steer_on_plugin_skip(monkeyp
     )
     runner._agent_has_active_subagents = MagicMock(return_value=False)
     runner._session_has_compression_in_flight = AsyncMock(return_value=False)
-    runner._queue_or_replace_pending_event = MagicMock()
+    runner._queue_or_replace_pending_event = MagicMock(return_value=True)
     runner.session_store = None
 
     def fake_invoke(name, **kwargs):
@@ -102,7 +161,7 @@ async def test_busy_path_queues_rewritten_confirmation_instead_of_steer(monkeypa
     )
     runner._agent_has_active_subagents = MagicMock(return_value=False)
     runner._session_has_compression_in_flight = AsyncMock(return_value=False)
-    runner._queue_or_replace_pending_event = MagicMock()
+    runner._queue_or_replace_pending_event = MagicMock(return_value=True)
     runner.session_store = None
 
     def fake_invoke(name, **kwargs):
@@ -118,8 +177,79 @@ async def test_busy_path_queues_rewritten_confirmation_instead_of_steer(monkeypa
     assert handled is True
     assert steered == []
     runner._queue_or_replace_pending_event.assert_called_once()
-    queued = runner._queue_or_replace_pending_event.call_args.args[1]
+    queue_call = runner._queue_or_replace_pending_event.call_args
+    assert queue_call.args[0] == "session-key"
+    assert queue_call.kwargs == {"force": True}
+    queued = queue_call.args[1]
     assert queued.text == "[bound frame] execute approved action"
+
+
+@pytest.mark.asyncio
+async def test_busy_rewrite_force_admission_bypasses_pending_cap(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    session_key = "session-key"
+    existing = _event("already queued")
+    adapter = MagicMock()
+    adapter._pending_messages = {session_key: existing}
+    state = _queue_state([_event(f"queued-{index}") for index in range(31)])
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner._peek_session_state = MagicMock(return_value=state)
+    runner._session_state = MagicMock(return_value=state)
+    runner.session_store = None
+
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda _name, **_kwargs: [{"action": "rewrite", "text": "bound confirmation"}],
+    )
+
+    handled = await GatewayRunner._handle_active_session_busy_message(
+        runner, _event(), session_key
+    )
+
+    assert handled is True
+    assert adapter._pending_messages[session_key] is existing
+    assert len(state.conversation.queued_events) == 32
+    assert state.conversation.queued_events[-1].text == "bound confirmation"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter", [None, MagicMock(spec=[])])
+async def test_busy_rewrite_returns_false_when_internal_admission_is_unavailable(
+    monkeypatch, adapter
+):
+    runner = object.__new__(GatewayRunner)
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner.session_store = None
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda _name, **_kwargs: [{"action": "rewrite", "text": "bound confirmation"}],
+    )
+
+    handled = await GatewayRunner._handle_active_session_busy_message(
+        runner, _event(), "session-key"
+    )
+
+    assert handled is False
+
+
+@pytest.mark.asyncio
+async def test_busy_rewrite_returns_false_when_fifo_enqueue_raises(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner._enqueue_fifo = MagicMock(side_effect=RuntimeError("queue unavailable"))
+    runner.session_store = None
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda _name, **_kwargs: [{"action": "rewrite", "text": "bound confirmation"}],
+    )
+
+    handled = await GatewayRunner._handle_active_session_busy_message(
+        runner, _event(), "session-key"
+    )
+
+    assert handled is False
 
 
 def test_busy_path_internal_events_skip_pre_gateway(monkeypatch):
@@ -172,6 +302,45 @@ def test_failed_busy_hook_remains_retryable_on_cold_path(monkeypatch):
     first_event, first = GatewayRunner._apply_pre_gateway_dispatch(runner, event)
     second_event, second = GatewayRunner._apply_pre_gateway_dispatch(runner, first_event)
 
-    assert (first, second) == ("continue", "continue")
+    assert (first, second) == ("retry", "continue")
     assert second_event is event
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_busy_hook_exception_queues_unmarked_event_for_cold_retry(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    session_key = "session-key"
+    adapter = MagicMock()
+    adapter._pending_messages = {}
+    state = _queue_state()
+    runner._adapter_for_source = MagicMock(return_value=adapter)
+    runner._peek_session_state = MagicMock(return_value=state)
+    runner._session_state = MagicMock(return_value=state)
+    runner.session_store = None
+    calls = 0
+
+    def fake_invoke(_name, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient hook failure")
+        return [{"action": "rewrite", "text": "bound after retry"}]
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", fake_invoke)
+    event = _event()
+
+    handled = await GatewayRunner._handle_active_session_busy_message(
+        runner, event, session_key
+    )
+
+    assert handled is True
+    queued = adapter._pending_messages.pop(session_key)
+    assert queued is event
+    assert not hasattr(queued, "_hermes_pre_gateway_dispatched")
+
+    replayed, disposition = GatewayRunner._apply_pre_gateway_dispatch(runner, queued)
+    assert disposition == "queue"
+    assert replayed.text == "bound after retry"
+    assert replayed._hermes_pre_gateway_dispatched is True
     assert calls == 2

@@ -8046,19 +8046,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
-            return
+            return False
         pending_slot = getattr(adapter, "_pending_messages", None)
-        if pending_slot is None:
-            return
+        if not isinstance(pending_slot, dict):
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(
                 queued_event
             )
         else:
             pending_slot[session_key] = queued_event
+        return True
 
     def _promote_queued_event(
         self,
@@ -9021,10 +9022,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        force: bool = False,
+    ) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -9034,7 +9041,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
-        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
+        if not isinstance(pending_slot, dict):
+            return False
+        existing = pending_slot.get(session_key)
         if existing is not None and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
@@ -9043,22 +9052,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
             merge_pending_message_event(
-                adapter._pending_messages,
+                pending_slot,
                 session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+        if (
+            not force
+            and self._queue_depth(session_key, adapter=adapter)
+            >= self._BUSY_QUEUE_MAX_PENDING
+        ):
             logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                "Refusing busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -9110,6 +9123,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns ``(event, disposition)`` where disposition is:
         - ``skip``  -> busy path must stop (plugin deny already final)
         - ``queue`` -> confirmation rewrite; force next-turn queue, no steer
+        - ``retry`` -> hook failed; queue the unmarked event for a cold retry
         - ``continue`` -> ordinary busy handling with possibly rewritten text
         """
         if bool(getattr(event, "internal", False)):
@@ -9126,7 +9140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception as hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", hook_exc)
-            return event, "continue"
+            return event, "retry"
 
         source = event.source
         for result in hook_results or []:
@@ -9161,8 +9175,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
         if pre_gateway_disposition == "skip":
             return True
-        if pre_gateway_disposition == "queue":
-            self._queue_or_replace_pending_event(session_key, event)
+        if pre_gateway_disposition in {"queue", "retry"}:
+            try:
+                admitted = self._queue_or_replace_pending_event(
+                    session_key,
+                    event,
+                    force=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Forced busy-path queue admission failed for session %s; "
+                    "falling back to the platform adapter queue",
+                    session_key,
+                    exc_info=True,
+                )
+                return False
+            if not admitted:
+                logger.warning(
+                    "Forced busy-path queue admission unavailable for session %s; "
+                    "falling back to the platform adapter queue",
+                    session_key,
+                )
+                return False
             return True
 
         # --- Authorization gate (#17775) ---
