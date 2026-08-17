@@ -136,3 +136,42 @@ def test_busy_path_internal_events_skip_pre_gateway(monkeypatch):
     assert disposition == "continue"
     assert called == []
     assert out_event is event
+
+
+def test_rewritten_busy_event_does_not_run_hook_again_on_cold_replay(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    calls: list[str] = []
+
+    def fake_invoke(name, **kwargs):
+        calls.append(kwargs["event"].text)
+        return [{"action": "rewrite", "text": "[bound frame] execute once"}]
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", fake_invoke)
+    rewritten, first = GatewayRunner._apply_pre_gateway_dispatch(runner, _event())
+    replayed, second = GatewayRunner._apply_pre_gateway_dispatch(runner, rewritten)
+
+    assert first == "queue"
+    assert second == "continue"
+    assert replayed.text == "[bound frame] execute once"
+    assert calls == ["按这个方案继续执行吧"]
+
+
+def test_failed_busy_hook_remains_retryable_on_cold_path(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    calls = 0
+
+    def fake_invoke(_name, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient hook failure")
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", fake_invoke)
+    event = _event()
+    first_event, first = GatewayRunner._apply_pre_gateway_dispatch(runner, event)
+    second_event, second = GatewayRunner._apply_pre_gateway_dispatch(runner, first_event)
+
+    assert (first, second) == ("continue", "continue")
+    assert second_event is event
+    assert calls == 2

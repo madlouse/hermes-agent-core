@@ -9114,6 +9114,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if bool(getattr(event, "internal", False)):
             return event, "continue"
+        if bool(getattr(event, "_hermes_pre_gateway_dispatched", False)):
+            return event, "continue"
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             hook_results = _invoke_hook(
@@ -9132,6 +9134,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             action = result.get("action")
             if action == "skip":
+                event._hermes_pre_gateway_dispatched = True
                 logger.info(
                     "pre_gateway_dispatch skip on busy path: reason=%s platform=%s chat=%s",
                     result.get("reason"),
@@ -9143,11 +9146,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 new_text = result.get("text")
                 if isinstance(new_text, str):
                     event = dataclasses.replace(event, text=new_text)
+                event._hermes_pre_gateway_dispatched = True
                 # Bound confirmation packets must become the next turn, not a
                 # mid-run steer/redirect into the unrelated busy conversation.
                 return event, "queue"
             if action == "allow":
                 break
+        event._hermes_pre_gateway_dispatched = True
         return event, "continue"
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
