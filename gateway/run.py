@@ -95,6 +95,7 @@ _EVENT_AUTHORIZATION_CACHE: weakref.WeakKeyDictionary[
     Any,
     dict[int, tuple[weakref.ReferenceType[Any], Any, tuple[str, ...], bool]],
 ] = weakref.WeakKeyDictionary()
+_PROTECTED_DEFERRED_REWRITE_TOKEN = object()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -9391,6 +9392,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event._hermes_pre_gateway_prepare_consumed = True
         return True
 
+    @staticmethod
+    def _mark_protected_deferred_rewrite(event: MessageEvent) -> None:
+        event._hermes_protected_deferred_rewrite = _PROTECTED_DEFERRED_REWRITE_TOKEN
+
+    @staticmethod
+    def _is_protected_deferred_rewrite(event: MessageEvent) -> bool:
+        return (
+            getattr(event, "_hermes_protected_deferred_rewrite", None)
+            is _PROTECTED_DEFERRED_REWRITE_TOKEN
+        )
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Authorize user traffic before hooks. A busy shared channel must not
         # let an unauthorized sender trigger a durable claim or queue retry.
@@ -9448,6 +9460,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if pre_gateway_disposition == "skip":
             return True
         if pre_gateway_disposition in {"queue", "retry"}:
+            if (
+                pre_gateway_disposition == "queue"
+                and bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+            ):
+                self._mark_protected_deferred_rewrite(event)
             try:
                 admitted = self._queue_or_replace_pending_event(
                     session_key,
@@ -15383,6 +15400,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 event._hermes_pre_gateway_prepare_terminal = True
                 return None
+
+            self._mark_protected_deferred_rewrite(event)
+
+        protected_deferred_rewrite = self._is_protected_deferred_rewrite(event)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -15394,7 +15415,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
         _up_state = self._peek_session_state(_quick_key)
-        if _up_state is not None and _up_state.persistent.update_prompt_pending:
+        if (
+            not protected_deferred_rewrite
+            and _up_state is not None
+            and _up_state.persistent.update_prompt_pending
+        ):
             raw = (event.text or "").strip()
             # Accept /approve and /deny as shorthand for yes/no
             cmd = event.get_command()
@@ -15473,7 +15498,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             _pending_clarify = None
-        if _pending_clarify is not None and _clarify_mod is not None:
+        if (
+            not protected_deferred_rewrite
+            and _pending_clarify is not None
+            and _clarify_mod is not None
+        ):
             _clarify_has_audio = bool(self._pending_event_audio_paths(event))
             _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
             if _clarify_has_audio and not _raw_clarify_reply:
@@ -15535,7 +15564,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _tool_approval_live = has_blocking_approval(_quick_key)
         except Exception:
             _tool_approval_live = False
-        if _pending_confirm and not _tool_approval_live:
+        if (
+            not protected_deferred_rewrite
+            and _pending_confirm
+            and not _tool_approval_live
+        ):
             _raw_reply = (event.text or "").strip()
             # Accept bang-prefixed replies (`!always`, `!cancel`) verbatim.
             # Slack/Matrix instruction text shows the `!` prefix (typed `/`

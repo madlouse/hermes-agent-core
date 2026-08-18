@@ -14,6 +14,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from gateway.session_state import SessionState
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -372,3 +373,94 @@ async def test_promoted_consumed_deferred_event_revalidates_on_cold_reentry(monk
     assert event.pre_gateway_consume_validate is None
     assert event._hermes_pre_gateway_consume_terminal is True
     dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cold_deferred_rewrite_bypasses_pending_update_interceptor(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    session_key = "agent:main:whatsapp:dm:15551234567@s.whatsapp.net"
+    state = SessionState()
+    state.persistent.update_prompt_pending = True
+    runner._sessions = {session_key: state}
+    runner._session_key_for_source = MagicMock(return_value=session_key)
+    dispatch = AsyncMock(return_value="agent-dispatched")
+    runner._handle_message_with_agent = dispatch
+
+    event = _make_event("approve the bound frame")
+    validate = MagicMock(return_value={"status": "ok"})
+
+    def prepare():
+        event.pre_gateway_consume_validate = validate
+        return {"status": "ready"}
+
+    event.pre_gateway_prepare = prepare
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        MagicMock(return_value=[{"action": "rewrite", "text": "[bound frame]"}]),
+    )
+    slash_resolve = AsyncMock(return_value="must-not-resolve")
+    monkeypatch.setattr(
+        "tools.slash_confirm.get_pending",
+        MagicMock(return_value={"confirm_id": "confirm-1"}),
+    )
+    monkeypatch.setattr("tools.slash_confirm.resolve", slash_resolve)
+
+    result = await runner._handle_message(event)
+
+    assert result == "agent-dispatched"
+    assert state.persistent.update_prompt_pending is True
+    slash_resolve.assert_not_awaited()
+    dispatch.assert_awaited_once()
+    assert event.text == "[bound frame]"
+
+
+@pytest.mark.asyncio
+async def test_busy_deferred_rewrite_bypasses_pending_clarify_on_cold_reentry(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    adapter._pending_messages = {}
+    session_key = "agent:main:whatsapp:dm:15551234567@s.whatsapp.net"
+    state = SessionState()
+    runner._sessions = {session_key: state}
+    runner._session_key_for_source = MagicMock(return_value=session_key)
+    runner._draining = False
+    runner._queue_or_replace_pending_event = MagicMock(return_value=True)
+    runner._agent_has_active_subagents = MagicMock(return_value=False)
+    runner._session_has_compression_in_flight = AsyncMock(return_value=False)
+    dispatch = AsyncMock(return_value="agent-dispatched")
+    runner._handle_message_with_agent = dispatch
+
+    event = _make_event("approve while busy")
+    validate = MagicMock(return_value={"status": "ok"})
+
+    def prepare():
+        event.pre_gateway_consume_validate = validate
+        return {"status": "ready"}
+
+    event.pre_gateway_prepare = prepare
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        MagicMock(return_value=[{"action": "rewrite", "text": "[bound frame]"}]),
+    )
+    handled = await runner._handle_active_session_busy_message(event, session_key)
+    assert handled is True
+    runner._queue_or_replace_pending_event.assert_called_once()
+
+    pending = SimpleNamespace(clarify_id="clarify-1")
+    resolve = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.clarify_gateway.get_pending_for_session", MagicMock(return_value=pending)
+    )
+    monkeypatch.setattr(
+        "tools.clarify_gateway.resolve_text_response_for_session", resolve
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "agent-dispatched"
+    resolve.assert_not_called()
+    dispatch.assert_awaited_once()
+    assert event.text == "[bound frame]"
