@@ -151,3 +151,28 @@ async def test_cold_deferred_prepare_runs_only_after_authorization(monkeypatch):
     assert await runner._handle_message(admitted) is None
     assert order == ["prepare", "hook"]
     assert admitted.pre_gateway_prepare is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_mode", ["empty", "allow", "exception"])
+async def test_consumed_cold_prepare_requires_explicit_rewrite(monkeypatch, hook_mode):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    dispatch = AsyncMock(return_value="should-not-run")
+    runner._handle_message_with_agent = dispatch
+
+    if hook_mode == "empty":
+        hook = MagicMock(return_value=[])
+    elif hook_mode == "allow":
+        hook = MagicMock(return_value=[{"action": "allow"}])
+    else:
+        hook = MagicMock(side_effect=RuntimeError("hook unavailable"))
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+
+    event = _make_event("approval")
+    event.pre_gateway_prepare = lambda: {"status": "ready"}
+
+    assert await runner._handle_message(event) is None
+    assert event._hermes_pre_gateway_prepare_terminal is True
+    dispatch.assert_not_awaited()

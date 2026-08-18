@@ -9181,6 +9181,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event._hermes_pre_gateway_dispatched = True
         return event, "continue"
 
+    def _revalidate_queued_deferred_event(self, event: MessageEvent) -> bool:
+        """Revalidate a claimed deferred event immediately before consumption.
+
+        Admission-time verification is insufficient for a busy FIFO: the
+        durable execution lease can expire while another turn is running. The
+        adapter-owned callback therefore gets one synchronous, no-await consume
+        phase in which it must re-read the exact receipt/owner/state/lease. Any
+        other outcome drops the queued event before its text, prompt, or media
+        can reach the model.
+        """
+        if not bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False)):
+            return True
+        validate = getattr(event, "pre_gateway_consume_validate", None)
+        if not callable(validate):
+            logger.warning("Queued deferred event is missing its consume validator")
+            event._hermes_pre_gateway_consume_terminal = True
+            return False
+
+        # The queued event is consumed once. Clear the bearer callback before
+        # invoking it so exceptions cannot accidentally leave a reusable seam.
+        event.pre_gateway_consume_validate = None
+        try:
+            result = validate()
+        except Exception:
+            logger.exception("Queued deferred-event revalidation failed")
+            event._hermes_pre_gateway_consume_terminal = True
+            return False
+
+        valid = result is True or (
+            isinstance(result, dict) and result.get("status") == "ok"
+        )
+        if valid:
+            event._hermes_pre_gateway_consume_revalidated = True
+            return True
+
+        logger.warning(
+            "Dropping queued deferred event after failed consume validation: "
+            "reason=%s platform=%s chat=%s",
+            result.get("reason") if isinstance(result, dict) else "rejected",
+            event.source.platform.value if getattr(event.source, "platform", None) else "unknown",
+            getattr(event.source, "chat_id", None) or "unknown",
+        )
+        event._hermes_pre_gateway_consume_terminal = True
+        return False
+
     @staticmethod
     def _has_deferred_pre_gateway_prepare(event: MessageEvent) -> bool:
         return callable(getattr(event, "pre_gateway_prepare", None))
@@ -9259,6 +9304,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Confirmation/runtime intake must see busy-path user follow-ups before
         # steer/redirect consumes them. Same hook contract as the cold path.
         event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
+        if bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False)) and (
+            pre_gateway_disposition != "queue"
+        ):
+            logger.warning(
+                "Dropping consumed deferred event without validated busy-path rewrite: "
+                "disposition=%s session=%s",
+                pre_gateway_disposition,
+                session_key,
+            )
+            event._hermes_pre_gateway_prepare_terminal = True
+            return True
         if pre_gateway_disposition == "skip":
             return True
         if pre_gateway_disposition in {"queue", "retry"}:
@@ -9269,10 +9325,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     emergency=True,
                 )
             except Exception:
-                if pre_gateway_disposition == "queue" and not bool(
+                consumed_prepare = bool(
                     getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
-                ):
+                )
+                if pre_gateway_disposition == "queue" and not consumed_prepare:
                     event._hermes_busy_fallback_preserve_identity = True
+                if consumed_prepare:
+                    event._hermes_pre_gateway_prepare_terminal = True
                 logger.warning(
                     "Emergency busy-path queue admission failed for session %s; %s",
                     session_key,
@@ -9283,14 +9342,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ),
                     exc_info=True,
                 )
-                return pre_gateway_disposition == "retry" or bool(
+                return pre_gateway_disposition == "retry" or consumed_prepare
+            if not admitted:
+                consumed_prepare = bool(
                     getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
                 )
-            if not admitted:
-                if pre_gateway_disposition == "queue" and not bool(
-                    getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
-                ):
+                if pre_gateway_disposition == "queue" and not consumed_prepare:
                     event._hermes_busy_fallback_preserve_identity = True
+                if consumed_prepare:
+                    event._hermes_pre_gateway_prepare_terminal = True
                 logger.warning(
                     "Emergency busy-path queue admission unavailable for session %s; %s",
                     session_key,
@@ -9300,9 +9360,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         else "falling back to the platform adapter queue"
                     ),
                 )
-                return pre_gateway_disposition == "retry" or bool(
-                    getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
-                )
+                return pre_gateway_disposition == "retry" or consumed_prepare
             return True
 
         # --- Draining case (gateway restarting/stopping) ---
@@ -15173,7 +15231,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
             source = event.source
-            if pre_gateway_disposition in {"skip", "retry"}:
+            if pre_gateway_disposition != "queue":
+                logger.warning(
+                    "Dropping consumed deferred event without validated cold-path rewrite: "
+                    "disposition=%s",
+                    pre_gateway_disposition,
+                )
+                event._hermes_pre_gateway_prepare_terminal = True
                 return None
         
         # Intercept messages that are responses to a pending /update prompt.
@@ -26070,6 +26134,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
                 pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                if pending_event is not None and not self._revalidate_queued_deferred_event(
+                    pending_event
+                ):
+                    return result
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
