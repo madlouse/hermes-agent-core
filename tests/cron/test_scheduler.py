@@ -679,6 +679,80 @@ class TestDeliverResultWrapping:
         assert "required_output_screening_hook_missing" in result
         send_mock.assert_not_awaited()
 
+    def test_delivery_preserves_legacy_report_only_metadata_for_boundary(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=False,
+            decision="deny",
+            reason="captured",
+            raw={"decision": "deny"},
+        )
+        before_send = MagicMock(return_value=boundary_decision)
+        send_mock = AsyncMock(return_value={"success": True})
+        report_only = {"mode": "not_actionable", "requires_user_reply": False}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", before_send), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(
+                {
+                    "id": "report-only-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                    "actionable_output": report_only,
+                },
+                "请确认今日学习总结已处理完成，无需回复。",
+            )
+
+        context = before_send.call_args.args[1]
+        assert context["legacy_actionable_output"] == report_only
+        assert "actionability" not in context
+        assert context["looks_actionable"] is False
+        assert "captured" in result
+        send_mock.assert_not_awaited()
+
+    def test_delivery_keeps_explicit_actionability_separate_from_legacy_report_only(
+        self,
+    ):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=False,
+            decision="deny",
+            reason="captured",
+            raw={"decision": "deny"},
+        )
+        before_send = MagicMock(return_value=boundary_decision)
+        explicit = {"requires_user_reply": True, "intent": "confirmation"}
+        report_only = {"mode": "not_actionable", "requires_user_reply": False}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", before_send):
+            _deliver_result(
+                {
+                    "id": "explicit-actionable-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                    "actionability": explicit,
+                    "actionable_output": report_only,
+                },
+                "please confirm",
+            )
+
+        context = before_send.call_args.args[1]
+        assert context["actionability"] == explicit
+        assert context["legacy_actionable_output"] == report_only
+        assert context["looks_actionable"] is True
+
     def test_boundary_rewrite_rebuilds_text_media_and_mirror(self):
         from gateway.config import Platform
 

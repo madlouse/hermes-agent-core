@@ -296,6 +296,37 @@ def test_enforced_gateway_reply_with_explicit_actionability_stays_actionable():
     assert ob.requires_boundary(context) is True
 
 
+def test_legacy_report_output_suppresses_text_heuristic_only():
+    context = ob.build_outbound_context(
+        source_kind="cron",
+        content="请确认日报已经处理完成，无需回复。",
+        platform="feishu",
+        chat_id="oc_test",
+        legacy_actionable_output={
+            "mode": "not_actionable",
+            "requires_user_reply": False,
+        },
+    )
+
+    assert context["looks_actionable"] is False
+
+
+def test_explicit_actionability_overrides_legacy_report_output():
+    context = ob.build_outbound_context(
+        source_kind="cron",
+        content="请回复 1 确认。",
+        platform="feishu",
+        chat_id="oc_test",
+        actionability={"requires_user_reply": True, "intent": "confirmation"},
+        legacy_actionable_output={
+            "mode": "not_actionable",
+            "requires_user_reply": False,
+        },
+    )
+
+    assert context["looks_actionable"] is True
+
+
 def test_gateway_reply_screening_requires_the_existing_hook_decision():
     context = ob.build_outbound_context(
         source_kind="gateway_reply",
