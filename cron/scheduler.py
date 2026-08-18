@@ -3426,6 +3426,7 @@ def _deliver_result(
                     job.get("action_specs") or job.get("cron_action_specs")
                 ),
                 actionability=job.get("actionability"),
+                legacy_actionable_output=job.get("actionable_output"),
                 gate_mode=job.get("actionable_gate_mode"),
                 decision_route=job.get("decision_route"),
                 result_route=job.get("result_route"),

@@ -229,10 +229,17 @@ def _declares_actionable_metadata(context: dict[str, Any]) -> bool:
     return "[[ACTION_SPEC" in content or '"action_spec"' in content or "'action_spec'" in content
 
 
+def _declared_report_output(context: dict[str, Any]) -> bool:
+    value = _object(context.get("legacy_actionable_output"))
+    return value.get("mode") == "not_actionable" and value.get("requires_user_reply") is False
+
+
 def looks_actionable(context: dict[str, Any]) -> bool:
-    if context.get("looks_actionable") is True:
-        return True
     if _declares_actionable_metadata(context):
+        return True
+    if _declared_report_output(context):
+        return False
+    if context.get("looks_actionable") is True:
         return True
     return bool(_ACTIONABLE_TEXT_RE.search(content_text(context) or ""))
 
@@ -428,7 +435,11 @@ def build_outbound_context(
     if not ctx.get("gate_mode"):
         ctx["gate_mode"] = os.getenv("HERMES_OUTBOUND_GATE_MODE", "enforce")
     if "looks_actionable" not in ctx:
-        if source_kind == "gateway_reply":
+        if _declares_actionable_metadata(ctx):
+            ctx["looks_actionable"] = True
+        elif _declared_report_output(ctx):
+            ctx["looks_actionable"] = False
+        elif source_kind == "gateway_reply":
             ctx["looks_actionable"] = _declares_actionable_metadata(ctx)
         else:
             ctx["looks_actionable"] = looks_actionable(ctx)
