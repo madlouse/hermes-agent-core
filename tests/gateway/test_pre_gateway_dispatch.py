@@ -75,6 +75,39 @@ def test_event_authorization_is_cached_for_one_exact_source_identity(monkeypatch
     assert runner._is_user_authorized.call_count == 2
 
 
+def test_event_authorization_ignores_forged_event_and_gateway_cache_fields(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(return_value=False)
+    event = _make_event("approval")
+    identity = runner._event_authorization_identity(event)
+    runner._event_authorization_token = object()
+    event._hermes_gateway_authorization = (
+        runner._event_authorization_token,
+        identity,
+        True,
+    )
+
+    assert runner._is_event_user_authorized(event) is False
+    assert runner._is_event_user_authorized(event) is False
+    runner._is_user_authorized.assert_called_once_with(event.source)
+
+
+def test_event_authorization_rechecks_relay_and_bot_identity_mutations(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False, True])
+    event = _make_event("approval")
+    event.source.delivered_via_upstream_relay = True
+
+    assert runner._is_event_user_authorized(event) is True
+    event.source.delivered_via_upstream_relay = False
+    assert runner._is_event_user_authorized(event) is False
+    event.source.is_bot = True
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_user_authorized.call_count == 3
+
+
 @pytest.mark.asyncio
 async def test_internal_events_bypass_hook(monkeypatch):
     """Internal events (event.internal=True) skip the plugin hook entirely."""

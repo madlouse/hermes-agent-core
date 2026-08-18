@@ -42,6 +42,7 @@ import signal
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -85,6 +86,15 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+
+# Authorization belongs to Core, not to the event or any hook that receives a
+# Gateway reference. Keep the verdict outside both objects and retain events
+# weakly so long-lived Gateways do not accumulate completed inbound turns.
+_EVENT_AUTHORIZATION_CACHE_LOCK = threading.Lock()
+_EVENT_AUTHORIZATION_CACHE: weakref.WeakKeyDictionary[
+    Any,
+    dict[int, tuple[weakref.ReferenceType[Any], tuple[str, ...], bool]],
+] = weakref.WeakKeyDictionary()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -9128,26 +9138,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             str(getattr(source, "chat_type", None) or ""),
             str(getattr(source, "chat_id", None) or ""),
             str(getattr(source, "user_id", None) or ""),
+            "1" if getattr(source, "is_bot", False) is True else "0",
+            "1" if getattr(source, "delivered_via_upstream_relay", False) is True else "0",
         )
 
     def _is_event_user_authorized(self, event: MessageEvent) -> bool:
         """Evaluate authorization once for one immutable event identity."""
-        token = getattr(self, "_event_authorization_token", None)
-        if token is None:
-            token = object()
-            self._event_authorization_token = token
         identity = self._event_authorization_identity(event)
-        cached = getattr(event, "_hermes_gateway_authorization", None)
-        if (
-            isinstance(cached, tuple)
-            and len(cached) == 3
-            and cached[0] is token
-            and cached[1] == identity
-        ):
-            return bool(cached[2])
-        authorized = bool(self._is_user_authorized(event.source))
-        event._hermes_gateway_authorization = (token, identity, authorized)
-        return authorized
+        event_id = id(event)
+        with _EVENT_AUTHORIZATION_CACHE_LOCK:
+            runner_cache = _EVENT_AUTHORIZATION_CACHE.setdefault(self, {})
+            cached = runner_cache.get(event_id)
+            if cached is not None and cached[0]() is event and cached[1] == identity:
+                return cached[2]
+
+            authorized = bool(self._is_user_authorized(event.source))
+            runner_ref = weakref.ref(self)
+
+            def discard_event(event_ref: weakref.ReferenceType[Any]) -> None:
+                runner = runner_ref()
+                if runner is None:
+                    return
+                with _EVENT_AUTHORIZATION_CACHE_LOCK:
+                    live_cache = _EVENT_AUTHORIZATION_CACHE.get(runner)
+                    current = live_cache.get(event_id) if live_cache is not None else None
+                    if current is not None and current[0] is event_ref:
+                        live_cache.pop(event_id, None)
+
+            runner_cache[event_id] = (weakref.ref(event, discard_event), identity, authorized)
+            return authorized
 
     def _apply_pre_gateway_dispatch(self, event: MessageEvent) -> tuple[MessageEvent, str]:
         """Run the same pre_gateway_dispatch hooks used by the cold path.
