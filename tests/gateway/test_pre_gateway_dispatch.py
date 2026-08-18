@@ -80,6 +80,32 @@ def test_event_authorization_is_cached_for_one_exact_source_identity(monkeypatch
     assert runner._is_user_authorized.call_count == 1
 
 
+def test_event_authorization_rechecks_current_policy_at_final_consume(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False])
+    event = _make_event("approval")
+
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_event_user_authorized(event, recheck_policy=True) is False
+    assert runner._is_user_authorized.call_count == 2
+
+
+def test_deferred_final_consume_fails_closed_after_authorization_revocation(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False])
+    event = _make_event("approval")
+    event._hermes_pre_gateway_prepare_consumed = True
+    consume_validate = MagicMock(return_value={"status": "ok"})
+    event.pre_gateway_consume_validate = consume_validate
+
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._revalidate_queued_deferred_event(event, consume=True) is False
+    consume_validate.assert_not_called()
+    assert event._hermes_pre_gateway_consume_terminal is True
+
+
 def test_event_authorization_ignores_forged_event_and_gateway_cache_fields(monkeypatch):
     _clear_auth_env(monkeypatch)
     runner, _adapter = _make_runner(Platform.WHATSAPP)

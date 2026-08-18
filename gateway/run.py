@@ -9190,8 +9190,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             str(self._adapter_profile_for_source(source) or ""),
         )
 
-    def _is_event_user_authorized(self, event: MessageEvent) -> bool:
-        """Evaluate authorization once against an immutable ingress snapshot."""
+    def _is_event_user_authorized(
+        self,
+        event: MessageEvent,
+        *,
+        recheck_policy: bool = False,
+    ) -> bool:
+        """Evaluate one immutable ingress identity against current policy."""
         event_id = id(event)
         with _EVENT_AUTHORIZATION_CACHE_LOCK:
             runner_cache = _EVENT_AUTHORIZATION_CACHE.setdefault(self, {})
@@ -9206,6 +9211,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or self._event_authorization_identity(event) != cached[2]
                 ):
                     return False
+                if recheck_policy:
+                    return bool(self._is_user_authorized(cached[1]))
                 return cached[3]
 
             source = event.source
@@ -9299,7 +9306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False)):
             return True
-        if not self._is_event_user_authorized(event):
+        if not self._is_event_user_authorized(event, recheck_policy=True):
             logger.warning("Queued deferred event authorization identity changed")
             event._hermes_pre_gateway_consume_terminal = True
             event.pre_gateway_consume_validate = None
