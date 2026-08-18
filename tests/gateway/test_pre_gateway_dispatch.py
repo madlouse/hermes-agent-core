@@ -60,6 +60,21 @@ def _make_runner(platform: Platform):
     return runner, adapter
 
 
+def test_event_authorization_is_cached_for_one_exact_source_identity(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False])
+    event = _make_event("approval")
+
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_event_user_authorized(event) is True
+    runner._is_user_authorized.assert_called_once_with(event.source)
+
+    event.source.user_id = "different-user"
+    assert runner._is_event_user_authorized(event) is False
+    assert runner._is_user_authorized.call_count == 2
+
+
 @pytest.mark.asyncio
 async def test_internal_events_bypass_hook(monkeypatch):
     """Internal events (event.internal=True) skip the plugin hook entirely."""

@@ -9118,6 +9118,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    @staticmethod
+    def _event_authorization_identity(event: MessageEvent) -> tuple[str, ...]:
+        source = event.source
+        platform = getattr(source, "platform", None)
+        return (
+            str(getattr(platform, "value", platform) or ""),
+            str(getattr(source, "profile", None) or ""),
+            str(getattr(source, "chat_type", None) or ""),
+            str(getattr(source, "chat_id", None) or ""),
+            str(getattr(source, "user_id", None) or ""),
+        )
+
+    def _is_event_user_authorized(self, event: MessageEvent) -> bool:
+        """Evaluate authorization once for one immutable event identity."""
+        token = getattr(self, "_event_authorization_token", None)
+        if token is None:
+            token = object()
+            self._event_authorization_token = token
+        identity = self._event_authorization_identity(event)
+        cached = getattr(event, "_hermes_gateway_authorization", None)
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 3
+            and cached[0] is token
+            and cached[1] == identity
+        ):
+            return bool(cached[2])
+        authorized = bool(self._is_user_authorized(event.source))
+        event._hermes_gateway_authorization = (token, identity, authorized)
+        return authorized
+
     def _apply_pre_gateway_dispatch(self, event: MessageEvent) -> tuple[MessageEvent, str]:
         """Run the same pre_gateway_dispatch hooks used by the cold path.
 
@@ -9262,9 +9293,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Authorize user traffic before hooks. A busy shared channel must not
         # let an unauthorized sender trigger a durable claim or queue retry.
-        if not bool(getattr(event, "internal", False)) and not self._is_user_authorized(
-            event.source
-        ):
+        if not bool(getattr(event, "internal", False)) and not self._is_event_user_authorized(event):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
@@ -15165,10 +15194,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # chat-scoped allowlist (e.g. TELEGRAM_GROUP_ALLOWED_CHATS
             # authorizes every member of the listed chat regardless of
             # sender). Defer to _is_user_authorized so that path runs.
-            if not self._is_user_authorized(source):
+            if not self._is_event_user_authorized(event):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
-        elif not self._is_user_authorized(source):
+        elif not self._is_event_user_authorized(event):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
