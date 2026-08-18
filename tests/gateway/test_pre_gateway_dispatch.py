@@ -6,6 +6,7 @@ dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
 from types import SimpleNamespace
+import threading
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -121,6 +122,45 @@ def test_event_authorization_rechecks_role_and_display_identity_mutations(monkey
     event.source.user_name = "renamed-principal"
     assert runner._is_event_user_authorized(event) is True
     assert runner._is_user_authorized.call_count == 3
+
+
+def test_event_authorization_concurrent_revocation_never_caches_stale_allow(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    event = _make_event("approval")
+    event.source.user_id = "allowed"
+    authorization_started = threading.Event()
+    release_authorization = threading.Event()
+    calls = []
+
+    def authorize(source):
+        observed = source.user_id
+        calls.append(observed)
+        if len(calls) == 1:
+            authorization_started.set()
+            assert release_authorization.wait(timeout=2)
+        return observed == "allowed"
+
+    runner._is_user_authorized = authorize
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(runner._is_event_user_authorized(event))
+    )
+    second = threading.Thread(
+        target=lambda: results.append(runner._is_event_user_authorized(event))
+    )
+    first.start()
+    assert authorization_started.wait(timeout=2)
+    second.start()
+    event.source.user_id = "revoked"
+    release_authorization.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert results == [False, False]
+    assert calls == ["allowed", "revoked"]
+    assert runner._is_event_user_authorized(event) is False
 
 
 @pytest.mark.asyncio

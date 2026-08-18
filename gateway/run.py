@@ -9148,15 +9148,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _is_event_user_authorized(self, event: MessageEvent) -> bool:
         """Evaluate authorization once for one immutable event identity."""
-        identity = self._event_authorization_identity(event)
         event_id = id(event)
         with _EVENT_AUTHORIZATION_CACHE_LOCK:
             runner_cache = _EVENT_AUTHORIZATION_CACHE.setdefault(self, {})
-            cached = runner_cache.get(event_id)
-            if cached is not None and cached[0]() is event and cached[1] == identity:
-                return cached[2]
-
-            authorized = bool(self._is_user_authorized(event.source))
             runner_ref = weakref.ref(self)
 
             def discard_event(event_ref: weakref.ReferenceType[Any]) -> None:
@@ -9169,8 +9163,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if current is not None and current[0] is event_ref:
                         live_cache.pop(event_id, None)
 
-            runner_cache[event_id] = (weakref.ref(event, discard_event), identity, authorized)
-            return authorized
+            for _attempt in range(3):
+                identity = self._event_authorization_identity(event)
+                cached = runner_cache.get(event_id)
+                if cached is not None and cached[0]() is event and cached[1] == identity:
+                    return cached[2]
+
+                authorized = bool(self._is_user_authorized(event.source))
+                if self._event_authorization_identity(event) != identity:
+                    continue
+                runner_cache[event_id] = (
+                    weakref.ref(event, discard_event),
+                    identity,
+                    authorized,
+                )
+                return authorized
+            return False
 
     def _apply_pre_gateway_dispatch(self, event: MessageEvent) -> tuple[MessageEvent, str]:
         """Run the same pre_gateway_dispatch hooks used by the cold path.
