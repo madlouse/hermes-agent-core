@@ -153,7 +153,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
 
 
 @pytest.mark.asyncio
-async def test_queued_deferred_event_revalidates_lease_after_awaits_before_model(monkeypatch, tmp_path):
+async def test_queued_deferred_event_consumes_lease_before_session_or_media_side_effects(monkeypatch, tmp_path):
     CaptureQueuedNativeImageAgent.calls = []
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -186,6 +186,7 @@ async def test_queued_deferred_event_revalidates_lease_after_awaits_before_model
     ])
     pending.pre_gateway_consume_validate = validate
     runner._is_event_user_authorized = MagicMock(return_value=True)
+    runner._recover_telegram_topic_thread_id = MagicMock()
     runner._transcribe_and_echo_pending_voice = AsyncMock()
     runner._prepare_profile_scoped_inbound_message_text = AsyncMock()
     adapter._pending_messages["agent:main:telegram:group:-1001"] = pending
@@ -204,7 +205,47 @@ async def test_queued_deferred_event_revalidates_lease_after_awaits_before_model
     assert validate.call_count == 2
     assert pending.pre_gateway_consume_validate is None
     assert pending._hermes_pre_gateway_consume_terminal is True
+    runner._recover_telegram_topic_thread_id.assert_not_called()
     runner._transcribe_and_echo_pending_voice.assert_not_awaited()
+    runner._prepare_profile_scoped_inbound_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cold_deferred_event_final_consume_precedes_session_and_media_side_effects():
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group")
+    event = MessageEvent(
+        text="bound confirmation packet",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/untrusted-voice.ogg"],
+        media_types=["audio/ogg"],
+        message_id="cold-confirmation-1",
+    )
+    event._hermes_pre_gateway_prepare_consumed = True
+    validate = MagicMock(side_effect=[
+        {"status": "ok"},
+        {"status": "expired", "reason": "lease_expired"},
+    ])
+    event.pre_gateway_consume_validate = validate
+    runner._is_event_user_authorized = MagicMock(return_value=True)
+    runner._recover_telegram_topic_thread_id = MagicMock()
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock()
+
+    assert runner._revalidate_queued_deferred_event(event) is True
+    result = await runner._handle_message_with_agent(
+        event,
+        source,
+        "agent:main:telegram:group:-1001",
+        1,
+    )
+
+    assert result is None
+    assert validate.call_count == 2
+    assert event.pre_gateway_consume_validate is None
+    assert event._hermes_pre_gateway_consume_terminal is True
+    runner._recover_telegram_topic_thread_id.assert_not_called()
     runner._prepare_profile_scoped_inbound_message_text.assert_not_awaited()
 
 
@@ -426,7 +467,7 @@ async def test_deferred_event_is_rejected_before_session_or_media_preprocessing(
     )
 
     assert result is None
-    runner._revalidate_queued_deferred_event.assert_called_once_with(event)
+    runner._revalidate_queued_deferred_event.assert_called_once_with(event, consume=True)
     runner._async_session_store.get_or_create_session.assert_not_called()
     runner._prepare_profile_scoped_inbound_message_text.assert_not_called()
 

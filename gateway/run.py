@@ -17183,7 +17183,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             deferred_confirmation
             and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
-            and not self._revalidate_queued_deferred_event(event)
+            and not self._revalidate_queued_deferred_event(event, consume=True)
         ):
             return None
 
@@ -18424,12 +18424,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
-            if (
-                deferred_confirmation
-                and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
-                and not self._revalidate_queued_deferred_event(event, consume=True)
-            ):
-                return None
             if turn_sidecar_notes and session_key and deferred_confirmation:
                 self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
             agent_result = await self._run_agent(
