@@ -15226,6 +15226,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        if (
+            not is_internal
+            and bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+            and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+        ):
+            # A deferred event can re-enter through the adapter pending slot
+            # after an earlier FIFO head was rejected or a recursion-limited
+            # turn handed ownership to a fresh task. Its prepare/hook are
+            # already consumed, but the one-shot receipt/lease capability must
+            # still be checked immediately before this task can expose any
+            # event content to the model.
+            if not self._revalidate_queued_deferred_event(event):
+                return None
+
         if deferred_prepare:
             if not self._apply_deferred_pre_gateway_prepare(event):
                 return None
@@ -26134,6 +26148,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # order, and (b) causes any mid-chain /queue to correctly
                 # route to overflow rather than jumping the queue.
                 pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                if (
+                    pending_event is not None
+                    and _interrupt_depth >= self._MAX_INTERRUPT_DEPTH
+                ):
+                    # This task will not consume the event. Requeue it before
+                    # invoking the one-shot validator so the fresh drain task
+                    # owns the final receipt/lease check at actual consumption.
+                    logger.warning(
+                        "Interrupt recursion depth %d reached for session %s — "
+                        "queueing event before deferred consume validation.",
+                        _interrupt_depth,
+                        session_key,
+                    )
+                    merge_pending_message_event(
+                        adapter._pending_messages,
+                        session_key,
+                        pending_event,
+                    )
+                    return result_holder[0] or {
+                        "final_response": response,
+                        "messages": history,
+                    }
                 if pending_event is not None and not self._revalidate_queued_deferred_event(
                     pending_event
                 ):

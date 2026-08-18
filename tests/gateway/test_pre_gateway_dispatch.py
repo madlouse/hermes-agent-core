@@ -176,3 +176,24 @@ async def test_consumed_cold_prepare_requires_explicit_rewrite(monkeypatch, hook
     assert await runner._handle_message(event) is None
     assert event._hermes_pre_gateway_prepare_terminal is True
     dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_promoted_consumed_deferred_event_revalidates_on_cold_reentry(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    dispatch = AsyncMock(return_value="must-not-run")
+    runner._handle_message_with_agent = dispatch
+    validate = MagicMock(return_value={"status": "expired", "reason": "lease_expired"})
+
+    event = _make_event("bound confirmation packet")
+    event._hermes_pre_gateway_prepare_consumed = True
+    event._hermes_pre_gateway_dispatched = True
+    event.pre_gateway_consume_validate = validate
+
+    assert await runner._handle_message(event) is None
+    validate.assert_called_once_with()
+    assert event.pre_gateway_consume_validate is None
+    assert event._hermes_pre_gateway_consume_terminal is True
+    dispatch.assert_not_awaited()

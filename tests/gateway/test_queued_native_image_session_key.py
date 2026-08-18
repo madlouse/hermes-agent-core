@@ -198,6 +198,54 @@ async def test_queued_deferred_event_revalidates_expired_lease_before_model(monk
     assert pending._hermes_pre_gateway_consume_terminal is True
 
 
+@pytest.mark.asyncio
+async def test_recursion_limit_requeues_deferred_event_before_one_shot_validation(
+    monkeypatch, tmp_path
+):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group")
+    session_key = "agent:main:telegram:group:-1001"
+    pending = MessageEvent(
+        text="bound confirmation packet",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="queued-confirmation-depth",
+    )
+    pending._hermes_pre_gateway_prepare_consumed = True
+    validate = MagicMock(return_value={"status": "ok"})
+    pending.pre_gateway_consume_validate = validate
+    adapter._pending_messages[session_key] = pending
+
+    result = await runner._run_agent(
+        message="first turn",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-depth-confirmation",
+        session_key=session_key,
+        _interrupt_depth=runner._MAX_INTERRUPT_DEPTH,
+    )
+
+    assert result["final_response"] == "done-1"
+    assert CaptureQueuedNativeImageAgent.calls == ["first turn"]
+    validate.assert_not_called()
+    assert pending.pre_gateway_consume_validate is validate
+    assert adapter._pending_messages[session_key] is pending
+
+
 def test_consumed_queued_event_without_validator_fails_closed():
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
