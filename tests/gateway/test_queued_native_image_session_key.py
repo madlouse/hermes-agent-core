@@ -199,6 +199,54 @@ async def test_queued_deferred_event_revalidates_expired_lease_before_model(monk
 
 
 @pytest.mark.asyncio
+async def test_rejected_fifo_head_validates_and_consumes_successor_without_new_traffic(
+    monkeypatch, tmp_path
+):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group")
+    session_key = "agent:main:telegram:group:-1001"
+    rejected = MessageEvent(
+        text="expired packet", message_type=MessageType.TEXT, source=source,
+        message_id="queued-expired-head",
+    )
+    rejected._hermes_pre_gateway_prepare_consumed = True
+    rejected_validate = MagicMock(return_value={"status": "expired"})
+    rejected.pre_gateway_consume_validate = rejected_validate
+    successor = MessageEvent(
+        text="valid successor packet", message_type=MessageType.TEXT, source=source,
+        message_id="queued-valid-successor",
+    )
+    successor._hermes_pre_gateway_prepare_consumed = True
+    successor_validate = MagicMock(return_value={"status": "ok"})
+    successor.pre_gateway_consume_validate = successor_validate
+    adapter._pending_messages[session_key] = rejected
+    runner._session_state(session_key).conversation.queued_events.append(successor)
+
+    result = await runner._run_agent(
+        message="first turn", context_prompt="", history=[], source=source,
+        session_id="sess-successor", session_key=session_key,
+    )
+
+    assert result["final_response"] == "done-2"
+    assert CaptureQueuedNativeImageAgent.calls == ["first turn", "valid successor packet"]
+    rejected_validate.assert_called_once_with()
+    successor_validate.assert_called_once_with()
+    assert session_key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
 async def test_recursion_limit_requeues_deferred_event_before_one_shot_validation(
     monkeypatch, tmp_path
 ):
@@ -228,6 +276,11 @@ async def test_recursion_limit_requeues_deferred_event_before_one_shot_validatio
     validate = MagicMock(return_value={"status": "ok"})
     pending.pre_gateway_consume_validate = validate
     adapter._pending_messages[session_key] = pending
+    successor = MessageEvent(
+        text="later successor", message_type=MessageType.TEXT, source=source,
+        message_id="queued-confirmation-after-depth",
+    )
+    runner._session_state(session_key).conversation.queued_events.append(successor)
 
     result = await runner._run_agent(
         message="first turn",
@@ -244,6 +297,7 @@ async def test_recursion_limit_requeues_deferred_event_before_one_shot_validatio
     validate.assert_not_called()
     assert pending.pre_gateway_consume_validate is validate
     assert adapter._pending_messages[session_key] is pending
+    assert runner._session_state(session_key).conversation.queued_events == [successor]
 
 
 def test_consumed_queued_event_without_validator_fails_closed():

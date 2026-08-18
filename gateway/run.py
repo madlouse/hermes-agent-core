@@ -26141,39 +26141,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending = None
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
-                # /queue overflow: after consuming the adapter's "next-up"
-                # slot, promote the next queued event into it so the
-                # recursive run's drain will see it.  This keeps the slot
-                # occupied for the full FIFO chain, which (a) preserves
-                # order, and (b) causes any mid-chain /queue to correctly
-                # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-                if (
-                    pending_event is not None
-                    and _interrupt_depth >= self._MAX_INTERRUPT_DEPTH
-                ):
-                    # This task will not consume the event. Requeue it before
-                    # invoking the one-shot validator so the fresh drain task
-                    # owns the final receipt/lease check at actual consumption.
-                    logger.warning(
-                        "Interrupt recursion depth %d reached for session %s — "
-                        "queueing event before deferred consume validation.",
-                        _interrupt_depth,
-                        session_key,
+                if pending_event is None:
+                    pending_event = self._promote_queued_event(
+                        session_key, adapter, None
                     )
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        session_key,
-                        pending_event,
+                while pending_event is not None:
+                    if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
+                        # No successor has been promoted yet. Restore this head
+                        # directly into the now-empty slot and leave overflow in
+                        # place, preserving both FIFO order and the one-shot
+                        # validator for the task that actually consumes it.
+                        logger.warning(
+                            "Interrupt recursion depth %d reached for session %s — "
+                            "queueing event before deferred consume validation.",
+                            _interrupt_depth,
+                            session_key,
+                        )
+                        adapter._pending_messages[session_key] = pending_event
+                        return result_holder[0] or {
+                            "final_response": response,
+                            "messages": history,
+                        }
+                    if self._revalidate_queued_deferred_event(pending_event):
+                        # Only after this head is accepted may the next overflow
+                        # item occupy the adapter slot for the following drain.
+                        pending_event = self._promote_queued_event(
+                            session_key, adapter, pending_event
+                        )
+                        break
+                    # Drop only the rejected head. Validate the successor in
+                    # this same drain so it cannot remain stranded waiting for
+                    # unrelated inbound traffic.
+                    pending_event = self._promote_queued_event(
+                        session_key, adapter, None
                     )
-                    return result_holder[0] or {
-                        "final_response": response,
-                        "messages": history,
-                    }
-                if pending_event is not None and not self._revalidate_queued_deferred_event(
-                    pending_event
-                ):
-                    return result
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
