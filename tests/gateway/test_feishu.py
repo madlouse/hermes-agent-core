@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from gateway.platforms.base import ProcessingOutcome
 
 try:
@@ -22,6 +24,15 @@ try:
     _HAS_LARK_OAPI = True
 except ImportError:
     _HAS_LARK_OAPI = False
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gateway_runtime_status(monkeypatch, tmp_path):
+    from gateway import status as gateway_status
+
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(gateway_status, "_get_process_hermes_home", lambda: hermes_home)
 
 
 class _FakeRequestContent:

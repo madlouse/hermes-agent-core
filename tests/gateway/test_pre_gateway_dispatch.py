@@ -17,6 +17,11 @@ from gateway.session import SessionSource
 from gateway.session_state import SessionState
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gateway_runtime_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+
 def _clear_auth_env(monkeypatch) -> None:
     for key in (
         "TELEGRAM_ALLOWED_USERS",

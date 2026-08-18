@@ -39,6 +39,11 @@ from gateway.run import GatewayRunner  # noqa: E402
 from gateway.session import build_session_key  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gateway_runtime_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+
 def _event(text: str = "按这个方案继续执行吧", *, internal: bool = False) -> MessageEvent:
     source = SessionSource(
         platform=Platform.FEISHU,
