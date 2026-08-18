@@ -9317,6 +9317,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     @staticmethod
+    def _agent_start_visible_message(event: MessageEvent, message_text: str) -> str:
+        if (
+            bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+            and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+        ):
+            return "[deferred confirmation pending final validation]"
+        return message_text[:500]
+
+    @staticmethod
     def _has_deferred_pre_gateway_prepare(event: MessageEvent) -> bool:
         return callable(getattr(event, "pre_gateway_prepare", None))
 
@@ -18301,11 +18310,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        deferred_confirmation = bool(
+            getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+        )
+
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
-        # next turn's user message.
-        if turn_sidecar_notes and session_key:
+        # next turn's user message. Deferred confirmations wait until their
+        # final receipt/lease consume check succeeds below.
+        if turn_sidecar_notes and session_key and not deferred_confirmation:
             self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
 
         # Bind this gateway run generation to the adapter's active-session
@@ -18319,7 +18333,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             if (
-                bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+                deferred_confirmation
                 and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
                 and not self._revalidate_queued_deferred_event(event)
             ):
@@ -18332,7 +18346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
-                "message": message_text[:500],
+                "message": self._agent_start_visible_message(event, message_text),
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -18343,11 +18357,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
             if (
-                bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+                deferred_confirmation
                 and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
                 and not self._revalidate_queued_deferred_event(event, consume=True)
             ):
                 return None
+            if turn_sidecar_notes and session_key and deferred_confirmation:
+                self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,

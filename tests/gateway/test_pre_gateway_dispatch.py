@@ -111,6 +111,18 @@ def test_event_authorization_rejects_wholesale_source_replacement(monkeypatch):
     runner._is_user_authorized.assert_called_once()
 
 
+def test_agent_start_redacts_deferred_packet_until_final_consume():
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    event = _make_event("secret bound packet")
+    event._hermes_pre_gateway_prepare_consumed = True
+
+    assert runner._agent_start_visible_message(event, event.text) == (
+        "[deferred confirmation pending final validation]"
+    )
+    event._hermes_pre_gateway_consume_revalidated = True
+    assert runner._agent_start_visible_message(event, event.text) == event.text
+
+
 def test_event_authorization_snapshots_relay_and_bot_identity_per_event(monkeypatch):
     _clear_auth_env(monkeypatch)
     runner, _adapter = _make_runner(Platform.WHATSAPP)
