@@ -118,3 +118,36 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cold_deferred_prepare_runs_only_after_authorization(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    order = []
+
+    def prepare():
+        order.append("prepare")
+        return {"status": "ready"}
+
+    def hook(name, **_kwargs):
+        assert name == "pre_gateway_dispatch"
+        order.append("hook")
+        return [{"action": "skip", "reason": "test"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+    denied = _make_event("denied")
+    denied.pre_gateway_prepare = prepare
+
+    assert await runner._handle_message(denied) is None
+    assert order == []
+    adapter.send.assert_awaited()
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    admitted = _make_event("admitted")
+    admitted.pre_gateway_prepare = prepare
+
+    assert await runner._handle_message(admitted) is None
+    assert order == ["prepare", "hook"]
+    assert admitted.pre_gateway_prepare is None

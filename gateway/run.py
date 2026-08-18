@@ -9045,11 +9045,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not isinstance(pending_slot, dict):
             return False
         existing = pending_slot.get(session_key)
-        if existing is not None and (
-            getattr(existing, "message_type", None) == MessageType.PHOTO
-            or event.message_type == MessageType.PHOTO
-            or bool(getattr(existing, "media_urls", None))
-            or bool(getattr(event, "media_urls", None))
+        if (
+            existing is not None
+            and not bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+            and (
+                getattr(existing, "message_type", None) == MessageType.PHOTO
+                or event.message_type == MessageType.PHOTO
+                or bool(getattr(existing, "media_urls", None))
+                or bool(getattr(event, "media_urls", None))
+            )
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
             merge_pending_message_event(
@@ -9065,7 +9069,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if emergency
             else self._BUSY_QUEUE_MAX_PENDING
         )
-        if self._queue_depth(session_key, adapter=adapter) >= queue_limit:
+        queue_depth = self._queue_depth(session_key, adapter=adapter)
+        if queue_depth >= queue_limit:
             logger.warning(
                 "Refusing busy-mode follow-up for session %s — pending queue at %s cap (%d).",
                 session_key,
@@ -9176,6 +9181,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event._hermes_pre_gateway_dispatched = True
         return event, "continue"
 
+    @staticmethod
+    def _has_deferred_pre_gateway_prepare(event: MessageEvent) -> bool:
+        return callable(getattr(event, "pre_gateway_prepare", None))
+
+    def _apply_deferred_pre_gateway_prepare(self, event: MessageEvent) -> bool:
+        """Consume one adapter-owned prepare capability exactly once.
+
+        The callback is deliberately synchronous. Busy admission calls this
+        only after authorization and the real 32+1 capacity check, then runs
+        the plugin hook and enqueue without yielding the event loop. Anything
+        except an explicit ``{"status": "ready"}`` fails closed.
+        """
+        prepare = getattr(event, "pre_gateway_prepare", None)
+        if not callable(prepare):
+            return True
+        event.pre_gateway_prepare = None
+        try:
+            result = prepare()
+        except Exception:
+            logger.exception("Deferred pre-gateway prepare failed")
+            event._hermes_pre_gateway_prepare_terminal = True
+            return False
+        ready = isinstance(result, dict) and result.get("status") == "ready"
+        if not ready:
+            logger.warning(
+                "Deferred pre-gateway prepare stopped dispatch: reason=%s",
+                result.get("reason") if isinstance(result, dict) else "invalid_result",
+            )
+            event._hermes_pre_gateway_prepare_terminal = True
+            return False
+        event._hermes_pre_gateway_prepare_consumed = True
+        return True
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # Authorize user traffic before hooks. A busy shared channel must not
         # let an unauthorized sender trigger a durable claim or queue retry.
@@ -9192,6 +9230,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
+        adapter = self._adapter_for_source(event.source)
+        deferred_prepare = self._has_deferred_pre_gateway_prepare(event)
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not bool(getattr(event, "internal", False)) and not isinstance(pending_slot, dict):
+            logger.warning(
+                "Deferring busy-path hook for session %s — adapter FIFO is unavailable; "
+                "no confirmation claim was attempted.",
+                session_key,
+            )
+            return deferred_prepare
+        if (
+            not bool(getattr(event, "internal", False))
+            and isinstance(pending_slot, dict)
+            and self._queue_depth(session_key, adapter=adapter)
+            >= self._BUSY_QUEUE_EMERGENCY_MAX_PENDING
+        ):
+            logger.warning(
+                "Deferring busy-path hook for session %s — emergency FIFO is full; "
+                "no confirmation claim was attempted.",
+                session_key,
+            )
+            return deferred_prepare
+
+        if deferred_prepare and not self._apply_deferred_pre_gateway_prepare(event):
+            return True
+
         # Confirmation/runtime intake must see busy-path user follow-ups before
         # steer/redirect consumes them. Same hook contract as the cold path.
         event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
@@ -9205,7 +9269,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     emergency=True,
                 )
             except Exception:
-                if pre_gateway_disposition == "queue":
+                if pre_gateway_disposition == "queue" and not bool(
+                    getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+                ):
                     event._hermes_busy_fallback_preserve_identity = True
                 logger.warning(
                     "Emergency busy-path queue admission failed for session %s; %s",
@@ -9217,9 +9283,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ),
                     exc_info=True,
                 )
-                return pre_gateway_disposition == "retry"
+                return pre_gateway_disposition == "retry" or bool(
+                    getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+                )
             if not admitted:
-                if pre_gateway_disposition == "queue":
+                if pre_gateway_disposition == "queue" and not bool(
+                    getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+                ):
                     event._hermes_busy_fallback_preserve_identity = True
                 logger.warning(
                     "Emergency busy-path queue admission unavailable for session %s; %s",
@@ -9230,7 +9300,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         else "falling back to the platform adapter queue"
                     ),
                 )
-                return pre_gateway_disposition == "retry"
+                return pre_gateway_disposition == "retry" or bool(
+                    getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+                )
             return True
 
         # --- Draining case (gateway restarting/stopping) ---
@@ -15011,11 +15083,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
         #   {"action": "allow"}   /   None          -> normal dispatch
-        # Hook runs BEFORE auth so plugins can handle unauthorized senders
-        # (e.g. customer handover ingest) without triggering the pairing flow.
+        # Hook normally runs BEFORE auth so plugins can handle unauthorized
+        # senders (e.g. customer handover ingest) without triggering pairing.
+        # Adapter-owned deferred prepares are the narrow exception: their
+        # durable effects and dependent hook run only after authorization.
         # Busy-session follow-ups reuse the same helper so confirmation plugins
         # cannot be bypassed while a DM turn is already active.
-        if not is_internal:
+        deferred_prepare = self._has_deferred_pre_gateway_prepare(event)
+        if not is_internal and not deferred_prepare:
             event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
             source = event.source
             if pre_gateway_disposition == "skip":
@@ -15092,6 +15167,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        if deferred_prepare:
+            if not self._apply_deferred_pre_gateway_prepare(event):
+                return None
+            event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
+            source = event.source
+            if pre_gateway_disposition in {"skip", "retry"}:
+                return None
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
