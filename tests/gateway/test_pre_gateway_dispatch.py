@@ -108,6 +108,21 @@ def test_event_authorization_rechecks_relay_and_bot_identity_mutations(monkeypat
     assert runner._is_user_authorized.call_count == 3
 
 
+def test_event_authorization_rechecks_role_and_display_identity_mutations(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False, True])
+    event = _make_event("approval")
+    event.source.role_authorized = True
+
+    assert runner._is_event_user_authorized(event) is True
+    event.source.role_authorized = False
+    assert runner._is_event_user_authorized(event) is False
+    event.source.user_name = "renamed-principal"
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_user_authorized.call_count == 3
+
+
 @pytest.mark.asyncio
 async def test_internal_events_bypass_hook(monkeypatch):
     """Internal events (event.internal=True) skip the plugin hook entirely."""

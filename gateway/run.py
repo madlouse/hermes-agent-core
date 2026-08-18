@@ -9128,18 +9128,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
-    @staticmethod
-    def _event_authorization_identity(event: MessageEvent) -> tuple[str, ...]:
+    def _event_authorization_identity(self, event: MessageEvent) -> tuple[str, ...]:
         source = event.source
         platform = getattr(source, "platform", None)
+        transport_adapter = self._registered_transport_adapter(source)
         return (
             str(getattr(platform, "value", platform) or ""),
             str(getattr(source, "profile", None) or ""),
             str(getattr(source, "chat_type", None) or ""),
             str(getattr(source, "chat_id", None) or ""),
             str(getattr(source, "user_id", None) or ""),
+            str(getattr(source, "user_name", None) or ""),
+            "1" if getattr(source, "role_authorized", False) is True else "0",
             "1" if getattr(source, "is_bot", False) is True else "0",
             "1" if getattr(source, "delivered_via_upstream_relay", False) is True else "0",
+            str(id(transport_adapter)) if transport_adapter is not None else "",
+            str(self._adapter_profile_for_source(source) or ""),
         )
 
     def _is_event_user_authorized(self, event: MessageEvent) -> bool:
