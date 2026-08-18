@@ -3,7 +3,7 @@ import importlib
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -173,8 +173,10 @@ async def test_queued_deferred_event_revalidates_lease_after_awaits_before_model
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group")
     pending = MessageEvent(
         text="bound confirmation packet",
-        message_type=MessageType.TEXT,
+        message_type=MessageType.VOICE,
         source=source,
+        media_urls=[str(tmp_path / "untrusted-voice.ogg")],
+        media_types=["audio/ogg"],
         message_id="queued-confirmation-1",
     )
     pending._hermes_pre_gateway_prepare_consumed = True
@@ -183,6 +185,9 @@ async def test_queued_deferred_event_revalidates_lease_after_awaits_before_model
         {"status": "expired", "reason": "lease_expired"},
     ])
     pending.pre_gateway_consume_validate = validate
+    runner._is_event_user_authorized = MagicMock(return_value=True)
+    runner._transcribe_and_echo_pending_voice = AsyncMock()
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock()
     adapter._pending_messages["agent:main:telegram:group:-1001"] = pending
 
     result = await runner._run_agent(
@@ -199,6 +204,8 @@ async def test_queued_deferred_event_revalidates_lease_after_awaits_before_model
     assert validate.call_count == 2
     assert pending.pre_gateway_consume_validate is None
     assert pending._hermes_pre_gateway_consume_terminal is True
+    runner._transcribe_and_echo_pending_voice.assert_not_awaited()
+    runner._prepare_profile_scoped_inbound_message_text.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -234,6 +241,7 @@ async def test_rejected_fifo_head_validates_and_consumes_successor_without_new_t
     successor._hermes_pre_gateway_prepare_consumed = True
     successor_validate = MagicMock(return_value={"status": "ok"})
     successor.pre_gateway_consume_validate = successor_validate
+    runner._is_event_user_authorized = MagicMock(return_value=True)
     adapter._pending_messages[session_key] = rejected
     runner._session_state(session_key).conversation.queued_events.append(successor)
 
@@ -338,6 +346,7 @@ def test_consumed_queued_event_preflight_retains_validator_until_final_consume()
     event._hermes_pre_gateway_prepare_consumed = True
     validate = MagicMock(return_value={"status": "ok"})
     event.pre_gateway_consume_validate = validate
+    runner._is_event_user_authorized = MagicMock(return_value=True)
 
     assert runner._revalidate_queued_deferred_event(event) is True
     validate.assert_called_once_with()
@@ -348,6 +357,46 @@ def test_consumed_queued_event_preflight_retains_validator_until_final_consume()
     assert validate.call_count == 2
     assert event.pre_gateway_consume_validate is None
     assert event._hermes_pre_gateway_consume_revalidated is True
+
+
+@pytest.mark.parametrize("mutation", ["replace_source", "mutate_frozen_identity"])
+def test_consumed_queued_event_rejects_authorization_identity_drift(mutation):
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    adapter = object()
+    runner._registered_transport_adapter = MagicMock(return_value=adapter)
+    runner._adapter_profile_for_source = MagicMock(return_value="atlas")
+    runner._is_user_authorized = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="verified packet",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            user_id="operator-1",
+            chat_type="group",
+        ),
+        message_id="queued-confirmation-auth-drift",
+    )
+    event._hermes_pre_gateway_prepare_consumed = True
+    validate = MagicMock(return_value={"status": "ok"})
+    event.pre_gateway_consume_validate = validate
+
+    assert runner._is_event_user_authorized(event) is True
+    if mutation == "replace_source":
+        event.source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1001",
+            user_id="operator-2",
+            chat_type="group",
+        )
+    else:
+        vars(event.source)["chat_id"] = "-2002"
+
+    assert runner._revalidate_queued_deferred_event(event, consume=True) is False
+    validate.assert_not_called()
+    assert event.pre_gateway_consume_validate is None
+    assert event._hermes_pre_gateway_consume_terminal is True
 
 
 @pytest.mark.asyncio

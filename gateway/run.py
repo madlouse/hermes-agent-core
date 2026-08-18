@@ -9299,6 +9299,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False)):
             return True
+        if not self._is_event_user_authorized(event):
+            logger.warning("Queued deferred event authorization identity changed")
+            event._hermes_pre_gateway_consume_terminal = True
+            event.pre_gateway_consume_validate = None
+            return False
         validate = getattr(event, "pre_gateway_consume_validate", None)
         if not callable(validate):
             logger.warning("Queued deferred event is missing its consume validator")
@@ -26333,7 +26338,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # fresh voice messages.
                     _pending_text = pending_event.text or ""
                     _media_urls = getattr(pending_event, "media_urls", None) or []
-                    if self._pending_event_audio_paths(pending_event):
+                    if bool(getattr(pending_event, "_hermes_pre_gateway_prepare_consumed", False)):
+                        pending = self._agent_start_visible_message(pending_event, _pending_text)
+                    elif self._pending_event_audio_paths(pending_event):
                         pending, _ = await self._transcribe_and_echo_pending_voice(
                             pending_event,
                             adapter,
@@ -26546,6 +26553,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
                 if pending_event is not None:
+                    if (
+                        bool(getattr(pending_event, "_hermes_pre_gateway_prepare_consumed", False))
+                        and not bool(getattr(pending_event, "_hermes_pre_gateway_consume_revalidated", False))
+                        and not self._revalidate_queued_deferred_event(
+                            pending_event,
+                            consume=True,
+                        )
+                    ):
+                        return result
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
@@ -26620,16 +26636,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                if (
-                    pending_event is not None
-                    and bool(getattr(pending_event, "_hermes_pre_gateway_prepare_consumed", False))
-                    and not bool(getattr(pending_event, "_hermes_pre_gateway_consume_revalidated", False))
-                    and not self._revalidate_queued_deferred_event(
-                        pending_event,
-                        consume=True,
-                    )
-                ):
-                    return result
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
