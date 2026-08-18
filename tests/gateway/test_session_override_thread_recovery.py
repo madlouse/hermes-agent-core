@@ -18,6 +18,7 @@ import threading
 from unittest.mock import MagicMock
 
 import gateway.run as gateway_run
+import pytest
 from gateway.config import Platform
 from gateway.session import SessionSource, build_session_key
 
@@ -61,3 +62,17 @@ def test_normalize_rewrites_lobby_thread_to_bound_topic():
     assert src.thread_id == ""
 
 
+def test_trusted_topic_recovery_returns_a_new_immutable_authorized_snapshot():
+    source = gateway_run._AuthorizationFrozenSessionSource.capture(
+        _topic_dm_source(thread_id=None)
+    )
+
+    recovered = gateway_run._AuthorizationFrozenSessionSource.with_thread_id(
+        source, "42"
+    )
+
+    assert recovered is not source
+    assert source.thread_id is None
+    assert recovered.thread_id == "42"
+    with pytest.raises(AttributeError, match="immutable"):
+        recovered.thread_id = "43"

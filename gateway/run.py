@@ -2644,6 +2644,21 @@ class _AuthorizationFrozenSessionSource(SessionSource):
         object.__setattr__(snapshot, "_authorization_frozen", True)
         return snapshot
 
+    @classmethod
+    def with_thread_id(
+        cls,
+        source: SessionSource,
+        thread_id: str,
+    ) -> "_AuthorizationFrozenSessionSource":
+        """Return a new immutable snapshot after trusted topic recovery."""
+        snapshot = object.__new__(cls)
+        object.__setattr__(snapshot, "_authorization_frozen", False)
+        for name, value in vars(source).items():
+            object.__setattr__(snapshot, name, value)
+        object.__setattr__(snapshot, "thread_id", thread_id)
+        object.__setattr__(snapshot, "_authorization_frozen", True)
+        return snapshot
+
 
 from gateway.delivery import (
     DeliveryRouter,
@@ -5936,7 +5951,10 @@ class TurnRunner:
                         session_id=agent_session_id,
                     )
                     if _binding and _binding.get("thread_id"):
-                        ctx.source.thread_id = str(_binding["thread_id"])
+                        ctx.source = _AuthorizationFrozenSessionSource.with_thread_id(
+                            ctx.source,
+                            str(_binding["thread_id"]),
+                        )
                         logger.debug(
                             "Restored source.thread_id=%s from binding after session split %s → %s",
                             ctx.source.thread_id,
@@ -17111,6 +17129,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        deferred_confirmation = bool(
+            getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+        )
+        if (
+            deferred_confirmation
+            and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+            and not self._revalidate_queued_deferred_event(event)
+        ):
+            return None
+
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -18310,10 +18338,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
-        deferred_confirmation = bool(
-            getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
-        )
-
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
@@ -18332,12 +18356,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
-            if (
-                deferred_confirmation
-                and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
-                and not self._revalidate_queued_deferred_event(event)
-            ):
-                return None
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
