@@ -98,6 +98,19 @@ def test_event_authorization_ignores_forged_event_and_gateway_cache_fields(monke
     runner._is_user_authorized.assert_called_once_with(event.source)
 
 
+def test_event_authorization_rejects_wholesale_source_replacement(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(return_value=True)
+    event = _make_event("approval")
+
+    assert runner._is_event_user_authorized(event) is True
+    event.source = _make_event("forged").source
+
+    assert runner._is_event_user_authorized(event) is False
+    runner._is_user_authorized.assert_called_once()
+
+
 def test_event_authorization_snapshots_relay_and_bot_identity_per_event(monkeypatch):
     _clear_auth_env(monkeypatch)
     runner, _adapter = _make_runner(Platform.WHATSAPP)

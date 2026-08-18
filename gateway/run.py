@@ -93,7 +93,7 @@ _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 _EVENT_AUTHORIZATION_CACHE_LOCK = threading.RLock()
 _EVENT_AUTHORIZATION_CACHE: weakref.WeakKeyDictionary[
     Any,
-    dict[int, tuple[weakref.ReferenceType[Any], tuple[str, ...], bool]],
+    dict[int, tuple[weakref.ReferenceType[Any], Any, tuple[str, ...], bool]],
 ] = weakref.WeakKeyDictionary()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -9183,7 +9183,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached = runner_cache.get(event_id)
             if cached is not None and cached[0]() is event:
-                return cached[2]
+                if event.source is not cached[1]:
+                    return False
+                return cached[3]
 
             source = event.source
             if source is None:
@@ -9193,7 +9195,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source = source
             identity = self._event_authorization_identity(event)
             authorized = bool(self._is_user_authorized(source))
-            runner_cache[event_id] = (weakref.ref(event), identity, authorized)
+            runner_cache[event_id] = (weakref.ref(event), source, identity, authorized)
             return authorized
 
     def _apply_pre_gateway_dispatch(self, event: MessageEvent) -> tuple[MessageEvent, str]:
