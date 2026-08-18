@@ -5800,11 +5800,19 @@ class BasePlatformAdapter(ABC):
 
             # A hook may durably claim and rewrite this exact event before the
             # runner discovers that its FIFO is unavailable. Preserve that
-            # identity for cold replay instead of merging into an older text
-            # event and losing the dispatched marker. Replacement also keeps
-            # this emergency fallback bounded to the existing head slot.
+            # identity for cold replay only when the adapter head is free.
+            # Replacing an occupied head would strand the earlier durable
+            # claim; an unavailable slot therefore fails closed.
             if bool(getattr(event, "_hermes_busy_fallback_preserve_identity", False)):
-                self._pending_messages[session_key] = event
+                if session_key not in self._pending_messages:
+                    self._pending_messages[session_key] = event
+                else:
+                    logger.error(
+                        "[%s] Refusing claimed busy fallback for %s: "
+                        "pending head already occupied",
+                        self.name,
+                        session_key,
+                    )
                 return
 
             # Special case: photo bursts/albums frequently arrive as multiple near-

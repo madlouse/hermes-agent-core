@@ -341,7 +341,7 @@ async def test_unauthorized_shared_channel_is_dropped_before_hook(monkeypatch):
 @pytest.mark.parametrize(
     "failure_mode", ["missing_adapter", "missing_slot", "enqueue_error"]
 )
-async def test_rewritten_claim_falls_back_through_adapter_with_same_event(
+async def test_rewritten_claim_uses_empty_adapter_fallback_with_same_event(
     monkeypatch, failure_mode
 ):
     adapter = _FallbackAdapter()
@@ -371,20 +371,61 @@ async def test_rewritten_claim_falls_back_through_adapter_with_same_event(
     session_key = build_session_key(event.source)
     adapter._active_sessions[session_key] = asyncio.Event()
     adapter._session_tasks[session_key] = asyncio.current_task()
-    older_pending = _event("older pending event")
-    adapter._pending_messages[session_key] = older_pending
 
     await adapter.handle_message(event)
 
     fallback = adapter._pending_messages[session_key]
     assert fallback is event
-    assert fallback is not older_pending
     assert fallback.text == "bound continuation"
     assert fallback._hermes_pre_gateway_dispatched is True
     replayed, disposition = GatewayRunner._apply_pre_gateway_dispatch(runner, fallback)
     assert replayed is event
     assert disposition == "continue"
     hook.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_claimed_busy_fallback_never_overwrites_earlier_claim():
+    adapter = _FallbackAdapter()
+    adapter.set_message_handler(AsyncMock(return_value=None))
+    adapter.set_busy_session_handler(AsyncMock(return_value=False))
+    session_key = build_session_key(_event().source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._session_tasks[session_key] = asyncio.current_task()
+
+    earlier_claim = _event("first claimed confirmation")
+    earlier_claim.message_id = "om_claimed_first"
+    earlier_claim._hermes_pre_gateway_dispatched = True
+    earlier_claim._hermes_busy_fallback_preserve_identity = True
+    later_claim = _event("second claimed confirmation")
+    later_claim.message_id = "om_claimed_second"
+    later_claim._hermes_pre_gateway_dispatched = True
+    later_claim._hermes_busy_fallback_preserve_identity = True
+
+    await adapter.handle_message(earlier_claim)
+    await adapter.handle_message(later_claim)
+
+    assert adapter._pending_messages[session_key] is earlier_claim
+    assert adapter._pending_messages[session_key].message_id == "om_claimed_first"
+    assert adapter.get_pending_message(session_key) is earlier_claim
+    assert session_key not in adapter._pending_messages
+    adapter._message_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unclaimed_busy_follow_up_keeps_normal_adapter_queue_path():
+    adapter = _FallbackAdapter()
+    adapter.set_message_handler(AsyncMock(return_value=None))
+    adapter.set_busy_session_handler(AsyncMock(return_value=False))
+    event = _event("photo follow-up")
+    event.message_type = MessageType.PHOTO
+    session_key = build_session_key(event.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._session_tasks[session_key] = asyncio.current_task()
+
+    await adapter.handle_message(event)
+
+    assert adapter._pending_messages[session_key] is event
 
 
 @pytest.mark.asyncio
