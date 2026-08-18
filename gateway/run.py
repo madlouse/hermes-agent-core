@@ -90,7 +90,7 @@ _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 # Authorization belongs to Core, not to the event or any hook that receives a
 # Gateway reference. Keep the verdict outside both objects and retain events
 # weakly so long-lived Gateways do not accumulate completed inbound turns.
-_EVENT_AUTHORIZATION_CACHE_LOCK = threading.Lock()
+_EVENT_AUTHORIZATION_CACHE_LOCK = threading.RLock()
 _EVENT_AUTHORIZATION_CACHE: weakref.WeakKeyDictionary[
     Any,
     dict[int, tuple[weakref.ReferenceType[Any], tuple[str, ...], bool]],
@@ -2619,6 +2619,32 @@ from gateway.session import (
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
 )
+
+
+class _AuthorizationFrozenSessionSource(SessionSource):
+    """Immutable per-event source snapshot retained after Core authorization."""
+
+    _authorization_frozen = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "_authorization_frozen", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_authorization_frozen", False):
+            raise AttributeError("authorized event source is immutable")
+        object.__setattr__(self, name, value)
+
+    @classmethod
+    def capture(cls, source: SessionSource) -> "_AuthorizationFrozenSessionSource":
+        snapshot = object.__new__(cls)
+        object.__setattr__(snapshot, "_authorization_frozen", False)
+        for name, value in vars(source).items():
+            object.__setattr__(snapshot, name, value)
+        object.__setattr__(snapshot, "_authorization_frozen", True)
+        return snapshot
+
+
 from gateway.delivery import (
     DeliveryRouter,
     looks_like_telegram_private_chat_id,
@@ -9147,38 +9173,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     def _is_event_user_authorized(self, event: MessageEvent) -> bool:
-        """Evaluate authorization once for one immutable event identity."""
+        """Evaluate authorization once against an immutable ingress snapshot."""
         event_id = id(event)
         with _EVENT_AUTHORIZATION_CACHE_LOCK:
             runner_cache = _EVENT_AUTHORIZATION_CACHE.setdefault(self, {})
-            runner_ref = weakref.ref(self)
+            for stale_id, cached in list(runner_cache.items()):
+                if cached[0]() is None:
+                    runner_cache.pop(stale_id, None)
 
-            def discard_event(event_ref: weakref.ReferenceType[Any]) -> None:
-                runner = runner_ref()
-                if runner is None:
-                    return
-                with _EVENT_AUTHORIZATION_CACHE_LOCK:
-                    live_cache = _EVENT_AUTHORIZATION_CACHE.get(runner)
-                    current = live_cache.get(event_id) if live_cache is not None else None
-                    if current is not None and current[0] is event_ref:
-                        live_cache.pop(event_id, None)
+            cached = runner_cache.get(event_id)
+            if cached is not None and cached[0]() is event:
+                return cached[2]
 
-            for _attempt in range(3):
-                identity = self._event_authorization_identity(event)
-                cached = runner_cache.get(event_id)
-                if cached is not None and cached[0]() is event and cached[1] == identity:
-                    return cached[2]
-
-                authorized = bool(self._is_user_authorized(event.source))
-                if self._event_authorization_identity(event) != identity:
-                    continue
-                runner_cache[event_id] = (
-                    weakref.ref(event, discard_event),
-                    identity,
-                    authorized,
-                )
-                return authorized
-            return False
+            source = event.source
+            if source is None:
+                return False
+            if not isinstance(source, _AuthorizationFrozenSessionSource):
+                source = _AuthorizationFrozenSessionSource.capture(source)
+                event.source = source
+            identity = self._event_authorization_identity(event)
+            authorized = bool(self._is_user_authorized(source))
+            runner_cache[event_id] = (weakref.ref(event), identity, authorized)
+            return authorized
 
     def _apply_pre_gateway_dispatch(self, event: MessageEvent) -> tuple[MessageEvent, str]:
         """Run the same pre_gateway_dispatch hooks used by the cold path.
@@ -9243,7 +9259,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event._hermes_pre_gateway_dispatched = True
         return event, "continue"
 
-    def _revalidate_queued_deferred_event(self, event: MessageEvent) -> bool:
+    def _revalidate_queued_deferred_event(
+        self,
+        event: MessageEvent,
+        *,
+        consume: bool = False,
+    ) -> bool:
         """Revalidate a claimed deferred event immediately before consumption.
 
         Admission-time verification is insufficient for a busy FIFO: the
@@ -9261,9 +9282,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event._hermes_pre_gateway_consume_terminal = True
             return False
 
-        # The queued event is consumed once. Clear the bearer callback before
-        # invoking it so exceptions cannot accidentally leave a reusable seam.
-        event.pre_gateway_consume_validate = None
+        # Preflight may run while selecting a FIFO head, before prior-response
+        # delivery and other awaited cleanup. The final consume repeats the
+        # read-only receipt/lease check immediately before model dispatch and
+        # clears the bearer callback before invoking it.
+        if consume:
+            event.pre_gateway_consume_validate = None
         try:
             result = validate()
         except Exception:
@@ -9275,7 +9299,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             isinstance(result, dict) and result.get("status") == "ok"
         )
         if valid:
-            event._hermes_pre_gateway_consume_revalidated = True
+            if consume:
+                event._hermes_pre_gateway_consume_revalidated = True
             return True
 
         logger.warning(
@@ -9286,6 +9311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(event.source, "chat_id", None) or "unknown",
         )
         event._hermes_pre_gateway_consume_terminal = True
+        event.pre_gateway_consume_validate = None
         return False
 
     @staticmethod
@@ -18290,6 +18316,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         try:
+            if (
+                bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+                and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+                and not self._revalidate_queued_deferred_event(event)
+            ):
+                return None
             # Emit agent:start hook
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -18308,6 +18340,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            if (
+                bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+                and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+                and not self._revalidate_queued_deferred_event(event, consume=True)
+            ):
+                return None
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -26541,6 +26579,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                if (
+                    pending_event is not None
+                    and bool(getattr(pending_event, "_hermes_pre_gateway_prepare_consumed", False))
+                    and not bool(getattr(pending_event, "_hermes_pre_gateway_consume_revalidated", False))
+                    and not self._revalidate_queued_deferred_event(
+                        pending_event,
+                        consume=True,
+                    )
+                ):
+                    return result
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,

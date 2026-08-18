@@ -66,14 +66,18 @@ def test_event_authorization_is_cached_for_one_exact_source_identity(monkeypatch
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     runner._is_user_authorized = MagicMock(side_effect=[True, False])
     event = _make_event("approval")
+    ingress_source = event.source
 
     assert runner._is_event_user_authorized(event) is True
     assert runner._is_event_user_authorized(event) is True
     runner._is_user_authorized.assert_called_once_with(event.source)
 
-    event.source.user_id = "different-user"
-    assert runner._is_event_user_authorized(event) is False
-    assert runner._is_user_authorized.call_count == 2
+    with pytest.raises(AttributeError, match="immutable"):
+        event.source.user_id = "different-user"
+    ingress_source.user_id = "different-user"
+    assert event.source.user_id != ingress_source.user_id
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_user_authorized.call_count == 1
 
 
 def test_event_authorization_ignores_forged_event_and_gateway_cache_fields(monkeypatch):
@@ -94,41 +98,44 @@ def test_event_authorization_ignores_forged_event_and_gateway_cache_fields(monke
     runner._is_user_authorized.assert_called_once_with(event.source)
 
 
-def test_event_authorization_rechecks_relay_and_bot_identity_mutations(monkeypatch):
+def test_event_authorization_snapshots_relay_and_bot_identity_per_event(monkeypatch):
     _clear_auth_env(monkeypatch)
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     runner._is_user_authorized = MagicMock(side_effect=[True, False, True])
-    event = _make_event("approval")
-    event.source.delivered_via_upstream_relay = True
+    relay = _make_event("approval")
+    relay.source.delivered_via_upstream_relay = True
+    ordinary = _make_event("approval")
+    bot = _make_event("approval")
+    bot.source.is_bot = True
 
-    assert runner._is_event_user_authorized(event) is True
-    event.source.delivered_via_upstream_relay = False
-    assert runner._is_event_user_authorized(event) is False
-    event.source.is_bot = True
-    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_event_user_authorized(relay) is True
+    assert runner._is_event_user_authorized(ordinary) is False
+    assert runner._is_event_user_authorized(bot) is True
     assert runner._is_user_authorized.call_count == 3
 
 
-def test_event_authorization_rechecks_role_and_display_identity_mutations(monkeypatch):
+def test_event_authorization_snapshots_role_and_display_identity_per_event(monkeypatch):
     _clear_auth_env(monkeypatch)
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     runner._is_user_authorized = MagicMock(side_effect=[True, False, True])
-    event = _make_event("approval")
-    event.source.role_authorized = True
+    role = _make_event("approval")
+    role.source.role_authorized = True
+    ordinary = _make_event("approval")
+    renamed = _make_event("approval")
+    renamed.source.user_name = "renamed-principal"
 
-    assert runner._is_event_user_authorized(event) is True
-    event.source.role_authorized = False
-    assert runner._is_event_user_authorized(event) is False
-    event.source.user_name = "renamed-principal"
-    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_event_user_authorized(role) is True
+    assert runner._is_event_user_authorized(ordinary) is False
+    assert runner._is_event_user_authorized(renamed) is True
     assert runner._is_user_authorized.call_count == 3
 
 
-def test_event_authorization_concurrent_revocation_never_caches_stale_allow(monkeypatch):
+def test_event_authorization_concurrent_ingress_mutation_cannot_change_snapshot(monkeypatch):
     _clear_auth_env(monkeypatch)
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     event = _make_event("approval")
     event.source.user_id = "allowed"
+    ingress_source = event.source
     authorization_started = threading.Event()
     release_authorization = threading.Event()
     calls = []
@@ -152,15 +159,16 @@ def test_event_authorization_concurrent_revocation_never_caches_stale_allow(monk
     first.start()
     assert authorization_started.wait(timeout=2)
     second.start()
-    event.source.user_id = "revoked"
+    ingress_source.user_id = "revoked"
     release_authorization.set()
     first.join(timeout=2)
     second.join(timeout=2)
 
     assert not first.is_alive() and not second.is_alive()
-    assert results == [False, False]
-    assert calls == ["allowed", "revoked"]
-    assert runner._is_event_user_authorized(event) is False
+    assert results == [True, True]
+    assert calls == ["allowed"]
+    assert event.source.user_id == "allowed"
+    assert runner._is_event_user_authorized(event) is True
 
 
 @pytest.mark.asyncio

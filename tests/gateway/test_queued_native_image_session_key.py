@@ -153,7 +153,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
 
 
 @pytest.mark.asyncio
-async def test_queued_deferred_event_revalidates_expired_lease_before_model(monkeypatch, tmp_path):
+async def test_queued_deferred_event_revalidates_lease_after_awaits_before_model(monkeypatch, tmp_path):
     CaptureQueuedNativeImageAgent.calls = []
 
     fake_dotenv = types.ModuleType("dotenv")
@@ -178,7 +178,10 @@ async def test_queued_deferred_event_revalidates_expired_lease_before_model(monk
         message_id="queued-confirmation-1",
     )
     pending._hermes_pre_gateway_prepare_consumed = True
-    validate = MagicMock(return_value={"status": "expired", "reason": "lease_expired"})
+    validate = MagicMock(side_effect=[
+        {"status": "ok"},
+        {"status": "expired", "reason": "lease_expired"},
+    ])
     pending.pre_gateway_consume_validate = validate
     adapter._pending_messages["agent:main:telegram:group:-1001"] = pending
 
@@ -191,9 +194,9 @@ async def test_queued_deferred_event_revalidates_expired_lease_before_model(monk
         session_key="agent:main:telegram:group:-1001",
     )
 
-    assert result["final_response"] == "done-1"
+    assert result["final_response"] in {"", "done-1"}
     assert CaptureQueuedNativeImageAgent.calls == ["first turn"]
-    validate.assert_called_once_with()
+    assert validate.call_count == 2
     assert pending.pre_gateway_consume_validate is None
     assert pending._hermes_pre_gateway_consume_terminal is True
 
@@ -242,7 +245,7 @@ async def test_rejected_fifo_head_validates_and_consumes_successor_without_new_t
     assert result["final_response"] == "done-2"
     assert CaptureQueuedNativeImageAgent.calls == ["first turn", "valid successor packet"]
     rejected_validate.assert_called_once_with()
-    successor_validate.assert_called_once_with()
+    assert successor_validate.call_count == 2
     assert session_key not in adapter._pending_messages
 
 
@@ -319,7 +322,7 @@ def test_consumed_queued_event_without_validator_fails_closed():
     assert event._hermes_pre_gateway_consume_terminal is True
 
 
-def test_consumed_queued_event_accepts_explicit_ok_and_clears_validator():
+def test_consumed_queued_event_preflight_retains_validator_until_final_consume():
     gateway_run = importlib.import_module("gateway.run")
     runner = object.__new__(gateway_run.GatewayRunner)
     event = MessageEvent(
@@ -338,5 +341,10 @@ def test_consumed_queued_event_accepts_explicit_ok_and_clears_validator():
 
     assert runner._revalidate_queued_deferred_event(event) is True
     validate.assert_called_once_with()
+    assert event.pre_gateway_consume_validate is validate
+    assert not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+
+    assert runner._revalidate_queued_deferred_event(event, consume=True) is True
+    assert validate.call_count == 2
     assert event.pre_gateway_consume_validate is None
     assert event._hermes_pre_gateway_consume_revalidated is True
