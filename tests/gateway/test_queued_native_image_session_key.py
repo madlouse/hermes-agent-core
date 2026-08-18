@@ -380,3 +380,37 @@ async def test_deferred_event_is_rejected_before_session_or_media_preprocessing(
     runner._revalidate_queued_deferred_event.assert_called_once_with(event)
     runner._async_session_store.get_or_create_session.assert_not_called()
     runner._prepare_profile_scoped_inbound_message_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_deferred_packet_log_preview_is_redacted_before_final_consume(monkeypatch):
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._revalidate_queued_deferred_event = MagicMock(return_value=True)
+    runner._recover_telegram_topic_thread_id = MagicMock(
+        side_effect=RuntimeError("stop after preview")
+    )
+    log_info = MagicMock()
+    monkeypatch.setattr(gateway_run.logger, "info", log_info)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        user_id="operator-1",
+    )
+    event = MessageEvent(
+        text="secret bound confirmation packet",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="deferred-log-redaction",
+    )
+    event._hermes_pre_gateway_prepare_consumed = True
+
+    with pytest.raises(RuntimeError, match="stop after preview"):
+        await runner._handle_message_with_agent(
+            event, source, "agent:main:telegram:group:-1001", 1
+        )
+
+    preview = log_info.call_args.args[4]
+    assert preview == "[deferred confirmation pending final validation]"
+    assert "secret bound" not in repr(log_info.call_args)

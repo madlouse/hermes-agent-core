@@ -9201,7 +9201,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             cached = runner_cache.get(event_id)
             if cached is not None and cached[0]() is event:
-                if event.source is not cached[1]:
+                if (
+                    event.source is not cached[1]
+                    or self._event_authorization_identity(event) != cached[2]
+                ):
                     return False
                 return cached[3]
 
@@ -17141,7 +17144,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = self._agent_start_visible_message(
+            event, event.text or ""
+        )[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(

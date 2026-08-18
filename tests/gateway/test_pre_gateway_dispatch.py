@@ -111,6 +111,19 @@ def test_event_authorization_rejects_wholesale_source_replacement(monkeypatch):
     runner._is_user_authorized.assert_called_once()
 
 
+def test_event_authorization_rejects_low_level_frozen_source_mutation(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(return_value=True)
+    event = _make_event("approval")
+
+    assert runner._is_event_user_authorized(event) is True
+    vars(event.source)["user_id"] = "forged-user"
+
+    assert runner._is_event_user_authorized(event) is False
+    runner._is_user_authorized.assert_called_once()
+
+
 def test_agent_start_redacts_deferred_packet_until_final_consume():
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     event = _make_event("secret bound packet")
