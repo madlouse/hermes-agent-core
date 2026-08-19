@@ -6,6 +6,7 @@ dicts: {"action": "skip"|"rewrite"|"allow"}.
 """
 
 from types import SimpleNamespace
+import threading
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -13,6 +14,12 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
+from gateway.session_state import SessionState
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gateway_runtime_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -58,6 +65,180 @@ def _make_runner(platform: Platform):
     runner._running_agents = {}
     runner._update_prompt_pending = {}
     return runner, adapter
+
+
+def test_event_authorization_is_cached_for_one_exact_source_identity(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False])
+    event = _make_event("approval")
+    ingress_source = event.source
+
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_event_user_authorized(event) is True
+    runner._is_user_authorized.assert_called_once_with(event.source)
+
+    with pytest.raises(AttributeError, match="immutable"):
+        event.source.user_id = "different-user"
+    ingress_source.user_id = "different-user"
+    assert event.source.user_id != ingress_source.user_id
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_user_authorized.call_count == 1
+
+
+def test_event_authorization_rechecks_current_policy_at_final_consume(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False])
+    event = _make_event("approval")
+
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._is_event_user_authorized(event, recheck_policy=True) is False
+    assert runner._is_user_authorized.call_count == 2
+
+
+def test_deferred_final_consume_fails_closed_after_authorization_revocation(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False])
+    event = _make_event("approval")
+    event._hermes_pre_gateway_prepare_consumed = True
+    consume_validate = MagicMock(return_value={"status": "ok"})
+    event.pre_gateway_consume_validate = consume_validate
+
+    assert runner._is_event_user_authorized(event) is True
+    assert runner._revalidate_queued_deferred_event(event, consume=True) is False
+    consume_validate.assert_not_called()
+    assert event._hermes_pre_gateway_consume_terminal is True
+
+
+def test_event_authorization_ignores_forged_event_and_gateway_cache_fields(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(return_value=False)
+    event = _make_event("approval")
+    identity = runner._event_authorization_identity(event)
+    runner._event_authorization_token = object()
+    event._hermes_gateway_authorization = (
+        runner._event_authorization_token,
+        identity,
+        True,
+    )
+
+    assert runner._is_event_user_authorized(event) is False
+    assert runner._is_event_user_authorized(event) is False
+    runner._is_user_authorized.assert_called_once_with(event.source)
+
+
+def test_event_authorization_rejects_wholesale_source_replacement(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(return_value=True)
+    event = _make_event("approval")
+
+    assert runner._is_event_user_authorized(event) is True
+    event.source = _make_event("forged").source
+
+    assert runner._is_event_user_authorized(event) is False
+    runner._is_user_authorized.assert_called_once()
+
+
+def test_event_authorization_rejects_low_level_frozen_source_mutation(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(return_value=True)
+    event = _make_event("approval")
+
+    assert runner._is_event_user_authorized(event) is True
+    vars(event.source)["user_id"] = "forged-user"
+
+    assert runner._is_event_user_authorized(event) is False
+    runner._is_user_authorized.assert_called_once()
+
+
+def test_agent_start_redacts_deferred_packet_until_final_consume():
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    event = _make_event("secret bound packet")
+    event._hermes_pre_gateway_prepare_consumed = True
+
+    assert runner._agent_start_visible_message(event, event.text) == (
+        "[deferred confirmation pending final validation]"
+    )
+    event._hermes_pre_gateway_consume_revalidated = True
+    assert runner._agent_start_visible_message(event, event.text) == event.text
+
+
+def test_event_authorization_snapshots_relay_and_bot_identity_per_event(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False, True])
+    relay = _make_event("approval")
+    relay.source.delivered_via_upstream_relay = True
+    ordinary = _make_event("approval")
+    bot = _make_event("approval")
+    bot.source.is_bot = True
+
+    assert runner._is_event_user_authorized(relay) is True
+    assert runner._is_event_user_authorized(ordinary) is False
+    assert runner._is_event_user_authorized(bot) is True
+    assert runner._is_user_authorized.call_count == 3
+
+
+def test_event_authorization_snapshots_role_and_display_identity_per_event(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized = MagicMock(side_effect=[True, False, True])
+    role = _make_event("approval")
+    role.source.role_authorized = True
+    ordinary = _make_event("approval")
+    renamed = _make_event("approval")
+    renamed.source.user_name = "renamed-principal"
+
+    assert runner._is_event_user_authorized(role) is True
+    assert runner._is_event_user_authorized(ordinary) is False
+    assert runner._is_event_user_authorized(renamed) is True
+    assert runner._is_user_authorized.call_count == 3
+
+
+def test_event_authorization_concurrent_ingress_mutation_cannot_change_snapshot(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    event = _make_event("approval")
+    event.source.user_id = "allowed"
+    ingress_source = event.source
+    authorization_started = threading.Event()
+    release_authorization = threading.Event()
+    calls = []
+
+    def authorize(source):
+        observed = source.user_id
+        calls.append(observed)
+        if len(calls) == 1:
+            authorization_started.set()
+            assert release_authorization.wait(timeout=2)
+        return observed == "allowed"
+
+    runner._is_user_authorized = authorize
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(runner._is_event_user_authorized(event))
+    )
+    second = threading.Thread(
+        target=lambda: results.append(runner._is_event_user_authorized(event))
+    )
+    first.start()
+    assert authorization_started.wait(timeout=2)
+    second.start()
+    ingress_source.user_id = "revoked"
+    release_authorization.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert results == [True, True]
+    assert calls == ["allowed"]
+    assert event.source.user_id == "allowed"
+    assert runner._is_event_user_authorized(event) is True
 
 
 @pytest.mark.asyncio
@@ -118,3 +299,173 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cold_deferred_prepare_runs_only_after_authorization(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    order = []
+
+    def prepare():
+        order.append("prepare")
+        return {"status": "ready"}
+
+    def hook(name, **_kwargs):
+        assert name == "pre_gateway_dispatch"
+        order.append("hook")
+        return [{"action": "skip", "reason": "test"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+    denied = _make_event("denied")
+    denied.pre_gateway_prepare = prepare
+
+    assert await runner._handle_message(denied) is None
+    assert order == []
+    adapter.send.assert_awaited()
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    admitted = _make_event("admitted")
+    admitted.pre_gateway_prepare = prepare
+
+    assert await runner._handle_message(admitted) is None
+    assert order == ["prepare", "hook"]
+    assert admitted.pre_gateway_prepare is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook_mode", ["empty", "allow", "exception"])
+async def test_consumed_cold_prepare_requires_explicit_rewrite(monkeypatch, hook_mode):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    dispatch = AsyncMock(return_value="should-not-run")
+    runner._handle_message_with_agent = dispatch
+
+    if hook_mode == "empty":
+        hook = MagicMock(return_value=[])
+    elif hook_mode == "allow":
+        hook = MagicMock(return_value=[{"action": "allow"}])
+    else:
+        hook = MagicMock(side_effect=RuntimeError("hook unavailable"))
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", hook)
+
+    event = _make_event("approval")
+    event.pre_gateway_prepare = lambda: {"status": "ready"}
+
+    assert await runner._handle_message(event) is None
+    assert event._hermes_pre_gateway_prepare_terminal is True
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_promoted_consumed_deferred_event_revalidates_on_cold_reentry(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    dispatch = AsyncMock(return_value="must-not-run")
+    runner._handle_message_with_agent = dispatch
+    validate = MagicMock(return_value={"status": "expired", "reason": "lease_expired"})
+
+    event = _make_event("bound confirmation packet")
+    event._hermes_pre_gateway_prepare_consumed = True
+    event._hermes_pre_gateway_dispatched = True
+    event.pre_gateway_consume_validate = validate
+
+    assert await runner._handle_message(event) is None
+    validate.assert_called_once_with()
+    assert event.pre_gateway_consume_validate is None
+    assert event._hermes_pre_gateway_consume_terminal is True
+    dispatch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cold_deferred_rewrite_bypasses_pending_update_interceptor(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    session_key = "agent:main:whatsapp:dm:15551234567@s.whatsapp.net"
+    state = SessionState()
+    state.persistent.update_prompt_pending = True
+    runner._sessions = {session_key: state}
+    runner._session_key_for_source = MagicMock(return_value=session_key)
+    dispatch = AsyncMock(return_value="agent-dispatched")
+    runner._handle_message_with_agent = dispatch
+
+    event = _make_event("approve the bound frame")
+    validate = MagicMock(return_value={"status": "ok"})
+
+    def prepare():
+        event.pre_gateway_consume_validate = validate
+        return {"status": "ready"}
+
+    event.pre_gateway_prepare = prepare
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        MagicMock(return_value=[{"action": "rewrite", "text": "[bound frame]"}]),
+    )
+    slash_resolve = AsyncMock(return_value="must-not-resolve")
+    monkeypatch.setattr(
+        "tools.slash_confirm.get_pending",
+        MagicMock(return_value={"confirm_id": "confirm-1"}),
+    )
+    monkeypatch.setattr("tools.slash_confirm.resolve", slash_resolve)
+
+    result = await runner._handle_message(event)
+
+    assert result == "agent-dispatched"
+    assert state.persistent.update_prompt_pending is True
+    slash_resolve.assert_not_awaited()
+    dispatch.assert_awaited_once()
+    assert event.text == "[bound frame]"
+
+
+@pytest.mark.asyncio
+async def test_busy_deferred_rewrite_bypasses_pending_clarify_on_cold_reentry(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    adapter._pending_messages = {}
+    session_key = "agent:main:whatsapp:dm:15551234567@s.whatsapp.net"
+    state = SessionState()
+    runner._sessions = {session_key: state}
+    runner._session_key_for_source = MagicMock(return_value=session_key)
+    runner._draining = False
+    runner._queue_or_replace_pending_event = MagicMock(return_value=True)
+    runner._agent_has_active_subagents = MagicMock(return_value=False)
+    runner._session_has_compression_in_flight = AsyncMock(return_value=False)
+    dispatch = AsyncMock(return_value="agent-dispatched")
+    runner._handle_message_with_agent = dispatch
+
+    event = _make_event("approve while busy")
+    validate = MagicMock(return_value={"status": "ok"})
+
+    def prepare():
+        event.pre_gateway_consume_validate = validate
+        return {"status": "ready"}
+
+    event.pre_gateway_prepare = prepare
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        MagicMock(return_value=[{"action": "rewrite", "text": "[bound frame]"}]),
+    )
+    handled = await runner._handle_active_session_busy_message(event, session_key)
+    assert handled is True
+    runner._queue_or_replace_pending_event.assert_called_once()
+
+    pending = SimpleNamespace(clarify_id="clarify-1")
+    resolve = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.clarify_gateway.get_pending_for_session", MagicMock(return_value=pending)
+    )
+    monkeypatch.setattr(
+        "tools.clarify_gateway.resolve_text_response_for_session", resolve
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "agent-dispatched"
+    resolve.assert_not_called()
+    dispatch.assert_awaited_once()
+    assert event.text == "[bound frame]"

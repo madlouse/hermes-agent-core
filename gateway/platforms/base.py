@@ -2146,6 +2146,15 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Optional adapter-owned, one-shot preparation for inbound events whose
+    # durable side effects must happen only after Gateway authorization and,
+    # on a busy session, bounded FIFO admission. Gateway consumes this sync
+    # callback immediately before pre_gateway_dispatch; adapters must not run
+    # it themselves. A non-ready result is terminal and never falls back to
+    # ordinary chat merging. Appended after the pre-existing fields to retain
+    # positional construction compatibility.
+    pre_gateway_prepare: Optional[Callable[[], Any]] = None
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -5797,6 +5806,35 @@ class BasePlatformAdapter(ABC):
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
+
+            # Deferred prepare is a bearer capability for an adapter-owned
+            # side effect such as a durable confirmation claim. If Gateway
+            # could not consume it, fail closed instead of treating the text
+            # as an ordinary follow-up and merging it into another turn.
+            if getattr(event, "pre_gateway_prepare", None) is not None:
+                logger.error(
+                    "[%s] Refusing ordinary busy fallback for deferred pre-gateway event %s",
+                    self.name,
+                    session_key,
+                )
+                return
+
+            # A hook may durably claim and rewrite this exact event before the
+            # runner discovers that its FIFO is unavailable. Preserve that
+            # identity for cold replay only when the adapter head is free.
+            # Replacing an occupied head would strand the earlier durable
+            # claim; an unavailable slot therefore fails closed.
+            if bool(getattr(event, "_hermes_busy_fallback_preserve_identity", False)):
+                if session_key not in self._pending_messages:
+                    self._pending_messages[session_key] = event
+                else:
+                    logger.error(
+                        "[%s] Refusing claimed busy fallback for %s: "
+                        "pending head already occupied",
+                        self.name,
+                        session_key,
+                    )
+                return
 
             # Special case: photo bursts/albums frequently arrive as multiple near-
             # simultaneous messages. Queue them without interrupting the active run,

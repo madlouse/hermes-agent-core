@@ -2276,6 +2276,16 @@ def terminal_tool(
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
+    from tools.cron_write_guard import deny_active_cron_execution
+
+    cron_denial = deny_active_cron_execution("terminal")
+    if cron_denial:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": cron_denial,
+            "status": "blocked",
+        }, ensure_ascii=False)
     try:
         if not isinstance(command, str):
             logger.warning(

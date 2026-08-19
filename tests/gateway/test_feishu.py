@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from typing import Dict
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from gateway.platforms.base import ProcessingOutcome
 
 try:
@@ -22,6 +24,15 @@ try:
     _HAS_LARK_OAPI = True
 except ImportError:
     _HAS_LARK_OAPI = False
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gateway_runtime_status(monkeypatch, tmp_path):
+    from gateway import status as gateway_status
+
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(gateway_status, "_get_process_hermes_home", lambda: hermes_home)
 
 
 class _FakeRequestContent:
@@ -2544,6 +2555,7 @@ class TestProcessingReactions(unittest.TestCase):
         self,
         create_success: bool = True,
         delete_success: bool = True,
+        delete_raises: bool = False,
         next_reaction_id: str = "r1",
     ):
         from gateway.config import PlatformConfig
@@ -2556,6 +2568,7 @@ class TestProcessingReactions(unittest.TestCase):
             next_reaction_id=next_reaction_id,
             create_success=create_success,
             delete_success=delete_success,
+            delete_raises=delete_raises,
         )
 
         def _create(request):
@@ -2573,6 +2586,8 @@ class TestProcessingReactions(unittest.TestCase):
 
         def _delete(request):
             tracker.delete_calls.append(request.reaction_id)
+            if tracker.delete_raises:
+                raise OSError("TLS transport failed")
             return SimpleNamespace(
                 success=lambda: tracker.delete_success,
                 code=0 if tracker.delete_success else 99,
@@ -2652,6 +2667,23 @@ class TestProcessingReactions(unittest.TestCase):
         self.assertEqual(
             adapter._pending_processing_reactions["om_msg"], "r_typing",
         )  # handle retained
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_delete_transport_error_is_best_effort_and_keeps_identity(self):
+        adapter, tracker = self._build_adapter(
+            next_reaction_id="r_typing",
+            delete_raises=True,
+        )
+        event = self._event("om_semantic_confirmation")
+        with self._patch_to_thread():
+            self._run(adapter.on_processing_start(event))
+            self._run(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+
+        self.assertEqual(tracker.delete_calls, ["r_typing"])
+        self.assertEqual(
+            adapter._pending_processing_reactions["om_semantic_confirmation"],
+            "r_typing",
+        )
 
 
     # ------------------------------------------------------------- env toggle

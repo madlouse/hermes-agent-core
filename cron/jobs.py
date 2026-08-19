@@ -403,6 +403,8 @@ _CRON_GOVERNANCE_HOOK_OWNED_FIELDS = frozenset({
     "process_charter_ref",
     "approval_evidence_ref",
     "read_scope_ref",
+    "write_scope_ref",
+    "write_scope",
     "disclosure_policy_ref",
     "risk_tier",
     "implementation_path_evidence_ref",
@@ -520,6 +522,8 @@ _CRON_GOVERNANCE_PATCH_FIELDS = frozenset({
     "process_charter_ref",
     "approval_evidence_ref",
     "read_scope_ref",
+    "write_scope_ref",
+    "write_scope",
     "disclosure_policy_ref",
     "risk_tier",
     "implementation_categories",
@@ -563,6 +567,8 @@ _CRON_GOVERNANCE_SELF_REFERENTIAL_FIELDS = frozenset({
 _CRON_GOVERNANCE_CALLER_BINDING_FIELDS = frozenset({
     "authorized_behavior_ref",
     "implementation_categories",
+    "write_scope_ref",
+    "write_scope",
 })
 
 
@@ -2064,7 +2070,9 @@ class CronRuntimeAdmissionError(PermissionError):
         )
 
 
-def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
+def _apply_cron_runtime_governance(
+    job: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
     """Run mandatory runtime admission before both cron execution paths."""
     required = (
         _cron_creation_governance_expected()
@@ -2081,7 +2089,7 @@ def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
     except Exception as exc:
         if not required:
             logger.warning("pre_cron_job_run discovery failed", exc_info=True)
-            return
+            return None
         decision = {
             "action": "block",
             "reason": "runtime_governance_unavailable",
@@ -2134,7 +2142,7 @@ def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
         )
     allowed = [item for item in decisions if item.get("action") == "allow"]
     if not allowed and not required and callback_count == 0:
-        return
+        return None
     if len(allowed) != 1:
         decision = {
             "action": "block",
@@ -2146,6 +2154,7 @@ def _apply_cron_runtime_governance(job: Dict[str, Any]) -> None:
             decision=decision,
             job=job,
         )
+    return copy.deepcopy(allowed[0])
 
 
 def _dispatch_post_cron_persist_effects(
@@ -4018,6 +4027,22 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def get_persisted_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Return the exact stored Job mapping for governance and execution.
+
+    ``get_job`` intentionally supplies reader defaults for UI and legacy
+    callers. Those defaults are derived data, however, and must not enter the
+    authorization hash seen by ``pre_cron_job_run``. Execution paths use this
+    accessor so the mandatory hook receives the complete persisted mapping
+    field-for-field, including unknown future semantic fields.
+    """
+    jobs = load_jobs()
+    for job in jobs:
+        if job.get("id") == job_id:
+            return copy.deepcopy(job)
+    return None
+
+
 class AmbiguousJobReference(LookupError):
     """Raised when a job name matches more than one job."""
 
@@ -5330,7 +5355,12 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             rj["id"] = rj.pop("job_id", None) or uuid.uuid4().hex[:12]
             needs_save = True
 
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    jobs = [
+        copy.deepcopy(j)
+        if _cron_candidate_requires_governance(j)
+        else _apply_skill_fields(j)
+        for j in raw_jobs
+    ]
     due = []
 
     # Normalize malformed "schedule" records (direct jobs.json edit, old writers,

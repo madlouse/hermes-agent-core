@@ -244,13 +244,29 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
+    job = {"id": "j1", "name": "t", "execution_id": "persisted-forgery"}
+    before = dict(job)
     ran = []
     monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
-    monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
-    monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
+    monkeypatch.setattr(jobs, "get_persisted_job", lambda jid: job)
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda job_id, *, source: {
+            "id": "external-execution",
+            "job_id": job_id,
+            "source": source,
+        },
+    )
+    monkeypatch.setattr(
+        sched,
+        "run_one_job",
+        lambda candidate, **kwargs: ran.append((candidate, kwargs)) or True,
+    )
 
     assert InProcessCronScheduler().fire_due("j1") is True
-    assert ran == ["j1"]
+    assert job == before
+    assert ran[0][0] is job
+    assert ran[0][1]["execution_id"] == "external-execution"
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──
@@ -412,5 +428,3 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
-

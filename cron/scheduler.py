@@ -782,8 +782,12 @@ class _DeferredCronAgentCollector:
             _teardown_cron_agent(agent, self._job_id)
 
 
-def _cron_authorization_values(job: dict) -> dict[str, str]:
-    """Project a persisted job into the in-process authorization context."""
+def _cron_authorization_values(
+    job: dict,
+    *,
+    runtime_admission: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Project job identity plus verified admission into runtime context."""
     categories = job.get("implementation_categories")
     if isinstance(categories, (list, tuple, set)):
         category_items = [
@@ -795,6 +799,18 @@ def _cron_authorization_values(job: dict) -> dict[str, str]:
     else:
         categories_text = str(categories or "")
     join_keys = job.get("join_keys") if isinstance(job.get("join_keys"), dict) else {}
+    admission = runtime_admission if isinstance(runtime_admission, dict) else {}
+    write_scope = admission.get("write_scope")
+    write_scope_text = (
+        json.dumps(
+            write_scope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if isinstance(write_scope, dict)
+        else ""
+    )
     return {
         "HERMES_CRON_JOB_ID": str(job.get("id") or ""),
         "HERMES_CRON_AUTHORIZED_BEHAVIOR_REF": str(
@@ -812,6 +828,8 @@ def _cron_authorization_values(job: dict) -> dict[str, str]:
         "HERMES_CRON_CANDIDATE_HASH": str(
             job.get("candidate_hash") or join_keys.get("candidate_hash") or ""
         ),
+        "HERMES_CRON_WRITE_SCOPE_REF": str(admission.get("write_scope_ref") or ""),
+        "HERMES_CRON_WRITE_SCOPE": write_scope_text,
     }
 
 
@@ -930,6 +948,8 @@ from cron.jobs import (
     cron_creation_profile_identity,
     get_due_jobs,
     get_cron_profile_home,
+    get_persisted_job,
+    _normalize_job_record,
     heartbeat_operational_notice_delivery,
     heartbeat_job_run_outcome,
     heartbeat_run_claim,
@@ -3406,6 +3426,7 @@ def _deliver_result(
                     job.get("action_specs") or job.get("cron_action_specs")
                 ),
                 actionability=job.get("actionability"),
+                legacy_actionable_output=job.get("actionable_output"),
                 gate_mode=job.get("actionable_gate_mode"),
                 decision_route=job.get("decision_route"),
                 result_route=job.get("result_route"),
@@ -5379,7 +5400,7 @@ def _run_job_body(
     from cron.jobs import CronRuntimeAdmissionError, _apply_cron_runtime_governance
 
     try:
-        _apply_cron_runtime_governance(job)
+        runtime_admission = _apply_cron_runtime_governance(job)
     except CronRuntimeAdmissionError as exc:
         return _RunJobResult(
             success=False,
@@ -5390,6 +5411,11 @@ def _run_job_body(
             runtime_admission_decision=exc.decision,
         )
     _run_control.raise_if_expired("runtime governance")
+
+    # Governance must inspect the exact persisted Job. Reader compatibility
+    # defaults (for example absent prompt/skill fields becoming ""/None/[])
+    # are safe only after admission, otherwise they change the semantic hash.
+    job = _normalize_job_record(job)
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -5764,7 +5790,11 @@ def _run_job_body(
     _cron_auth_tokens = []
     try:
         _cron_auth_tokens = set_cron_authorization(
-            _cron_authorization_values(job), lease=_run_control.lease
+            _cron_authorization_values(
+                job,
+                runtime_admission=runtime_admission,
+            ),
+            lease=_run_control.lease,
         )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
@@ -6807,7 +6837,14 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict,
+    *,
+    execution_id: Optional[str] = None,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -6822,17 +6859,60 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
-    execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(job["id"], source="direct")["id"]
+    job_id = str(job["id"])
+    if execution_id is None:
+        execution_id = create_execution(job_id, source="direct")["id"]
+    execution_id = str(execution_id)
+    execution_transition_attempted = False
+    execution_terminalized = False
+    execution_terminal_error = (
+        "Cron execution stopped before a terminal outcome was recorded."
+    )
     run_outcome_claim = None
     dispatch_phase = "not_attempted"
+
+    def _terminalize_execution(
+        *,
+        success: bool,
+        error: Optional[str] = None,
+        delivery_outcome: Optional[str] = None,
+    ):
+        nonlocal execution_terminalized
+        if execution_terminalized:
+            return None
+        record = finish_execution(
+            execution_id,
+            job_id=job_id,
+            success=success,
+            error=error,
+            delivery_outcome=delivery_outcome,
+        )
+        execution_terminalized = True
+        return record
 
     def _renew_run_outcome_owner() -> None:
         if run_outcome_claim is not None:
             _renew_run_outcome_claim_or_raise(job["id"], run_outcome_claim)
 
     try:
+        # Every production caller has already created a claimed attempt. Keep
+        # the authoritative reload under the once-only terminalizer so an I/O
+        # or corruption failure cannot strand that attempt in ``claimed``.
+        execution_transition_attempted = True
+        persisted_job = get_persisted_job(job_id)
+        if persisted_job is not None:
+            job = persisted_job
+
+        # The execution ledger is the attempt authority, not Job data. Claim the
+        # exact execution_id + job_id tuple before any Job, tool, or delivery
+        # side effect. A forged, stale, terminal, or cross-Job ID fails closed.
+        if mark_execution_running(execution_id, job_id=job_id) is None:
+            execution_transition_attempted = False
+            logger.error(
+                "Job '%s': execution attempt is missing, terminal, or belongs to another job",
+                job_id,
+            )
+            return False
         if _set_running_job_state(
             job["id"],
             "preflight",
@@ -6960,12 +7040,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]),
             )
-            finish_execution(
-                execution_id,
+            terminal = _terminalize_execution(
                 success=False,
                 error="Dispatch claim rejected; execution was not started.",
             )
-            return True  # not an error — already handled/removed
+            return terminal is not None  # already handled/removed
         dispatch_phase = "committed"
         if _set_running_job_state(job["id"], "executing"):
             kwargs = (
@@ -6981,8 +7060,6 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             )
             _consume_interrupted_flag(job["id"])
             return False
-
-        mark_execution_running(execution_id)
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -7179,19 +7256,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
-        finish_execution(
-            execution_id,
+        terminal = _terminalize_execution(
             success=success,
             error=error,
             delivery_outcome=delivery_outcome,
         )
-        return True
+        return terminal is not None
 
     except CronRunOutcomeOwnershipLost as ownership_error:
         logger.error("Job '%s': %s; stopping without delivery or terminal write", job["id"], ownership_error)
-        finish_execution(execution_id, success=False, error=str(ownership_error))
+        _terminalize_execution(success=False, error=str(ownership_error))
         return False
     except Exception as e:
+        execution_terminal_error = str(e)
         logger.error("Error processing job %s: %s", job['id'], e)
         if dispatch_phase != "committed":
             if dispatch_phase == "attempting":
@@ -7284,9 +7361,22 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     str(e),
                     **outcome_kwargs,
                 )
-        finish_execution(execution_id, success=False, error=str(e))
+        _terminalize_execution(success=False, error=str(e))
         return False
     finally:
+        if execution_transition_attempted and not execution_terminalized:
+            try:
+                _terminalize_execution(
+                    success=False,
+                    error=execution_terminal_error,
+                )
+            except Exception as terminal_error:
+                logger.error(
+                    "Job '%s': failed to terminalize execution attempt %s: %s",
+                    job_id,
+                    execution_id,
+                    terminal_error,
+                )
         for _deferred_agent in locals().get("_deferred_agents", []):
             _teardown_cron_agent(_deferred_agent, job["id"])
         with _running_lock:
@@ -7414,12 +7504,18 @@ def tick(
                 _max_workers if _max_workers else "unbounded",
             )
 
-        def _process_job(job: dict) -> bool:
+        def _process_job(job: dict, execution_id: str) -> bool:
             """Run one due job end-to-end. Thin wrapper around the shared
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job,
+                execution_id=execution_id,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+            )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
@@ -7460,12 +7556,11 @@ def tick(
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             execution = create_execution(job_id, source="builtin")
-            dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
+            def _run_and_release(j=job, eid=execution["id"], ctx=_ctx):
                 try:
-                    return ctx.run(_process_job, j)
+                    return ctx.run(_process_job, j, eid)
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
@@ -7481,6 +7576,7 @@ def tick(
                     _interrupted_job_ids.discard(job_id)
                 finish_execution(
                     execution["id"],
+                    job_id=job_id,
                     success=False,
                     error=f"Executor dispatch failed: {submit_err}",
                 )

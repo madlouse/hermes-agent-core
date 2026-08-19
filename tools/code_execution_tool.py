@@ -1284,6 +1284,11 @@ def execute_code(
     Returns:
         JSON string with execution results.
     """
+    from tools.cron_write_guard import deny_active_cron_execution
+
+    cron_denial = deny_active_cron_execution("execute_code")
+    if cron_denial:
+        return tool_error(cron_denial)
     if not SANDBOX_AVAILABLE:
         return tool_error(
             "execute_code sandbox is unavailable in this environment. "

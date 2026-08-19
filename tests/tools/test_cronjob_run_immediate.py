@@ -11,9 +11,12 @@ into the calling agent's activity tracker — otherwise the gateway inactivity
 watchdog kills the parent turn at ~1800s.
 """
 import json
+import copy
 import threading
 import time
 from unittest.mock import patch
+
+import pytest
 
 from tools.cronjob_tools import cronjob, _execute_job_now
 from tools.environments.base import set_activity_callback
@@ -21,6 +24,22 @@ from tools.environments.base import set_activity_callback
 
 _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
         "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
+
+
+@pytest.fixture(autouse=True)
+def _manual_execution_attempt(monkeypatch):
+    monkeypatch.setattr(
+        "tools.cronjob_tools.get_persisted_job",
+        lambda _job_id: dict(_JOB),
+    )
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda job_id, *, source: {
+            "id": f"manual-exec-{job_id}",
+            "job_id": job_id,
+            "source": source,
+        },
+    )
 
 
 class TestCronjobRunExecutesImmediately:
@@ -37,7 +56,10 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
         m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
-        m_run.assert_called_once_with(ran)                # fire the claimed snapshot
+        m_run.assert_called_once_with(
+            _JOB,
+            execution_id="manual-exec-job-run-1",
+        )
 
 
     def test_execute_job_now_bails_without_claim(self):
@@ -48,6 +70,35 @@ class TestCronjobRunExecutesImmediately:
         assert res["claimed"] is False
         assert res["success"] is False
         m_run.assert_not_called()
+
+    def test_manual_run_passes_job_unchanged_and_execution_out_of_band(self):
+        claimed_job = dict(_JOB, execution_id="persisted-forgery")
+        before = copy.deepcopy(claimed_job)
+        attempts = []
+        calls = []
+
+        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("tools.cronjob_tools.get_persisted_job", return_value=claimed_job), \
+             patch("tools.cronjob_tools.get_job", return_value=claimed_job), \
+             patch(
+                 "cron.executions.create_execution",
+                 side_effect=lambda job_id, *, source: attempts.append(
+                     (job_id, source)
+                 ) or {"id": "manual-execution"},
+             ), \
+             patch(
+                 "cron.scheduler.run_one_job",
+                 side_effect=lambda job, **kwargs: calls.append(
+                     (job, kwargs)
+                 ) or True,
+             ):
+            result = _execute_job_now(claimed_job)
+
+        assert result["success"] is False  # no persisted last_status was synthesized
+        assert claimed_job == before
+        assert attempts == [("job-run-1", "manual")]
+        assert calls[0][0] is claimed_job
+        assert calls[0][1]["execution_id"] == "manual-execution"
 
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""
@@ -74,7 +125,7 @@ class TestCronjobRunExecutesImmediately:
 
         set_activity_callback(record)
         try:
-            def slow_run(job):
+            def slow_run(job, **_kwargs):
                 # Deterministic: block until at least one heartbeat has fired
                 # (bounded so a broken heartbeat can't hang the test).
                 assert heartbeat_seen.wait(timeout=5.0), "no heartbeat within 5s"
@@ -123,7 +174,7 @@ class TestCronjobRunExecutesImmediately:
 
         set_activity_callback(record)
         try:
-            def slow_run(job):
+            def slow_run(job, **_kwargs):
                 # Ceiling=0 → the very first wake stops the loop without
                 # touching. Give it a couple of cycles to prove silence.
                 time.sleep(0.2)
@@ -156,7 +207,7 @@ class TestCronjobRunExecutesImmediately:
 
         set_activity_callback(flaky)
         try:
-            def slow_run(job):
+            def slow_run(job, **_kwargs):
                 # Block until a heartbeat AFTER the raising one has fired.
                 assert second_beat.wait(timeout=5.0), \
                     "heartbeat stopped after one callback exception"

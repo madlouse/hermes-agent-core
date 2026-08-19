@@ -43,6 +43,7 @@ from cron.jobs import (
     claim_job_for_fire,
     create_job,
     get_job,
+    get_persisted_job,
     list_jobs,
     mark_job_run,
     parse_schedule,
@@ -608,6 +609,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     job_id = job["id"]
     try:
+        from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
@@ -625,13 +627,15 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
                 reason = "Job is already being fired by the scheduler; not run again."
             return {"claimed": False, "success": False, "error": reason}
 
-        claimed_job = get_job(job_id)
+        claimed_job = get_persisted_job(job_id)
         if claimed_job is None:
             return {
                 "claimed": True,
                 "success": False,
                 "error": "Job disappeared after its manual fire claim was committed.",
             }
+
+        execution = create_execution(job_id, source="manual")
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -694,7 +698,10 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
             _heartbeat_thread.start()
 
         try:
-            processed = run_one_job(claimed_job)
+            processed = run_one_job(
+                claimed_job,
+                execution_id=execution["id"],
+            )
         finally:
             _heartbeat_stop.set()
             if _heartbeat_thread is not None:

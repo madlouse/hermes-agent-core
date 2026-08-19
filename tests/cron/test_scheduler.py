@@ -1,6 +1,7 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
 import asyncio
+import copy
 import contextlib
 import itertools
 import json
@@ -677,6 +678,80 @@ class TestDeliverResultWrapping:
 
         assert "required_output_screening_hook_missing" in result
         send_mock.assert_not_awaited()
+
+    def test_delivery_preserves_legacy_report_only_metadata_for_boundary(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=False,
+            decision="deny",
+            reason="captured",
+            raw={"decision": "deny"},
+        )
+        before_send = MagicMock(return_value=boundary_decision)
+        send_mock = AsyncMock(return_value={"success": True})
+        report_only = {"mode": "not_actionable", "requires_user_reply": False}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", before_send), \
+             patch("tools.send_message_tool._send_to_platform", new=send_mock):
+            result = _deliver_result(
+                {
+                    "id": "report-only-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                    "actionable_output": report_only,
+                },
+                "请确认今日学习总结已处理完成，无需回复。",
+            )
+
+        context = before_send.call_args.args[1]
+        assert context["legacy_actionable_output"] == report_only
+        assert "actionability" not in context
+        assert context["looks_actionable"] is False
+        assert "captured" in result
+        send_mock.assert_not_awaited()
+
+    def test_delivery_keeps_explicit_actionability_separate_from_legacy_report_only(
+        self,
+    ):
+        from gateway.config import Platform
+
+        pconfig = MagicMock(enabled=True)
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        boundary_decision = MagicMock(
+            transmit=False,
+            decision="deny",
+            reason="captured",
+            raw={"decision": "deny"},
+        )
+        before_send = MagicMock(return_value=boundary_decision)
+        explicit = {"requires_user_reply": True, "intent": "confirmation"}
+        report_only = {"mode": "not_actionable", "requires_user_reply": False}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.outbound_boundary.outbound_before_send_sync", before_send):
+            _deliver_result(
+                {
+                    "id": "explicit-actionable-job",
+                    "deliver": "origin",
+                    "origin": {"platform": "telegram", "chat_id": "123"},
+                    "actionability": explicit,
+                    "actionable_output": report_only,
+                },
+                "please confirm",
+            )
+
+        context = before_send.call_args.args[1]
+        assert context["actionability"] == explicit
+        assert context["legacy_actionable_output"] == report_only
+        assert context["looks_actionable"] is True
 
     def test_boundary_rewrite_rebuilds_text_media_and_mirror(self):
         from gateway.config import Platform
@@ -1605,6 +1680,8 @@ class TestRunJobSessionPersistence:
             "HERMES_CRON_IMPLEMENTATION_PATH_EVIDENCE_REF": "evidence.impl.bound-job",
             "HERMES_CRON_OBSERVED_SCOPE_EVIDENCE_REF": "evidence.scope.bound-job",
             "HERMES_CRON_CANDIDATE_HASH": "sha256:bound-job",
+            "HERMES_CRON_WRITE_SCOPE_REF": "",
+            "HERMES_CRON_WRITE_SCOPE": "",
         }
         assert seen["failed-job"]["context"] == {
             "HERMES_CRON_JOB_ID": "failed-job",
@@ -4163,6 +4240,41 @@ def test_run_job_routes_no_agent_script_through_optional_snapshot():
         assert kwargs["workdir"] is None
         assert kwargs["script_snapshot"] == b"claimed"
         assert isinstance(kwargs["run_control"], scheduler._CronRunControl)
+
+
+@pytest.mark.parametrize(
+    "semantic_fields",
+    [
+        {},
+        {
+            "prompt": "changed prompt",
+            "skill": "changed-skill",
+            "skills": ["changed-skill"],
+            "future_semantic_field": {"mode": "strict"},
+        },
+    ],
+)
+def test_runtime_governance_sees_job_before_reader_normalization(semantic_fields):
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "governance-before-normalization",
+        "name": "Governed",
+        "no_agent": True,
+        "script": "task.py",
+        **semantic_fields,
+    }
+    seen = []
+
+    def governance(candidate):
+        seen.append(copy.deepcopy(candidate))
+        return None
+
+    with patch("cron.jobs._apply_cron_runtime_governance", side_effect=governance), \
+         patch("cron.scheduler._run_job_script", return_value=(True, "payload")):
+        assert scheduler.run_job(job)[0] is True
+
+    assert seen == [job]
 
 
 def test_run_one_job_passes_claimed_script_snapshot_to_executor():

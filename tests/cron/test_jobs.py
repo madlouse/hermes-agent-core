@@ -27,6 +27,7 @@ from cron.jobs import (
     load_jobs,
     save_jobs,
     get_job,
+    get_persisted_job,
     heartbeat_job_run_outcome,
     list_jobs,
     update_job,
@@ -59,6 +60,46 @@ def _signed_job_revision(job_id="job.receipt", profile_id="default"):
             "job_semantic_hash": "sha256:" + "3" * 64,
         },
     }
+
+
+def test_persisted_job_reader_does_not_add_compatibility_defaults(tmp_cron_dir):
+    stored = _signed_job_revision("signed-exact")
+    stored.update({
+        "name": "Signed exact",
+        "schedule": {"kind": "cron", "expr": "0 9 * * *"},
+        "enabled": True,
+    })
+    save_jobs([stored])
+
+    assert get_persisted_job("signed-exact") == stored
+    assert "prompt" not in get_persisted_job("signed-exact")
+    assert "skills" not in get_persisted_job("signed-exact")
+    assert get_job("signed-exact")["prompt"] == ""
+    assert get_job("signed-exact")["skills"] == []
+
+
+def test_governed_due_job_keeps_exact_persisted_semantic_shape(
+    tmp_cron_dir, monkeypatch
+):
+    now = datetime(2026, 8, 17, 9, 0, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+    stored = _signed_job_revision("signed-due")
+    stored.update({
+        "name": "Signed due",
+        "schedule": {
+            "kind": "once",
+            "run_at": "2026-08-17T09:00:00+00:00",
+        },
+        "next_run_at": "2026-08-17T09:00:00+00:00",
+        "enabled": True,
+        "state": "scheduled",
+    })
+    save_jobs([stored])
+
+    due = get_due_jobs()
+    assert due == load_jobs()
+    assert "prompt" not in due[0]
+    assert "skills" not in due[0]
 
 
 # =========================================================================

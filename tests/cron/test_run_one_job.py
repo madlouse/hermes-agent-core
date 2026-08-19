@@ -11,6 +11,7 @@ the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
 import cron.scheduler as s
+import copy
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
@@ -66,6 +67,81 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_direct_run_creates_attempt_out_of_band_and_preserves_job(monkeypatch):
+    calls = _patch_pipeline(monkeypatch)
+    job = {"id": "direct-job", "name": "direct", "execution_id": "forged"}
+    before = copy.deepcopy(job)
+    attempts = []
+    ledger = []
+    monkeypatch.setattr(s, "get_persisted_job", lambda _job_id: None)
+    monkeypatch.setattr(
+        s,
+        "create_execution",
+        lambda job_id, *, source: attempts.append((job_id, source))
+        or {"id": "direct-execution"},
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_execution_running",
+        lambda execution_id, *, job_id: ledger.append(
+            ("running", execution_id, job_id)
+        ) or {"id": execution_id, "job_id": job_id},
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda execution_id, **kwargs: ledger.append(
+            ("terminal", execution_id, kwargs)
+        ) or {"id": execution_id, "status": "completed"},
+    )
+
+    assert s.run_one_job(job) is True
+    assert job == before
+    assert attempts == [("direct-job", "direct")]
+    assert ledger[0] == ("running", "direct-execution", "direct-job")
+    assert ledger[-1][0:2] == ("terminal", "direct-execution")
+    assert [item[0] for item in calls] == ["run_job", "save", "deliver", "mark"]
+
+
+def test_direct_run_reloads_authoritative_persisted_job(monkeypatch):
+    stored = {
+        "id": "direct-stored",
+        "name": "Stored",
+        "authorized_behavior_ref": "behavior.direct",
+        "future_semantic_field": {"mode": "strict"},
+    }
+    caller_view = {
+        **stored,
+        "prompt": "",
+        "skill": None,
+        "skills": [],
+    }
+    seen = []
+    monkeypatch.setattr(s, "get_persisted_job", lambda _job_id: copy.deepcopy(stored))
+    monkeypatch.setattr(
+        s,
+        "mark_execution_running",
+        lambda execution_id, *, job_id: {"id": execution_id, "job_id": job_id},
+    )
+    monkeypatch.setattr(s, "finish_execution", lambda execution_id, **kwargs: {"id": execution_id})
+    monkeypatch.setattr(s, "_set_running_job_state", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(s, "begin_job_run_outcome", lambda _job: None)
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        s,
+        "_run_job_result",
+        lambda job, **_kwargs: seen.append(copy.deepcopy(job))
+        or s._RunJobResult(True, "out", "final", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/direct-stored.md")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *_args, **_kwargs: None)
+
+    assert s.run_one_job(caller_view, execution_id="direct-attempt") is True
+    assert seen == [stored]
+    assert caller_view["prompt"] == ""
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
@@ -107,5 +183,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
-

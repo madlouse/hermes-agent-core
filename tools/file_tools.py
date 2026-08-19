@@ -398,6 +398,25 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     return resolved.resolve()
 
 
+def _path_for_cron_write_guard(filepath: str, task_id: str = "default") -> str:
+    """Return an absolute target without dereferencing target path components."""
+    container_paths = _uses_container_paths(task_id)
+    expanded = _expand_tilde(filepath)
+    if container_paths:
+        if posixpath.isabs(expanded):
+            return posixpath.normpath(expanded)
+        base = str(_resolve_base_dir(task_id, container_paths=True))
+        return posixpath.normpath(posixpath.join(base, expanded))
+
+    from tools.environments.local import _msys_to_windows_path
+
+    expanded = _msys_to_windows_path(expanded)
+    path = Path(expanded)
+    if not path.is_absolute():
+        path = Path(_resolve_base_dir(task_id, container_paths=False)) / path
+    return os.path.abspath(os.path.normpath(str(path)))
+
+
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
     """Warn when a relative path resolved OUTSIDE the task's workspace root.
 
@@ -1811,6 +1830,21 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "file contents before writing."
         )
     try:
+        from gateway.session_context import get_cron_runtime_context
+        from tools.cron_write_guard import write_active_cron_file
+
+        if get_cron_runtime_context() is not None:
+            if _terminal_env_type_for_task(task_id) != "local":
+                return tool_error("Cron write denied: remote file backends are unavailable")
+            cron_target = _path_for_cron_write_guard(path, task_id)
+            result_dict = write_active_cron_file(cron_target, content, raw_path=path)
+            if result_dict is None:
+                return tool_error("Cron write denied: runtime authorization unavailable")
+            _mark_verification_stale(task_id, [cron_target], session_id=session_id)
+            return json.dumps(result_dict, ensure_ascii=False)
+    except Exception as exc:
+        return tool_error(str(exc))
+    try:
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
         # check below still runs.
@@ -1843,7 +1877,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(_resolved, content)
+            result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
@@ -1879,6 +1913,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     targets under another profile's skills/plugins/cron/memories
     directory. Same shape as ``write_file``'s flag.
     """
+    from gateway.session_context import get_cron_runtime_context
+
+    if get_cron_runtime_context() is not None:
+        return tool_error("Cron write denied: patch has no atomic local sink; use write_file")
     # Check sensitive paths for both replace (explicit path) and V4A patch (extract paths)
     _paths_to_check = []
     if path:
@@ -1886,38 +1924,22 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     if mode == "patch" and patch:
         import re as _re
         from tools.path_security import has_traversal_component
+
         def _reject_v4a_traversal(v4a_path: str) -> str | None:
-            # V4A path headers come from patch CONTENT, not the explicit
-            # ``path=`` arg — so they're more attacker-influenceable (skill
-            # content, web extract, prompt injection). Reject ``..`` traversal
-            # in V4A headers: a legitimate multi-file patch from a single cwd
-            # can always emit absolute paths or paths relative to the agent's
-            # cwd without ``..``. The explicit ``path=`` arg is unchanged
-            # because the agent uses relative ``..`` paths legitimately
-            # (e.g. ``patch path="../other_module/x.py"`` from a worktree).
             if has_traversal_component(v4a_path):
                 return tool_error(
                     f"V4A patch header contains '..' traversal: {v4a_path!r}. "
                     "Use the agent's cwd-relative path (no '..') or an absolute "
-                    "path in '*** Update File:' / '*** Add File:' / "
-                    "'*** Delete File:' / '*** Move File:' headers."
+                    "path in a V4A file header."
                 )
             return None
 
-        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser leniency:
-        # it accepts ``***Update File:`` with no space after the asterisks
-        # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
-        # here let a no-space header parse + apply while skipping this check.
         for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             v4a_path = _m.group(1).strip()
             _err = _reject_v4a_traversal(v4a_path)
             if _err:
                 return _err
             _paths_to_check.append(v4a_path)
-        # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
-        # but was never extracted, so a Move targeting /etc/crontab skipped the
-        # sensitive-path pre-check. Check BOTH endpoints, and run them through
-        # the same ``..`` traversal rejection as the other headers.
         for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
             for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
                 _err = _reject_v4a_traversal(v4a_path)
@@ -1982,24 +2004,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
-                # Pass the resolved ABSOLUTE path to the shell layer so it
-                # operates on the exact file the tool layer resolved — the
-                # shell's own cwd may differ (worktree-cwd bug), and a relative
-                # path would let the two layers disagree about which file is
-                # being edited.
-                _replace_target = _path_to_resolved.get(path) or path
+                # Preserve the public non-Cron backend contract. Active Cron
+                # writes have already returned through the atomic local sink.
+                _replace_target = path
                 result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                # Rewrite V4A headers to the resolved absolute paths so the
-                # shell layer patches the exact files the tool layer resolved
-                # (locked/reported). Without this a relative header re-resolves
-                # against the shell's cwd, which can differ from the workspace
-                # (git-worktree cwd bug) — landing the edit elsewhere.
-                patch_for_ops = _rewrite_v4a_patch_paths_for_host(
-                    patch, _path_to_resolved, file_ops
-                )
+                # Preserve the public non-Cron backend contract. Active Cron
+                # patches fail closed above because no atomic patch sink exists.
+                patch_for_ops = patch
                 result = file_ops.patch_v4a(patch_for_ops)
             else:
                 return tool_error(f"Unknown mode: {mode}")

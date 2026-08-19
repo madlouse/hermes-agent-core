@@ -42,6 +42,7 @@ import signal
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -85,6 +86,16 @@ _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
+
+# Authorization belongs to Core, not to the event or any hook that receives a
+# Gateway reference. Keep the verdict outside both objects and retain events
+# weakly so long-lived Gateways do not accumulate completed inbound turns.
+_EVENT_AUTHORIZATION_CACHE_LOCK = threading.RLock()
+_EVENT_AUTHORIZATION_CACHE: weakref.WeakKeyDictionary[
+    Any,
+    dict[int, tuple[weakref.ReferenceType[Any], Any, tuple[str, ...], bool]],
+] = weakref.WeakKeyDictionary()
+_PROTECTED_DEFERRED_REWRITE_TOKEN = object()
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -2609,6 +2620,47 @@ from gateway.session import (
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
 )
+
+
+class _AuthorizationFrozenSessionSource(SessionSource):
+    """Immutable per-event source snapshot retained after Core authorization."""
+
+    _authorization_frozen = False
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, "_authorization_frozen", True)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_authorization_frozen", False):
+            raise AttributeError("authorized event source is immutable")
+        object.__setattr__(self, name, value)
+
+    @classmethod
+    def capture(cls, source: SessionSource) -> "_AuthorizationFrozenSessionSource":
+        snapshot = object.__new__(cls)
+        object.__setattr__(snapshot, "_authorization_frozen", False)
+        for name, value in vars(source).items():
+            object.__setattr__(snapshot, name, value)
+        object.__setattr__(snapshot, "_authorization_frozen", True)
+        return snapshot
+
+    @classmethod
+    def with_thread_id(
+        cls,
+        source: SessionSource,
+        thread_id: str,
+    ) -> "_AuthorizationFrozenSessionSource":
+        """Return a new immutable snapshot after trusted topic recovery."""
+        snapshot = object.__new__(cls)
+        object.__setattr__(snapshot, "_authorization_frozen", False)
+        for name, value in vars(source).items():
+            object.__setattr__(snapshot, name, value)
+        object.__setattr__(snapshot, "thread_id", thread_id)
+        object.__setattr__(snapshot, "_authorization_frozen", True)
+        return snapshot
+
+
 from gateway.delivery import (
     DeliveryRouter,
     looks_like_telegram_private_chat_id,
@@ -5900,7 +5952,10 @@ class TurnRunner:
                         session_id=agent_session_id,
                     )
                     if _binding and _binding.get("thread_id"):
-                        ctx.source.thread_id = str(_binding["thread_id"])
+                        ctx.source = _AuthorizationFrozenSessionSource.with_thread_id(
+                            ctx.source,
+                            str(_binding["thread_id"]),
+                        )
                         logger.debug(
                             "Restored source.thread_id=%s from binding after session split %s → %s",
                             ctx.source.thread_id,
@@ -8046,19 +8101,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # it up.  Clearing happens on /new and /reset via
     # _handle_reset_command.
 
-    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
+    def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> bool:
         """Append a /queue event to the FIFO chain for a session."""
         if adapter is None:
-            return
+            return False
         pending_slot = getattr(adapter, "_pending_messages", None)
-        if pending_slot is None:
-            return
+        if not isinstance(pending_slot, dict):
+            return False
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(
                 queued_event
             )
         else:
             pending_slot[session_key] = queued_event
+        return True
 
     def _promote_queued_event(
         self,
@@ -9020,11 +9076,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # follow-ups is far beyond any realistic conversational backlog while
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
+    _BUSY_QUEUE_EMERGENCY_MAX_PENDING = _BUSY_QUEUE_MAX_PENDING + 1
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        *,
+        emergency: bool = False,
+    ) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -9034,31 +9097,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
-        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        if existing is not None and (
-            getattr(existing, "message_type", None) == MessageType.PHOTO
-            or event.message_type == MessageType.PHOTO
-            or bool(getattr(existing, "media_urls", None))
-            or bool(getattr(event, "media_urls", None))
+        if not isinstance(pending_slot, dict):
+            return False
+        existing = pending_slot.get(session_key)
+        if (
+            existing is not None
+            and not bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+            and (
+                getattr(existing, "message_type", None) == MessageType.PHOTO
+                or event.message_type == MessageType.PHOTO
+                or bool(getattr(existing, "media_urls", None))
+                or bool(getattr(event, "media_urls", None))
+            )
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
             merge_pending_message_event(
-                adapter._pending_messages,
+                pending_slot,
                 session_key,
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+        queue_limit = (
+            self._BUSY_QUEUE_EMERGENCY_MAX_PENDING
+            if emergency
+            else self._BUSY_QUEUE_MAX_PENDING
+        )
+        queue_depth = self._queue_depth(session_key, adapter=adapter)
+        if queue_depth >= queue_limit:
             logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                "Refusing busy-mode follow-up for session %s — pending queue at %s cap (%d).",
                 session_key,
-                self._BUSY_QUEUE_MAX_PENDING,
+                "emergency" if emergency else "ordinary",
+                queue_limit,
             )
-            return
+            return False
 
-        self._enqueue_fifo(session_key, event, adapter)
+        return self._enqueue_fifo(session_key, event, adapter)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -9097,6 +9173,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    def _event_authorization_identity(self, event: MessageEvent) -> tuple[str, ...]:
+        source = event.source
+        platform = getattr(source, "platform", None)
+        transport_adapter = self._registered_transport_adapter(source)
+        return (
+            str(getattr(platform, "value", platform) or ""),
+            str(getattr(source, "profile", None) or ""),
+            str(getattr(source, "chat_type", None) or ""),
+            str(getattr(source, "chat_id", None) or ""),
+            str(getattr(source, "user_id", None) or ""),
+            str(getattr(source, "user_name", None) or ""),
+            "1" if getattr(source, "role_authorized", False) is True else "0",
+            "1" if getattr(source, "is_bot", False) is True else "0",
+            "1" if getattr(source, "delivered_via_upstream_relay", False) is True else "0",
+            str(id(transport_adapter)) if transport_adapter is not None else "",
+            str(self._adapter_profile_for_source(source) or ""),
+        )
+
+    def _is_event_user_authorized(
+        self,
+        event: MessageEvent,
+        *,
+        recheck_policy: bool = False,
+    ) -> bool:
+        """Evaluate one immutable ingress identity against current policy."""
+        event_id = id(event)
+        with _EVENT_AUTHORIZATION_CACHE_LOCK:
+            runner_cache = _EVENT_AUTHORIZATION_CACHE.setdefault(self, {})
+            for stale_id, cached in list(runner_cache.items()):
+                if cached[0]() is None:
+                    runner_cache.pop(stale_id, None)
+
+            cached = runner_cache.get(event_id)
+            if cached is not None and cached[0]() is event:
+                if (
+                    event.source is not cached[1]
+                    or self._event_authorization_identity(event) != cached[2]
+                ):
+                    return False
+                if recheck_policy:
+                    return bool(self._is_user_authorized(cached[1]))
+                return cached[3]
+
+            source = event.source
+            if source is None:
+                return False
+            if not isinstance(source, _AuthorizationFrozenSessionSource):
+                source = _AuthorizationFrozenSessionSource.capture(source)
+                event.source = source
+            identity = self._event_authorization_identity(event)
+            authorized = bool(self._is_user_authorized(source))
+            runner_cache[event_id] = (weakref.ref(event), source, identity, authorized)
+            return authorized
+
     def _apply_pre_gateway_dispatch(self, event: MessageEvent) -> tuple[MessageEvent, str]:
         """Run the same pre_gateway_dispatch hooks used by the cold path.
 
@@ -9110,9 +9240,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns ``(event, disposition)`` where disposition is:
         - ``skip``  -> busy path must stop (plugin deny already final)
         - ``queue`` -> confirmation rewrite; force next-turn queue, no steer
+        - ``retry`` -> hook failed; queue the unmarked event for a cold retry
         - ``continue`` -> ordinary busy handling with possibly rewritten text
         """
         if bool(getattr(event, "internal", False)):
+            return event, "continue"
+        if bool(getattr(event, "_hermes_pre_gateway_dispatched", False)):
             return event, "continue"
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
@@ -9124,7 +9257,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception as hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", hook_exc)
-            return event, "continue"
+            return event, "retry"
 
         source = event.source
         for result in hook_results or []:
@@ -9132,6 +9265,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             action = result.get("action")
             if action == "skip":
+                event._hermes_pre_gateway_dispatched = True
                 logger.info(
                     "pre_gateway_dispatch skip on busy path: reason=%s platform=%s chat=%s",
                     result.get("reason"),
@@ -9142,30 +9276,137 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if action == "rewrite":
                 new_text = result.get("text")
                 if isinstance(new_text, str):
-                    event = dataclasses.replace(event, text=new_text)
+                    # Preserve the adapter-owned event identity. If internal
+                    # FIFO admission fails, BasePlatformAdapter falls back to
+                    # this same object and must replay the claimed rewrite
+                    # without invoking the hook a second time.
+                    event.text = new_text
+                event._hermes_pre_gateway_dispatched = True
                 # Bound confirmation packets must become the next turn, not a
                 # mid-run steer/redirect into the unrelated busy conversation.
                 return event, "queue"
             if action == "allow":
                 break
+        event._hermes_pre_gateway_dispatched = True
         return event, "continue"
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
-        # Confirmation/runtime intake must see busy-path user follow-ups before
-        # steer/redirect consumes them. Same hook contract as the cold path.
-        event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
-        if pre_gateway_disposition == "skip":
+    def _revalidate_queued_deferred_event(
+        self,
+        event: MessageEvent,
+        *,
+        consume: bool = False,
+    ) -> bool:
+        """Revalidate a claimed deferred event immediately before consumption.
+
+        Admission-time verification is insufficient for a busy FIFO: the
+        durable execution lease can expire while another turn is running. The
+        adapter-owned callback therefore gets one synchronous, no-await consume
+        phase in which it must re-read the exact receipt/owner/state/lease. Any
+        other outcome drops the queued event before its text, prompt, or media
+        can reach the model.
+        """
+        if not bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False)):
             return True
-        if pre_gateway_disposition == "queue":
-            self._queue_or_replace_pending_event(session_key, event)
+        if not self._is_event_user_authorized(event, recheck_policy=True):
+            logger.warning("Queued deferred event authorization identity changed")
+            event._hermes_pre_gateway_consume_terminal = True
+            event.pre_gateway_consume_validate = None
+            return False
+        validate = getattr(event, "pre_gateway_consume_validate", None)
+        if not callable(validate):
+            logger.warning("Queued deferred event is missing its consume validator")
+            event._hermes_pre_gateway_consume_terminal = True
+            return False
+
+        # Preflight may run while selecting a FIFO head, before prior-response
+        # delivery and other awaited cleanup. The final consume repeats the
+        # read-only receipt/lease check immediately before model dispatch and
+        # clears the bearer callback before invoking it.
+        if consume:
+            event.pre_gateway_consume_validate = None
+        try:
+            result = validate()
+        except Exception:
+            logger.exception("Queued deferred-event revalidation failed")
+            event._hermes_pre_gateway_consume_terminal = True
+            return False
+
+        valid = result is True or (
+            isinstance(result, dict) and result.get("status") == "ok"
+        )
+        if valid:
+            if consume:
+                event._hermes_pre_gateway_consume_revalidated = True
             return True
 
-        # --- Authorization gate (#17775) ---
-        # The cold path (_handle_message) checks _is_user_authorized before
-        # creating a session.  The busy path must enforce the same check;
-        # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
-        # can inject messages into an active session they don't own.
-        if not self._is_user_authorized(event.source):
+        logger.warning(
+            "Dropping queued deferred event after failed consume validation: "
+            "reason=%s platform=%s chat=%s",
+            result.get("reason") if isinstance(result, dict) else "rejected",
+            event.source.platform.value if getattr(event.source, "platform", None) else "unknown",
+            getattr(event.source, "chat_id", None) or "unknown",
+        )
+        event._hermes_pre_gateway_consume_terminal = True
+        event.pre_gateway_consume_validate = None
+        return False
+
+    @staticmethod
+    def _agent_start_visible_message(event: MessageEvent, message_text: str) -> str:
+        if (
+            bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+            and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+        ):
+            return "[deferred confirmation pending final validation]"
+        return message_text[:500]
+
+    @staticmethod
+    def _has_deferred_pre_gateway_prepare(event: MessageEvent) -> bool:
+        return callable(getattr(event, "pre_gateway_prepare", None))
+
+    def _apply_deferred_pre_gateway_prepare(self, event: MessageEvent) -> bool:
+        """Consume one adapter-owned prepare capability exactly once.
+
+        The callback is deliberately synchronous. Busy admission calls this
+        only after authorization and the real 32+1 capacity check, then runs
+        the plugin hook and enqueue without yielding the event loop. Anything
+        except an explicit ``{"status": "ready"}`` fails closed.
+        """
+        prepare = getattr(event, "pre_gateway_prepare", None)
+        if not callable(prepare):
+            return True
+        event.pre_gateway_prepare = None
+        try:
+            result = prepare()
+        except Exception:
+            logger.exception("Deferred pre-gateway prepare failed")
+            event._hermes_pre_gateway_prepare_terminal = True
+            return False
+        ready = isinstance(result, dict) and result.get("status") == "ready"
+        if not ready:
+            logger.warning(
+                "Deferred pre-gateway prepare stopped dispatch: reason=%s",
+                result.get("reason") if isinstance(result, dict) else "invalid_result",
+            )
+            event._hermes_pre_gateway_prepare_terminal = True
+            return False
+        event._hermes_pre_gateway_prepare_consumed = True
+        return True
+
+    @staticmethod
+    def _mark_protected_deferred_rewrite(event: MessageEvent) -> None:
+        event._hermes_protected_deferred_rewrite = _PROTECTED_DEFERRED_REWRITE_TOKEN
+
+    @staticmethod
+    def _is_protected_deferred_rewrite(event: MessageEvent) -> bool:
+        return (
+            getattr(event, "_hermes_protected_deferred_rewrite", None)
+            is _PROTECTED_DEFERRED_REWRITE_TOKEN
+        )
+
+    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Authorize user traffic before hooks. A busy shared channel must not
+        # let an unauthorized sender trigger a durable claim or queue retry.
+        if not bool(getattr(event, "internal", False)) and not self._is_event_user_authorized(event):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
@@ -9175,6 +9416,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        adapter = self._adapter_for_source(event.source)
+        deferred_prepare = self._has_deferred_pre_gateway_prepare(event)
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not bool(getattr(event, "internal", False)) and not isinstance(pending_slot, dict):
+            logger.warning(
+                "Deferring busy-path hook for session %s — adapter FIFO is unavailable; "
+                "no confirmation claim was attempted.",
+                session_key,
+            )
+            return deferred_prepare
+        if (
+            not bool(getattr(event, "internal", False))
+            and isinstance(pending_slot, dict)
+            and self._queue_depth(session_key, adapter=adapter)
+            >= self._BUSY_QUEUE_EMERGENCY_MAX_PENDING
+        ):
+            logger.warning(
+                "Deferring busy-path hook for session %s — emergency FIFO is full; "
+                "no confirmation claim was attempted.",
+                session_key,
+            )
+            return deferred_prepare
+
+        if deferred_prepare and not self._apply_deferred_pre_gateway_prepare(event):
+            return True
+
+        # Confirmation/runtime intake must see busy-path user follow-ups before
+        # steer/redirect consumes them. Same hook contract as the cold path.
+        event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
+        if bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False)) and (
+            pre_gateway_disposition != "queue"
+        ):
+            logger.warning(
+                "Dropping consumed deferred event without validated busy-path rewrite: "
+                "disposition=%s session=%s",
+                pre_gateway_disposition,
+                session_key,
+            )
+            event._hermes_pre_gateway_prepare_terminal = True
+            return True
+        if pre_gateway_disposition == "skip":
+            return True
+        if pre_gateway_disposition in {"queue", "retry"}:
+            if (
+                pre_gateway_disposition == "queue"
+                and bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+            ):
+                self._mark_protected_deferred_rewrite(event)
+            try:
+                admitted = self._queue_or_replace_pending_event(
+                    session_key,
+                    event,
+                    emergency=True,
+                )
+            except Exception:
+                consumed_prepare = bool(
+                    getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+                )
+                if pre_gateway_disposition == "queue" and not consumed_prepare:
+                    event._hermes_busy_fallback_preserve_identity = True
+                if consumed_prepare:
+                    event._hermes_pre_gateway_prepare_terminal = True
+                logger.warning(
+                    "Emergency busy-path queue admission failed for session %s; %s",
+                    session_key,
+                    (
+                        "dropping unclaimed hook retry"
+                        if pre_gateway_disposition == "retry"
+                        else "falling back to the platform adapter queue"
+                    ),
+                    exc_info=True,
+                )
+                return pre_gateway_disposition == "retry" or consumed_prepare
+            if not admitted:
+                consumed_prepare = bool(
+                    getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+                )
+                if pre_gateway_disposition == "queue" and not consumed_prepare:
+                    event._hermes_busy_fallback_preserve_identity = True
+                if consumed_prepare:
+                    event._hermes_pre_gateway_prepare_terminal = True
+                logger.warning(
+                    "Emergency busy-path queue admission unavailable for session %s; %s",
+                    session_key,
+                    (
+                        "dropping unclaimed hook retry"
+                        if pre_gateway_disposition == "retry"
+                        else "falling back to the platform adapter queue"
+                    ),
+                )
+                return pre_gateway_disposition == "retry" or consumed_prepare
+            return True
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -14954,11 +15288,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
         #   {"action": "allow"}   /   None          -> normal dispatch
-        # Hook runs BEFORE auth so plugins can handle unauthorized senders
-        # (e.g. customer handover ingest) without triggering the pairing flow.
+        # Hook normally runs BEFORE auth so plugins can handle unauthorized
+        # senders (e.g. customer handover ingest) without triggering pairing.
+        # Adapter-owned deferred prepares are the narrow exception: their
+        # durable effects and dependent hook run only after authorization.
         # Busy-session follow-ups reuse the same helper so confirmation plugins
         # cannot be bypassed while a DM turn is already active.
-        if not is_internal:
+        deferred_prepare = self._has_deferred_pre_gateway_prepare(event)
+        if not is_internal and not deferred_prepare:
             event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
             source = event.source
             if pre_gateway_disposition == "skip":
@@ -14975,10 +15312,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # chat-scoped allowlist (e.g. TELEGRAM_GROUP_ALLOWED_CHATS
             # authorizes every member of the listed chat regardless of
             # sender). Defer to _is_user_authorized so that path runs.
-            if not self._is_user_authorized(source):
+            if not self._is_event_user_authorized(event):
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
-        elif not self._is_user_authorized(source):
+        elif not self._is_event_user_authorized(event):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
@@ -15035,6 +15372,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        if (
+            not is_internal
+            and bool(getattr(event, "_hermes_pre_gateway_prepare_consumed", False))
+            and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+        ):
+            # A deferred event can re-enter through the adapter pending slot
+            # after an earlier FIFO head was rejected or a recursion-limited
+            # turn handed ownership to a fresh task. Its prepare/hook are
+            # already consumed, but the one-shot receipt/lease capability must
+            # still be checked immediately before this task can expose any
+            # event content to the model.
+            if not self._revalidate_queued_deferred_event(event):
+                return None
+
+        if deferred_prepare:
+            if not self._apply_deferred_pre_gateway_prepare(event):
+                return None
+            event, pre_gateway_disposition = self._apply_pre_gateway_dispatch(event)
+            source = event.source
+            if pre_gateway_disposition != "queue":
+                logger.warning(
+                    "Dropping consumed deferred event without validated cold-path rewrite: "
+                    "disposition=%s",
+                    pre_gateway_disposition,
+                )
+                event._hermes_pre_gateway_prepare_terminal = True
+                return None
+
+            self._mark_protected_deferred_rewrite(event)
+
+        protected_deferred_rewrite = self._is_protected_deferred_rewrite(event)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -15046,7 +15415,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
         _up_state = self._peek_session_state(_quick_key)
-        if _up_state is not None and _up_state.persistent.update_prompt_pending:
+        if (
+            not protected_deferred_rewrite
+            and _up_state is not None
+            and _up_state.persistent.update_prompt_pending
+        ):
             raw = (event.text or "").strip()
             # Accept /approve and /deny as shorthand for yes/no
             cmd = event.get_command()
@@ -15125,7 +15498,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             _pending_clarify = None
-        if _pending_clarify is not None and _clarify_mod is not None:
+        if (
+            not protected_deferred_rewrite
+            and _pending_clarify is not None
+            and _clarify_mod is not None
+        ):
             _clarify_has_audio = bool(self._pending_event_audio_paths(event))
             _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
             if _clarify_has_audio and not _raw_clarify_reply:
@@ -15187,7 +15564,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _tool_approval_live = has_blocking_approval(_quick_key)
         except Exception:
             _tool_approval_live = False
-        if _pending_confirm and not _tool_approval_live:
+        if (
+            not protected_deferred_rewrite
+            and _pending_confirm
+            and not _tool_approval_live
+        ):
             _raw_reply = (event.text or "").strip()
             # Accept bang-prefixed replies (`!always`, `!cancel`) verbatim.
             # Slack/Matrix instruction text shows the `!` prefix (typed `/`
@@ -16796,9 +17177,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        deferred_confirmation = bool(
+            getattr(event, "_hermes_pre_gateway_prepare_consumed", False)
+        )
+        if (
+            deferred_confirmation
+            and not bool(getattr(event, "_hermes_pre_gateway_consume_revalidated", False))
+            and not self._revalidate_queued_deferred_event(event, consume=True)
+        ):
+            return None
+
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        _msg_preview = (event.text or "")[:80].replace("\n", " ")
+        _msg_preview = self._agent_start_visible_message(
+            event, event.text or ""
+        )[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(
@@ -17998,8 +18391,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Stage the collected must-deliver notes for this turn's agent run
         # (one-shot; consumed in run_sync).  Staged AFTER the message_text
         # early-out above so an aborted turn cannot leak its notes into the
-        # next turn's user message.
-        if turn_sidecar_notes and session_key:
+        # next turn's user message. Deferred confirmations wait until their
+        # final receipt/lease consume check succeeds below.
+        if turn_sidecar_notes and session_key and not deferred_confirmation:
             self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
 
         # Bind this gateway run generation to the adapter's active-session
@@ -18020,7 +18414,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "thread_id": str(getattr(source, "thread_id", None)) if getattr(source, "thread_id", None) else "",
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
-                "message": message_text[:500],
+                "message": self._agent_start_visible_message(event, message_text),
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
@@ -18030,6 +18424,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            if turn_sidecar_notes and session_key and deferred_confirmation:
+                self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -25923,13 +26319,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pending = None
             if result and adapter and session_key:
                 pending_event = _dequeue_pending_event(adapter, session_key)
-                # /queue overflow: after consuming the adapter's "next-up"
-                # slot, promote the next queued event into it so the
-                # recursive run's drain will see it.  This keeps the slot
-                # occupied for the full FIFO chain, which (a) preserves
-                # order, and (b) causes any mid-chain /queue to correctly
-                # route to overflow rather than jumping the queue.
-                pending_event = self._promote_queued_event(session_key, adapter, pending_event)
+                if pending_event is None:
+                    pending_event = self._promote_queued_event(
+                        session_key, adapter, None
+                    )
+                while pending_event is not None:
+                    if _interrupt_depth >= self._MAX_INTERRUPT_DEPTH:
+                        # No successor has been promoted yet. Restore this head
+                        # directly into the now-empty slot and leave overflow in
+                        # place, preserving both FIFO order and the one-shot
+                        # validator for the task that actually consumes it.
+                        logger.warning(
+                            "Interrupt recursion depth %d reached for session %s — "
+                            "queueing event before deferred consume validation.",
+                            _interrupt_depth,
+                            session_key,
+                        )
+                        adapter._pending_messages[session_key] = pending_event
+                        return result_holder[0] or {
+                            "final_response": response,
+                            "messages": history,
+                        }
+                    if self._revalidate_queued_deferred_event(pending_event):
+                        # Only after this head is accepted may the next overflow
+                        # item occupy the adapter slot for the following drain.
+                        pending_event = self._promote_queued_event(
+                            session_key, adapter, pending_event
+                        )
+                        break
+                    # Drop only the rejected head. Validate the successor in
+                    # this same drain so it cannot remain stranded waiting for
+                    # unrelated inbound traffic.
+                    pending_event = self._promote_queued_event(
+                        session_key, adapter, None
+                    )
                 if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                     interrupt_message = result.get("interrupt_message")
                     if _is_control_interrupt_message(interrupt_message):
@@ -25949,7 +26372,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # fresh voice messages.
                     _pending_text = pending_event.text or ""
                     _media_urls = getattr(pending_event, "media_urls", None) or []
-                    if self._pending_event_audio_paths(pending_event):
+                    if bool(getattr(pending_event, "_hermes_pre_gateway_prepare_consumed", False)):
+                        pending = self._agent_start_visible_message(pending_event, _pending_text)
+                    elif self._pending_event_audio_paths(pending_event):
                         pending, _ = await self._transcribe_and_echo_pending_voice(
                             pending_event,
                             adapter,
@@ -26162,6 +26587,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # re-mark the generation for the final delivered turn.
                 next_message_type = None
                 if pending_event is not None:
+                    if (
+                        bool(getattr(pending_event, "_hermes_pre_gateway_prepare_consumed", False))
+                        and not bool(getattr(pending_event, "_hermes_pre_gateway_consume_revalidated", False))
+                        and not self._revalidate_queued_deferred_event(
+                            pending_event,
+                            consume=True,
+                        )
+                    ):
+                        return result
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
                         logger.info(
