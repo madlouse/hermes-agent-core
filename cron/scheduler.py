@@ -959,7 +959,12 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    list_executions,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -4998,6 +5003,18 @@ def _cron_execution_context_block(
     if not re.fullmatch(r"[0-9T:+.Z-]{1,48}", started_at):
         started_at = "unknown"
 
+    scheduled_streak = execution_context.get("prior_builtin_success_streak")
+    if not isinstance(scheduled_streak, int) or scheduled_streak < 0:
+        scheduled_streak = None
+    scheduled_times = execution_context.get("prior_builtin_success_times")
+    if not isinstance(scheduled_times, list):
+        scheduled_times = []
+    scheduled_times = [
+        str(value)
+        for value in scheduled_times
+        if isinstance(value, str) and re.fullmatch(r"[0-9T:+.Z-]{1,48}", value)
+    ][:10]
+
     if mode == "manual_validation":
         source_rule = (
             "This is a manual validation run. Do not describe it as a scheduled "
@@ -5016,20 +5033,52 @@ def _cron_execution_context_block(
     else:
         source_rule = "This attempt was triggered by a scheduler."
 
+    ledger_evidence = ""
+    if scheduled_streak is not None:
+        rendered_times = ", ".join(f"`{value}`" for value in scheduled_times)
+        ledger_evidence = (
+            f"- Prior built-in scheduled success streak: `{scheduled_streak}`\n"
+            f"- Completions in that streak (newest first): {rendered_times or '`none`'}\n"
+        )
+
     return (
         "## Runtime Execution Context\n"
         f"- Trigger source: `{source}`\n"
         f"- Trigger mode: `{mode}`\n"
         f"- Actual attempt start: `{started_at}`\n\n"
+        f"{ledger_evidence}\n"
         "Treat this block as authoritative runtime metadata. "
         f"{source_rule} "
         "The current attempt is not terminal while you are generating the "
         "response, so do not claim that this attempt has completed or that its "
         "delivery succeeded. Claims about prior run streaks require durable "
         "execution-ledger evidence; never infer them from the Job name, cron "
-        "expression, or expected schedule. Use the actual attempt start above, "
+        "expression, expected schedule, or a previously generated report. If a "
+        "loaded file contains a conflicting streak or future completion, correct "
+        "that file and use the ledger values above. Use the actual attempt start above, "
         "not the scheduled expression, when referring to this run.\n\n"
     )
+
+
+def _execution_context_with_history(
+    execution_context: dict[str, Any], *, job_id: str, execution_id: str
+) -> dict[str, Any]:
+    """Add authoritative prior built-in schedule evidence to attempt context."""
+    context = dict(execution_context)
+    streak = 0
+    times: list[str] = []
+    for record in list_executions(job_id=job_id, limit=500):
+        if record.get("id") == execution_id or record.get("source") != "builtin":
+            continue
+        if record.get("status") != "completed":
+            break
+        streak += 1
+        timestamp = record.get("finished_at") or record.get("started_at")
+        if isinstance(timestamp, str) and len(times) < 10:
+            times.append(timestamp)
+    context["prior_builtin_success_streak"] = streak
+    context["prior_builtin_success_times"] = times
+    return context
 
 
 def _build_job_prompt(
@@ -7001,6 +7050,11 @@ def run_one_job(
                 job_id,
             )
             return False
+        execution_context = _execution_context_with_history(
+            execution_context,
+            job_id=job_id,
+            execution_id=execution_id,
+        )
         if _set_running_job_state(
             job["id"],
             "preflight",
