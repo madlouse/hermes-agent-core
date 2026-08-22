@@ -96,7 +96,7 @@ def _runner(session_store):
     runner.hooks = SimpleNamespace(loaded_hooks=False, emit=AsyncMock())
     runner.session_store = session_store
     runner._session_db = MagicMock()
-    runner._session_db.get_telegram_topic_binding_by_session.return_value = None
+    runner._session_db._db.get_telegram_topic_binding_by_session.return_value = None
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
     runner._running_agents = {}
@@ -281,5 +281,4 @@ class _ProviderSwitchAgent(_CompressionThenFailureAgent):
             ],
             "api_calls": 1,
         }
-
 

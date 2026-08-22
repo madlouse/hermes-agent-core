@@ -2013,7 +2013,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("patch content required")
                 # Preserve the public non-Cron backend contract. Active Cron
                 # patches fail closed above because no atomic patch sink exists.
-                patch_for_ops = patch
+                patch_for_ops = _rewrite_v4a_patch_paths_for_host(
+                    patch, _path_to_resolved, file_ops
+                )
                 result = file_ops.patch_v4a(patch_for_ops)
             else:
                 return tool_error(f"Unknown mode: {mode}")
