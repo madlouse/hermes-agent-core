@@ -281,6 +281,8 @@ def builtin_success_streak_context(
     times: List[str] = []
     boundary_seen = False
     for row in rows:
+        if row["status"] in ("claimed", "running"):
+            continue
         if row["status"] != "completed":
             boundary_seen = True
             break

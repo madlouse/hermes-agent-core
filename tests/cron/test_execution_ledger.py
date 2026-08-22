@@ -129,6 +129,22 @@ def test_builtin_streak_marks_retention_boundary_as_lower_bound(monkeypatch, tmp
     assert context["prior_builtin_success_streak_exact"] is False
 
 
+def test_builtin_streak_skips_concurrent_nonterminal_attempt(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    completed = executions.create_execution("streak", source="builtin")
+    executions.finish_execution(completed["id"], job_id="streak", success=True)
+    concurrent = executions.create_execution("streak", source="builtin")
+    executions.mark_execution_running(concurrent["id"], job_id="streak")
+    current = executions.create_execution("streak", source="manual")
+
+    context = executions.builtin_success_streak_context(
+        "streak", exclude_execution_id=current["id"]
+    )
+
+    assert context["prior_builtin_success_streak"] == 1
+    assert context["prior_builtin_success_streak_exact"] is True
+
+
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
