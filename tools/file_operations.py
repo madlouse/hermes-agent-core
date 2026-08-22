@@ -915,6 +915,34 @@ class ShellFileOperations(FileOperations):
             return non_printable / min(len(content_sample), 1000) > 0.30
         
         return False
+
+    def _read_content_sample(self, path: str, byte_limit: int = 1000) -> str:
+        """Read a binary-detection sample without splitting the final UTF-8 code point.
+
+        Emit bytes as ASCII hex so terminal stdout decoding cannot fail first.
+        Read three extra bytes (the maximum UTF-8 continuation remainder),
+        then trim only bytes beyond ``byte_limit`` until a valid UTF-8 prefix
+        is found. Invalid bytes inside the requested sample remain U+FFFD and
+        still fail closed in :meth:`_is_likely_binary`.
+        """
+        command = (
+            f"od -An -v -tx1 -N {byte_limit + 3} "
+            f"{self._escape_shell_arg(path)} 2>/dev/null"
+        )
+        result = self._exec(command)
+        if result.exit_code != 0:
+            return "\ufffd"
+        try:
+            raw = bytes.fromhex(_strip_terminal_fence_leaks(result.stdout))
+        except ValueError:
+            return "\ufffd"
+        minimum = min(byte_limit, len(raw))
+        for end in range(len(raw), minimum - 1, -1):
+            try:
+                return raw[:end].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
     
     def _is_image(self, path: str) -> bool:
         """Check if file is an image we can return as base64."""
@@ -1180,9 +1208,7 @@ class ShellFileOperations(FileOperations):
             )
         
         # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        sample_output = self._read_content_sample(path)
         
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
@@ -1298,8 +1324,7 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        sample_output = self._read_content_sample(path)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
                 is_binary=True, file_size=file_size,
