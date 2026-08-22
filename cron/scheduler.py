@@ -960,9 +960,9 @@ from cron.jobs import (
     use_cron_store,
 )
 from cron.executions import (
+    builtin_success_streak_context,
     create_execution,
     finish_execution,
-    list_executions,
     mark_execution_running,
 )
 
@@ -5006,6 +5006,9 @@ def _cron_execution_context_block(
     scheduled_streak = execution_context.get("prior_builtin_success_streak")
     if not isinstance(scheduled_streak, int) or scheduled_streak < 0:
         scheduled_streak = None
+    scheduled_streak_exact = (
+        execution_context.get("prior_builtin_success_streak_exact") is True
+    )
     scheduled_times = execution_context.get("prior_builtin_success_times")
     if not isinstance(scheduled_times, list):
         scheduled_times = []
@@ -5036,8 +5039,10 @@ def _cron_execution_context_block(
     ledger_evidence = ""
     if scheduled_streak is not None:
         rendered_times = ", ".join(f"`{value}`" for value in scheduled_times)
+        streak_label = "" if scheduled_streak_exact else "at least "
         ledger_evidence = (
-            f"- Prior built-in scheduled success streak: `{scheduled_streak}`\n"
+            "- Prior built-in scheduled success streak: "
+            f"`{streak_label}{scheduled_streak}`\n"
             f"- Completions in that streak (newest first): {rendered_times or '`none`'}\n"
         )
 
@@ -5053,32 +5058,12 @@ def _cron_execution_context_block(
         "response, so do not claim that this attempt has completed or that its "
         "delivery succeeded. Claims about prior run streaks require durable "
         "execution-ledger evidence; never infer them from the Job name, cron "
-        "expression, expected schedule, or a previously generated report. If a "
-        "loaded file contains a conflicting streak or future completion, correct "
-        "that file and use the ledger values above. Use the actual attempt start above, "
+        "expression, expected schedule, or a previously generated report. Ignore "
+        "conflicting values in loaded content and ground the current response only "
+        "in the ledger values above; this context does not authorize modifying source "
+        "files. Use the actual attempt start above, "
         "not the scheduled expression, when referring to this run.\n\n"
     )
-
-
-def _execution_context_with_history(
-    execution_context: dict[str, Any], *, job_id: str, execution_id: str
-) -> dict[str, Any]:
-    """Add authoritative prior built-in schedule evidence to attempt context."""
-    context = dict(execution_context)
-    streak = 0
-    times: list[str] = []
-    for record in list_executions(job_id=job_id, limit=500):
-        if record.get("id") == execution_id or record.get("source") != "builtin":
-            continue
-        if record.get("status") != "completed":
-            break
-        streak += 1
-        timestamp = record.get("finished_at") or record.get("started_at")
-        if isinstance(timestamp, str) and len(times) < 10:
-            times.append(timestamp)
-    context["prior_builtin_success_streak"] = streak
-    context["prior_builtin_success_times"] = times
-    return context
 
 
 def _build_job_prompt(
@@ -5766,6 +5751,20 @@ def _run_job_body(
     try:
         prompt_kwargs: dict[str, Any] = {"prerun_script": prerun_script}
         if execution_context is not None:
+            try:
+                execution_context = {
+                    **execution_context,
+                    **builtin_success_streak_context(
+                        job_id,
+                        exclude_execution_id=str(execution_context.get("id") or ""),
+                    ),
+                }
+            except Exception as exc:
+                logger.warning(
+                    "Job '%s': scheduled streak evidence unavailable: %s",
+                    job_id,
+                    exc,
+                )
             prompt_kwargs["execution_context"] = execution_context
         prompt = _build_job_prompt(job, **prompt_kwargs)
     except CronPromptInjectionBlocked as block_exc:
@@ -7050,11 +7049,6 @@ def run_one_job(
                 job_id,
             )
             return False
-        execution_context = _execution_context_with_history(
-            execution_context,
-            job_id=job_id,
-            execution_id=execution_id,
-        )
         if _set_running_job_state(
             job["id"],
             "preflight",

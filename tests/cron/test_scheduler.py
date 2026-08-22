@@ -2659,6 +2659,7 @@ class TestBuildJobPromptSilentHint:
                 "source": "manual",
                 "started_at": "2026-08-22T16:24:00+08:00",
                 "prior_builtin_success_streak": 4,
+                "prior_builtin_success_streak_exact": True,
                 "prior_builtin_success_times": [
                     "2026-08-21T23:04:31+08:00",
                     "2026-08-20T23:05:20+08:00",
@@ -2674,6 +2675,7 @@ class TestBuildJobPromptSilentHint:
         assert "Prior built-in scheduled success streak: `4`" in result
         assert "2026-08-21T23:04:31+08:00" in result
         assert "previously generated report" in result
+        assert "does not authorize modifying source files" in result
         assert "running as a scheduled cron job" not in result
 
     def test_builtin_execution_context_is_scheduled_but_not_yet_terminal(self):

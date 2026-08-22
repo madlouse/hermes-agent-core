@@ -162,26 +162,6 @@ def test_run_one_job_passes_ledger_context_without_mutating_job(monkeypatch):
         "finish_execution",
         lambda *_args, **_kwargs: {"status": "completed"},
     )
-    monkeypatch.setattr(
-        s,
-        "list_executions",
-        lambda **_kwargs: [
-            {"id": "manual-attempt", "source": "manual", "status": "running"},
-            {
-                "id": "scheduled-4",
-                "source": "builtin",
-                "status": "completed",
-                "finished_at": "2026-08-21T23:04:31+08:00",
-            },
-            {
-                "id": "scheduled-3",
-                "source": "builtin",
-                "status": "completed",
-                "finished_at": "2026-08-20T23:05:20+08:00",
-            },
-            {"id": "scheduled-failure", "source": "builtin", "status": "failed"},
-        ],
-    )
     monkeypatch.setattr(s, "_set_running_job_state", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(s, "begin_job_run_outcome", lambda _job: None)
     monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
@@ -199,11 +179,6 @@ def test_run_one_job_passes_ledger_context_without_mutating_job(monkeypatch):
     assert job == before
     assert seen[0][0] == before
     assert seen[0][1]["execution_context"]["source"] == "manual"
-    assert seen[0][1]["execution_context"]["prior_builtin_success_streak"] == 2
-    assert seen[0][1]["execution_context"]["prior_builtin_success_times"] == [
-        "2026-08-21T23:04:31+08:00",
-        "2026-08-20T23:05:20+08:00",
-    ]
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
