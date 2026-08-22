@@ -19,7 +19,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     """Patch the job pipeline primitives and record the call order."""
     calls = []
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, **_kwargs):
         calls.append(("run_job", job["id"]))
         fr = final if silent_marker_in is None else silent_marker_in
         return (success, output, fr, error)
@@ -142,6 +142,45 @@ def test_direct_run_reloads_authoritative_persisted_job(monkeypatch):
     assert caller_view["prompt"] == ""
 
 
+def test_run_one_job_passes_ledger_context_without_mutating_job(monkeypatch):
+    job = {"id": "manual-job", "name": "manual", "prompt": "report"}
+    before = copy.deepcopy(job)
+    seen = []
+    monkeypatch.setattr(s, "get_persisted_job", lambda _job_id: None)
+    monkeypatch.setattr(
+        s,
+        "mark_execution_running",
+        lambda execution_id, *, job_id: {
+            "id": execution_id,
+            "job_id": job_id,
+            "source": "manual",
+            "started_at": "2026-08-22T16:24:00+08:00",
+        },
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_execution",
+        lambda *_args, **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(s, "_set_running_job_state", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(s, "begin_job_run_outcome", lambda _job: None)
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        s,
+        "_run_job_result",
+        lambda candidate, **kwargs: seen.append((copy.deepcopy(candidate), kwargs))
+        or s._RunJobResult(True, "out", "final", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/manual-job.md")
+    monkeypatch.setattr(s, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *_args, **_kwargs: None)
+
+    assert s.run_one_job(job, execution_id="manual-attempt") is True
+    assert job == before
+    assert seen[0][0] == before
+    assert seen[0][1]["execution_context"]["source"] == "manual"
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
@@ -159,7 +198,7 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
 
     scope_during_run = {}
 
-    def fake_run_job(job, *, defer_agent_teardown=None):
+    def fake_run_job(job, *, defer_agent_teardown=None, **_kwargs):
         # This is where resolve_runtime_provider() would read a secret. Prove a
         # scope is installed and the profile's secret resolves without raising.
         scope_during_run["scope"] = ss.current_secret_scope()

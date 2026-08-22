@@ -93,6 +93,58 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     assert executions.latest_execution("live")["status"] == "running"
 
 
+def test_builtin_streak_ignores_manual_runs_and_stops_at_failure(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    failed = executions.create_execution("streak", source="builtin")
+    executions.finish_execution(failed["id"], job_id="streak", success=False)
+    for _ in range(2):
+        completed = executions.create_execution("streak", source="builtin")
+        executions.finish_execution(completed["id"], job_id="streak", success=True)
+    manual = executions.create_execution("streak", source="manual")
+    executions.finish_execution(manual["id"], job_id="streak", success=True)
+    current = executions.create_execution("streak", source="manual")
+
+    context = executions.builtin_success_streak_context(
+        "streak", exclude_execution_id=current["id"]
+    )
+
+    assert context["prior_builtin_success_streak"] == 2
+    assert context["prior_builtin_success_streak_exact"] is True
+    assert len(context["prior_builtin_success_times"]) == 2
+
+
+def test_builtin_streak_marks_retention_boundary_as_lower_bound(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 2)
+    for _ in range(3):
+        completed = executions.create_execution("streak", source="builtin")
+        executions.finish_execution(completed["id"], job_id="streak", success=True)
+    current = executions.create_execution("streak", source="manual")
+
+    context = executions.builtin_success_streak_context(
+        "streak", exclude_execution_id=current["id"]
+    )
+
+    assert context["prior_builtin_success_streak"] == 2
+    assert context["prior_builtin_success_streak_exact"] is False
+
+
+def test_builtin_streak_skips_concurrent_nonterminal_attempt(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    completed = executions.create_execution("streak", source="builtin")
+    executions.finish_execution(completed["id"], job_id="streak", success=True)
+    concurrent = executions.create_execution("streak", source="builtin")
+    executions.mark_execution_running(concurrent["id"], job_id="streak")
+    current = executions.create_execution("streak", source="manual")
+
+    context = executions.builtin_success_streak_context(
+        "streak", exclude_execution_id=current["id"]
+    )
+
+    assert context["prior_builtin_success_streak"] == 1
+    assert context["prior_builtin_success_streak_exact"] is True
+
+
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     executions.EXECUTIONS_FILE.parent.mkdir(parents=True)

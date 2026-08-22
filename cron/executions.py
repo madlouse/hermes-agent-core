@@ -261,6 +261,45 @@ def list_executions(
     return [dict(row) for row in rows]
 
 
+def builtin_success_streak_context(
+    job_id: str, *, exclude_execution_id: str
+) -> Dict[str, Any]:
+    """Return prior built-in schedule evidence without mixing other triggers."""
+    with _transaction() as conn:
+        rows = conn.execute(
+            """SELECT status, started_at, finished_at FROM executions
+               WHERE job_id=? AND source='builtin' AND id<>?
+               ORDER BY claimed_at DESC, id DESC""",
+            (str(job_id), str(exclude_execution_id)),
+        ).fetchall()
+        terminal_count = conn.execute(
+            "SELECT COUNT(*) FROM executions "
+            "WHERE status IN ('completed','failed','unknown')"
+        ).fetchone()[0]
+
+    streak = 0
+    times: List[str] = []
+    boundary_seen = False
+    for row in rows:
+        if row["status"] in ("claimed", "running"):
+            continue
+        if row["status"] != "completed":
+            boundary_seen = True
+            break
+        streak += 1
+        timestamp = row["finished_at"] or row["started_at"]
+        if isinstance(timestamp, str) and len(times) < 10:
+            times.append(timestamp)
+
+    return {
+        "prior_builtin_success_streak": streak,
+        "prior_builtin_success_streak_exact": (
+            boundary_seen or terminal_count < MAX_TERMINAL_EXECUTIONS
+        ),
+        "prior_builtin_success_times": times,
+    }
+
+
 def latest_execution(job_id: str) -> Optional[Dict[str, Any]]:
     rows = list_executions(job_id=job_id, limit=1)
     return rows[0] if rows else None
