@@ -304,8 +304,8 @@ class TestShellFileOpsHelpers:
             commands.append(command)
             if command.startswith("wc -c"):
                 return {"output": "5\n", "returncode": 0}
-            if command.startswith("head -c"):
-                return {"output": "hello", "returncode": 0}
+            if command.startswith("od -An"):
+                return {"output": "68 65 6c 6c 6f", "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": "hello\n", "returncode": 0}
             if command.startswith("wc -l"):
@@ -318,7 +318,7 @@ class TestShellFileOpsHelpers:
 
         assert result.error is None
         assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[1] == "od -An -v -tx1 -N 1003 '/c/Users/alice/notes.txt' 2>/dev/null"
         assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
         assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
 
@@ -673,3 +673,36 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_split_utf8_boundary_is_extended_before_classification(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        path = tmp_path / "knowledge.md"
+        path.write_bytes(("a" * 999 + "中文内容\n").encode("utf-8"))
+
+        sample = ops._read_content_sample(str(path))
+
+        assert "\ufffd" not in sample
+        assert sample.endswith("中")
+        assert ops._is_likely_binary(str(path), sample) is False
+
+    def test_read_file_accepts_cjk_split_at_byte_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        path = tmp_path / "MAP.md"
+        content = "a" * 999 + "中文知识地图\n"
+        path.write_text(content, encoding="utf-8")
+
+        result = ops.read_file(str(path))
+
+        assert result.error is None
+        assert result.is_binary is False
+        assert "中文知识地图" in result.content
+
+    def test_invalid_byte_before_extended_boundary_stays_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        path = tmp_path / "invalid.txt"
+        path.write_bytes(b"a" * 999 + b"\xffvalid-tail\n")
+
+        sample = ops._read_content_sample(str(path))
+
+        assert "\ufffd" in sample[:-1]
+        assert ops._is_likely_binary(str(path), sample) is True
