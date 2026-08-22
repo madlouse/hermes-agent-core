@@ -60,6 +60,7 @@ def _make_runner():
         platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
     )
     adapter = MagicMock()
+    adapter._pending_messages = {}
     adapter.send = AsyncMock()
     adapter._send_with_retry = AsyncMock(
         return_value=SimpleNamespace(success=True, message_id="reply1")
@@ -131,5 +132,4 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     from tools.approval import _gateway_queues
     assert session_key not in _gateway_queues
     _clear_approval_state()
-
 
